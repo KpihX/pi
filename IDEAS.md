@@ -283,6 +283,10 @@ question is answered*, never *never build anything*. Measured state today:
 - The ear's POC is a real uv package at `voice/stt/` (`π-ear`, module `π_ear`; the distribution name
   stays `pi-ear` because the packaging standard is ASCII-only): `pyproject.toml`, `src/`, `tests/`,
   `Makefile`. Dependencies are added with `uv add` only, never hand-written into the dependency list.
+- The repository is named `pi` on both remotes (`github.com/kpihx-labs/pi` and
+  `gitlab.com/kpihx-labs/pi`), for the same ASCII reason, and this time it is a measured one: asked
+  for `π`, GitHub did not refuse, it **silently created a repository named `-`** (deleted at once).
+  π is the name of the local directory and of the thing itself, never of the registry entry.
 - Nothing else in this list is relaxed: no GUI, no framework chosen before measurement, no setup
   ritual, and the law of section 0 (100% stream, 100% live) is what the POC was built to obey.
 
