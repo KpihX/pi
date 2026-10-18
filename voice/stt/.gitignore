@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+.uv/
+
+# tooling
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# NEVER commit audio, state or event logs. The raw material of this package is
+# the voice of whoever was in the room, and the state is a session artefact, not
+# a document. These patterns are defensive: the runtime root is /tmp/π, outside
+# the tree, but a ROOT pointed at the project must still be safe.
+*.raw
+*.wav
+*.flac
+*.mp3
+*.opus
+state.json
+events.jsonl
+snapshots/
+archive/
