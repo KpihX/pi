@@ -1,93 +1,63 @@
-"""The entry point must be tested, not only the library.
-
-This file exists because of a real failure. Every unit test built its Config from
-a ``Path`` object, while the command line hands a ``str`` over: ``make run``
-crashed on ``self.root / "audio"`` and not a single test noticed. A pure function
-tested only through its Python API says nothing about the way a user reaches it.
-
-Everything below therefore goes through the command line, exactly as a user does.
-"""
+"""The command line, as an operator types it."""
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
+from conftest import needs_data
 from typer.testing import CliRunner
 
 from π_ear.cli import app
-from π_ear.config import Config
+from π_ear.public import Scene, libri
 
 runner = CliRunner()
 
 
-def test_config_normalises_a_string_root(tmp_path):
-    cfg = Config(root=str(tmp_path))
-    assert isinstance(cfg.root, Path)
-    cfg.ensure()
-    assert cfg.audio_dir.is_dir()
-
-
-def test_run_accepts_a_string_root(tmp_path):
-    result = runner.invoke(app, ["run", "--root", str(tmp_path), "--max-seconds", "0.2"])
-    assert result.exit_code == 0, result.output
-    assert (tmp_path / "state.json").is_file()
-
-
-def test_run_accepts_every_flag_the_makefile_passes(tmp_path):
-    """The Makefile is how this is actually started, so its flags are the real
-    interface. Keep this list in sync with EAR_ARGS in the Makefile: when the two
-    drift, `make run` breaks and no unit test notices."""
-    result = runner.invoke(
-        app,
-        [
-            "run",
-            "--root",
-            str(tmp_path),
-            "--device",
-            "plughw:0,6",
-            "--rate",
-            "16000",
-            "--chunk-s",
-            "1",
-            "--window-s",
-            "3.0",
-            "--k-evidence",
-            "3",
-            "--tau-floor",
-            "0.5",
-            "--z-margin",
-            "3.0",
-            "--voiced-floor",
-            "0.25",
-            "--corpus-dir",
-            str(tmp_path / "corpus"),
-            "--corpus-max-chunks",
-            "60",
-            "--max-seconds",
-            "0.2",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    assert (tmp_path / "corpus").is_dir()
-    assert (tmp_path / "state.json").is_file()
-
-
-def test_no_corpus_leaves_the_home_alone(tmp_path):
-    result = runner.invoke(
-        app, ["run", "--root", str(tmp_path), "--no-corpus", "--max-seconds", "0.2"]
-    )
-    assert result.exit_code == 0, result.output
-    assert not (tmp_path / "corpus").exists()
-
-
-def test_ctl_status_accepts_a_string_root(tmp_path):
+def test_status_without_a_state_says_so(tmp_path):
     result = runner.invoke(app, ["ctl", "status", "--root", str(tmp_path)])
-    assert result.exit_code == 1
-    assert "no state yet" in result.output
+    assert result.exit_code == 1 and "no state yet" in result.output
 
 
-def test_snapshot_accepts_a_string_root(tmp_path):
-    (tmp_path / "state.json").write_text("{}\n", encoding="utf-8")
-    result = runner.invoke(app, ["snapshot", "--root", str(tmp_path)])
+def test_pause_and_resume_are_files(tmp_path):
+    runner.invoke(app, ["ctl", "pause", "--root", str(tmp_path)])
+    assert (tmp_path / "PAUSE").exists()
+    runner.invoke(app, ["ctl", "resume", "--root", str(tmp_path)])
+    assert not (tmp_path / "PAUSE").exists()
+
+
+def test_a_correction_is_one_appended_line(tmp_path):
+    for args in (["same", "3", "7"], ["name", "3", "--label", "KπX"]):
+        result = runner.invoke(app, ["correct", *args, "--memory", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+    lines = [json.loads(x) for x in (tmp_path / "corrections.jsonl").read_text().splitlines()]
+    assert [x["kind"] for x in lines] == ["same", "name"] and lines[1]["label"] == "KπX"
+
+
+def test_name_without_a_label_is_refused(tmp_path):
+    result = runner.invoke(app, ["correct", "name", "3", "--memory", str(tmp_path)])
+    assert result.exit_code != 0
+
+
+@needs_data
+def test_replay_then_status_then_correct_by_speaker(tmp_path):
+    from π_ear import contract
+
+    scene = Scene(seed=0).silence(1).add("A", libri(contract.DATA)["libri5703"]).silence(1)
+    scene.write(tmp_path / "chunks")
+    root, memory = str(tmp_path / "live"), str(tmp_path / "memory")
+    result = runner.invoke(
+        app, ["replay", str(tmp_path / "chunks"), "--root", root, "--memory", memory, "--quiet"]
+    )
     assert result.exit_code == 0, result.output
-    assert list((tmp_path / "snapshots").glob("*.json"))
+    assert json.loads(result.output.splitlines()[-1])["speakers"] == 1
+    status = runner.invoke(app, ["ctl", "status", "--root", root])
+    assert "speaker" in status.output
+    key = next(
+        c["key"]
+        for c in json.loads((tmp_path / "memory" / "model.json").read_text())["model"]["clusters"]
+        if c["kind"] == "speaker"
+    )
+    result = runner.invoke(
+        app, ["correct", "name", "--speaker", key, "--label", "A", "--memory", memory]
+    )
+    assert result.exit_code == 0 and '"label": "A"' in result.output

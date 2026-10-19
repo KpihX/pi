@@ -1,200 +1,198 @@
-"""The command line. Thin on purpose: every flag maps to one Config field.
+"""The command line. Thin on purpose.
 
-Two entry points, and they are exactly the two servers of the architecture plus
-the two things you need while watching a live system: freeze it, compare it.
-
-    π-ear run       the ear: reads the chunks, keeps the state live on disk
-    π-ear ctl       pause | resume | reset | status
-    π-ear snapshot  freeze the state, or diff the last two
-    π-ear replay    re-run the whole backlog with fresh parameters
+π-ear run        the ear, live, following the recorder's directory
+π-ear ctl        pause | resume | reset | status
+π-ear correct    same | different | not_voice | name   ROWS...  (one case, obeyed now)
+π-ear snapshot   freeze the state, or --diff the last two
+π-ear replay     a recorded directory (the corpus), from a fresh or the current memory
+π-ear fetch      the models and the public corpora
+π-ear base       re-measure the base weights on public voices
 """
 
 from __future__ import annotations
 
 import enum
 import json
+import shutil
+from pathlib import Path
 
 import typer
 
-from π_ear.config import Config
-from π_ear.live import Ear
-from π_ear.state import archive, diff_last_two, read_json
-from π_ear.state import snapshot as take_snapshot
+from π_ear import contract
+from π_ear.ear import Ear, Places, base_weights_path, correction
+from π_ear.io import diff_last_two, read_json, write_atomic
+from π_ear.io import snapshot as take_snapshot
 
 app = typer.Typer(add_completion=False, help="π-ear: the streaming ear of π.")
 
+ROOT = typer.Option(None, help="live root (default /tmp/π)")
+MEMORY = typer.Option(None, help="what the ear has learned (default ~/.cache/π/ear)")
 
-class CtlAction(enum.StrEnum):
+
+def _places(root=None, memory=None, **extra) -> Places:
+    kwargs = {k: v for k, v in dict(root=root, memory=memory, **extra).items() if v is not None}
+    return Places(**kwargs)
+
+
+@app.command()
+def run(
+    root: str = ROOT,
+    memory: str = MEMORY,
+    audio_dir: str = typer.Option(None, help="read chunks here instead of <root>/audio"),
+    from_start: bool = typer.Option(False, "--from-start", help="ingest the backlog first"),
+    corpus: bool = typer.Option(True, "--corpus/--no-corpus", help="keep a durable copy"),
+    corpus_dir: str = typer.Option(None, help="where the durable corpus lives"),
+    asr: bool = typer.Option(True, "--asr/--no-asr", help="transcribe finished speech runs"),
+    max_seconds: float = typer.Option(None, help="stop after N seconds"),
+):
+    """Follow the recorder forever. The state on disk is live; Ctrl+C stops."""
+    places = _places(root, memory, audio=audio_dir)
+    if not corpus:
+        places.corpus = None
+    elif corpus_dir:
+        places.corpus = Path(corpus_dir)
+    ear = Ear(places, from_start=from_start, asr=asr)
+    typer.echo(f"π-ear  audio={places.audio_dir}  memory={places.memory}  rows={len(ear.store)}")
+    typer.echo(f"       weights={ear.model.base.source}")
+    try:
+        ear.run(max_seconds=max_seconds, echo=typer.echo)
+    except KeyboardInterrupt:
+        ear.persist()
+        typer.echo("\nstopped, memory saved")
+
+
+@app.command()
+def replay(
+    audio_dir: str = typer.Argument(..., help="a directory of recorded chunks (e.g. the corpus)"),
+    root: str = ROOT,
+    memory: str = typer.Option(None, help="memory to replay into (default: a fresh one in <root>)"),
+    asr: bool = typer.Option(False, "--asr/--no-asr", help="transcribe while replaying"),
+    quiet: bool = typer.Option(False, "--quiet", help="no line per decision"),
+):
+    """Run a recorded session through the ear, to the end, then stop."""
+    places = _places(root, memory, audio=audio_dir)
+    if memory is None:
+        places.memory = places.root / "replay-memory"
+        shutil.rmtree(places.memory, ignore_errors=True)
+        places.events.unlink(missing_ok=True)
+    places.corpus = None
+    ear = Ear(places, from_start=True, live=False, asr=asr)
+    ear.run(drain=True, echo=None if quiet else typer.echo)
+    typer.echo(json.dumps(ear.state()["model"]))
+
+
+class Action(enum.StrEnum):
     pause = "pause"
     resume = "resume"
     reset = "reset"
     status = "status"
 
 
-def _config(**overrides) -> Config:
-    """Build a Config, ignoring the flags that were not given (None)."""
-    clean = {key: value for key, value in overrides.items() if value is not None}
-    return Config(**clean)
-
-
-def _echo_config(cfg: Config) -> None:
-    typer.echo("π-ear")
-    for key, value in cfg.as_dict().items():
-        typer.echo(f"  {key:16s} {value}")
-    typer.echo(f"  {'state_file':16s} {cfg.state_file}")
-    typer.echo(f"  {'events_file':16s} {cfg.events_file}")
-    typer.echo("")
-
-
 @app.command()
-def run(
-    root: str = typer.Option(None, help="runtime root (default /tmp/π)"),
-    device: str = typer.Option(None, help="ALSA capture device (must match the recorder)"),
-    rate: int = typer.Option(None, help="sample rate in Hz (the model contract is 16000)"),
-    chunk_s: int = typer.Option(None, help="chunk duration, must match arecord --max-file-time"),
-    window_s: float = typer.Option(None, help="analysis window in seconds"),
-    k_evidence: int = typer.Option(None, help="observations needed before registering a speaker"),
-    tau_floor: float = typer.Option(None, help="min cosine to the closest voice"),
-    z_margin: float = typer.Option(
-        None, help="how many sigma above the observed margin noise the winner must be"
-    ),
-    voiced_floor: float = typer.Option(
-        None, help="min voiced ratio before a window counts as speech"
-    ),
-    from_start: bool = typer.Option(
-        False, "--from-start", help="ingest the backlog instead of skipping it"
-    ),
-    keep_audio: bool = typer.Option(False, "--keep-audio", help="do not delete consumed chunks"),
-    audio_dir: str = typer.Option(None, help="read chunks from here instead of <root>/audio"),
-    corpus: bool | None = typer.Option(
-        None, "--corpus/--no-corpus", help="copy ingested chunks into the durable corpus"
-    ),
-    corpus_dir: str = typer.Option(None, help="where the durable corpus lives"),
-    corpus_max_chunks: int = typer.Option(None, help="how many chunks the corpus keeps"),
-    log_silence: bool = typer.Option(
-        False, "--log-silence", help="log every window, silent ones included"
-    ),
-    max_seconds: float = typer.Option(None, help="stop after N seconds (tests, demos)"),
-):
-    """Follow the chunks directory forever and keep the state live."""
-    cfg = _config(
-        root=root,
-        device=device,
-        rate=rate,
-        chunk_s=chunk_s,
-        window_s=window_s,
-        k_evidence=k_evidence,
-        tau_floor=tau_floor,
-        z_margin=z_margin,
-        voiced_floor=voiced_floor,
-        audio_dir_override=audio_dir,
-        corpus=corpus,
-        corpus_dir=corpus_dir,
-        corpus_max_chunks=corpus_max_chunks,
-    )
-    cfg.ensure()
-    _echo_config(cfg)
-    typer.echo(f"waiting for chunks in {cfg.audio_dir}  (Ctrl+C stops)\n")
-    ear = Ear(cfg, from_start=from_start, keep_audio=keep_audio)
-    try:
-        ear.run(max_seconds=max_seconds, log_silence=log_silence, echo=typer.echo)
-    except KeyboardInterrupt:
-        ear._persist(paused=False)
-        typer.echo("\nstopped")
-
-
-@app.command()
-def ctl(
-    action: CtlAction = typer.Argument(help="pause | resume | reset | status"),
-    root: str = typer.Option(None, help="runtime root (default /tmp/π)"),
-):
-    """Freeze, unfreeze, wipe, or read the state. Files, not signals."""
-    cfg = _config(root=root)
-    cfg.ensure()
-    if action is CtlAction.pause:
-        cfg.pause_file.touch()
-        typer.echo(f"paused: {cfg.pause_file} exists, the recorder keeps recording")
-    elif action is CtlAction.resume:
-        cfg.pause_file.unlink(missing_ok=True)
-        typer.echo("resumed: the ear will drain the backlog")
-    elif action is CtlAction.reset:
-        cfg.reset_file.touch()
-        typer.echo(f"reset requested: {cfg.reset_file} exists, the ear will archive and restart")
+def ctl(action: Action, root: str = ROOT):
+    """Control files, not signals: the state says what the ear is doing."""
+    places = _places(root)
+    places.ensure()
+    if action is Action.pause:
+        places.pause.touch()
+        typer.echo("paused: the recorder keeps recording, the audio becomes a backlog")
+    elif action is Action.resume:
+        places.pause.unlink(missing_ok=True)
+        typer.echo("resumed: the backlog is drained")
+    elif action is Action.reset:
+        places.reset.touch()
+        typer.echo("reset requested: everything learned is archived, the ear starts from its base")
     else:
-        payload = read_json(cfg.state_file)
-        if not payload:
-            typer.echo(f"no state yet at {cfg.state_file}")
+        state = read_json(places.state)
+        if not state:
+            typer.echo(f"no state yet at {places.state}")
             raise typer.Exit(code=1)
-        inventory = payload.get("inventory", {})
-        typer.echo(f"utc            {payload.get('utc')}")
-        typer.echo(f"revision       {payload.get('revision')}")
-        typer.echo(f"clock_s        {payload.get('clock_s')}")
-        typer.echo(f"paused         {payload.get('paused')}")
-        typer.echo(f"backlog        {payload.get('audio', {}).get('backlog_chunks')} chunks")
-        typer.echo(f"tau_floor      {inventory.get('tau_now')}")
         typer.echo(
-            f"margin_now     {inventory.get('margin_now')}  (sigma {inventory.get('margin_sigma')})"
+            f"revision {state['revision']}  session {state['session']}  stream {state['stream_s']}s  "
+            f"paused {state['paused']}  backlog {state['audio']['backlog_chunks']}"
         )
-        typer.echo(
-            f"separation     {inventory.get('separation')}  "
-            "(max cosine between two entries: 1.0 = indistinguishable)"
-        )
-        typer.echo(f"registered     {len(inventory.get('registered', []))}")
-        for entry in inventory.get("registered", []):
+        typer.echo(f"model    {json.dumps(state['model'])}")
+        for s in state["speakers"]:
             typer.echo(
-                f"  {entry['id']}  evidence={entry['evidence']:3d} "
-                f"f0={entry['f0_med_hz']:6.1f}Hz level={entry['level_med_dbfs']:7.1f}dB "
-                f"silent_for={entry['silent_for_s']}s"
+                f"  {s['id']:18s} {s['kind']:8s} {s['label'] or '':12s} evidence={s['evidence']:<5d}"
+                f" silent_for={s['silent_for_s']}s"
             )
-        typer.echo(f"candidates     {len(inventory.get('candidates', []))}")
-        for entry in inventory.get("candidates", []):
-            typer.echo(f"  {entry['id']}  evidence={entry['evidence']} f0={entry['f0_med_hz']}Hz")
-        absorbed = inventory.get("absorbed", {})
-        typer.echo(f"absorbed       {len(absorbed)} keys merged into a surviving entry")
-        typer.echo(f"counters       {json.dumps(inventory.get('counters', {}))}")
+        typer.echo(f"counters {json.dumps(state['counters'])}")
+
+
+class Kind(enum.StrEnum):
+    same = "same"
+    different = "different"
+    not_voice = "not_voice"
+    name = "name"
+
+
+@app.command()
+def correct(
+    kind: Kind,
+    rows: list[int] = typer.Argument(None, help="row numbers, as printed in events.jsonl"),
+    speaker: list[str] = typer.Option(None, help="every row of this speaker key (repeatable)"),
+    label: str = typer.Option(None, help="for `name`: what to call this voice"),
+    memory: str = MEMORY,
+):
+    """Say once what was wrong. The running ear obeys at once and learns from it.
+
+    \b
+      π-ear correct same 812 840            these two windows are one voice
+      π-ear correct different 812 901       these two are two voices
+      π-ear correct not_voice --speaker KEY that "speaker" was never a voice
+      π-ear correct name 812 --label KπX    call this voice KπX
+    """
+    places = _places(memory=memory)
+    rows = list(rows or [])
+    if speaker:
+        saved = read_json(places.checkpoint, {}) or {}
+        clusters = {c["key"]: c for c in saved.get("model", {}).get("clusters", [])}
+        for key in speaker:
+            if key not in clusters:
+                raise typer.BadParameter(f"no speaker {key} in {places.checkpoint}")
+            rows += clusters[key]["members"]
+    if not rows:
+        raise typer.BadParameter("give rows, or --speaker")
+    if kind is Kind.name and not label:
+        raise typer.BadParameter("`name` needs --label")
+    line = correction(places, kind.value, rows, label)
+    typer.echo(f"written: {json.dumps(line)}")
 
 
 @app.command()
 def snapshot(
-    tag: str = typer.Option(None, help="suffix for the snapshot file"),
-    diff: bool = typer.Option(False, "--diff", help="show the diff between the last two snapshots"),
-    root: str = typer.Option(None, help="runtime root (default /tmp/π)"),
+    tag: str = typer.Option(None), diff: bool = typer.Option(False, "--diff"), root: str = ROOT
 ):
-    """Freeze the state into a comparable copy, or compare the last two."""
-    cfg = _config(root=root)
-    cfg.ensure()
+    """Freeze a comparable copy of the state, or diff the last two."""
+    places = _places(root)
     if diff:
-        typer.echo(diff_last_two(cfg.snapshots_dir))
-        return
-    target = take_snapshot(cfg.state_file, cfg.snapshots_dir, tag=tag)
-    typer.echo(f"snapshot: {target}")
+        typer.echo(diff_last_two(places.snapshots))
+    else:
+        typer.echo(f"snapshot: {take_snapshot(places.state, places.snapshots, tag)}")
 
 
 @app.command()
-def replay(
-    window_s: float = typer.Option(None, help="analyse the backlog with a different window"),
-    k_evidence: int = typer.Option(None, help="and a different evidence bar"),
-    keep_audio: bool = typer.Option(True, "--keep-audio/--no-keep-audio", help="keep the backlog"),
-    audio_dir: str = typer.Option(None, help="replay this directory (the corpus) instead"),
-    max_seconds: float = typer.Option(None, help="stop after N seconds"),
-    root: str = typer.Option(None, help="runtime root (default /tmp/π)"),
-):
-    """Re-run a whole backlog from scratch, with fresh parameters, and compare.
+def fetch(what: str = typer.Argument("all", help="models | data | all")):
+    """Download the models and the public test corpora (~470 MB, once)."""
+    from π_ear import fetch as downloads
 
-    A frozen directory is not a live one: nothing there is being written, so the
-    completeness gate is off and the last, legitimately partial chunk of a
-    recorded session is analysed instead of skipped.
-    """
-    cfg = _config(root=root, window_s=window_s, k_evidence=k_evidence, audio_dir_override=audio_dir)
-    cfg.ensure()
-    backlog = sorted(cfg.audio_dir.glob("*.raw"))
-    if not backlog:
-        typer.echo(f"nothing to replay in {cfg.audio_dir} (was the ear run with --keep-audio?)")
-        raise typer.Exit(code=1)
-    archive(cfg.archive_dir, cfg.state_file, cfg.events_file)
-    typer.echo(f"replaying {len(backlog)} chunks, previous state archived in {cfg.archive_dir}\n")
-    ear = Ear(cfg, from_start=True, keep_audio=keep_audio, strict_chunks=False)
-    ear.run(max_seconds=max_seconds, echo=typer.echo)
+    if what in ("models", "all"):
+        downloads.models(echo=typer.echo)
+    if what in ("data", "all"):
+        downloads.data(echo=typer.echo)
+
+
+@app.command()
+def base():
+    """Re-measure the base weights on public voices the tests never use."""
+    from π_ear.public import fit_base
+    from π_ear.sense import Sensor
+
+    weights = fit_base(Sensor(contract.MODELS), contract.DATA, contract.MODELS)
+    target = base_weights_path(contract.ENCODER)
+    write_atomic(target, weights.to_dict())
+    typer.echo(f"{target}\n{weights.source}")
 
 
 def main() -> None:

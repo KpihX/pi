@@ -12,6 +12,7 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.5.4",
     "sherpa-onnx>=1.13.8",
+    "sherpa-onnx-core>=1.13.8",
     "typer>=0.27.3",
 ]
 
@@ -76,6 +77,7 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-xpu"
 url = "https://download.pytorch.org/whl/xpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
@@ -115,6 +117,7 @@ ignore = [
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.17.1",
+    "scipy>=1.18.1",
 ]
 
 [tool.pytest.ini_options]
