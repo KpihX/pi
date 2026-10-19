@@ -35,7 +35,11 @@ DEVICE = os.environ.get("PI_EAR_DEVICE", "plughw:0,6")
 ENCODER = os.environ.get("PI_EAR_ENCODER", "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 ENCODER_WINDOW_S = 2.0
 VAD_MODEL = "silero_vad.onnx"
-WHISPER_DIR = "sherpa-onnx-whisper-tiny"
+# Measured 2026-10-19 (voice/stt/IDEAS.md, "Transcription"): WER on French speech
+# tiny 16 %, base 9 %, small 3 %; small costs 0.22 s per second of audio with the
+# language given, 0.54 s without, and runs off the decision loop.
+WHISPER = os.environ.get("PI_EAR_WHISPER", "small")
+WHISPER_DIR = f"sherpa-onnx-whisper-{WHISPER}"
 WHISPER_LANGUAGE = os.environ.get("PI_EAR_LANGUAGE", "")  # empty: whisper detects it
 
 # --- formats -----------------------------------------------------------------

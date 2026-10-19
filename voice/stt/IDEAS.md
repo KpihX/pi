@@ -363,3 +363,78 @@ other than real people do. ERes2Net is the upgrade path if the twins case matter
    `same` corrections. Measured cost of not having it: one split voice in 4 rooms out of 12.
 3. **Turn changes inside a 2 s window** (the conversation case): a sub-window re-cut when the
    posterior flips, or a speaker-change detector in front of the encoder.
+
+---
+
+## v1.1 (2026-10-19): the returns of the first live session, answered
+
+`../../RETURNS.md` (the first live session on the real microphone, 21 minutes) made ten proposals,
+R1 to R10; Claude's reading added five, P1 to P5. All fifteen are in. What each became:
+
+| # | What it asked | What v1.1 does |
+|---|---|---|
+| R1 | continuity between windows | a **continuity prior** P(the next window of a run keeps its voice), learned **only** from labelled transitions (a `same` or `different` on two adjacent windows). Off until both kinds exist. Learned from the model's own decisions it would feed itself, which is the v0 loop |
+| R2 | the doubt is invisible (`p = 1.0` 104 times in 112) | **`margin`** in nats on every decision. Measured on 12 rooms, 1041 decisions: p = 1.0 in 91 %, while the margin spans 8.9 (5th percentile) to 110 nats (95th), median 56; 5 windows sit below 1 nat. Those are the ones worth a look |
+| R3 | negative dBFS is hard to read | **`rel_db`**: the level above this session's non-speech floor, the floor learned from the chunks where the VAD heard no speech. 2 min of room floor at -60 dBFS reads -60.0 +/- 1.5 (`test_two_minutes_of_room_floor_observe_nothing`) |
+| R4 | Whisper on the loop: 144 % of a core | a **scribe thread**: the loop queues a finished run and goes on. Tested with a transcriber that takes 1 s per run: the loop finishes in less than one run's time |
+| R5 | voices inside music | not built: separation and target-speaker extraction come after the arbiter. Gating (below) removes the music runs from Whisper |
+| R6 | the record mixes v0 and v1 lines | every line carries **`port: 1`** and its `session`; a `session` line opens each session (with its first chunk); a record that does not start on the port is archived whole at startup |
+| R7 | no correction was ever written | owed by KπX, live. Everything it needs is tested: obey, log, absorb, undo |
+| R8 | candidates are invisible | `candidates` in the state: rows, evidence, waiting time, current weight |
+| R9 | Whisper tiny is poor | **measured** (below), default is now `small`, int8, off the loop; `PI_EAR_WHISPER` and `PI_EAR_LANGUAGE` choose otherwise |
+| R10 | a contract for consumers | **`port.py`**, version 1: typed `Session`, `Decision`, `Text`, `Correction`, `read()` and `follow()` |
+| P1 | the 81-second hole, unexplained | **`π-ear probe`**: Silero's own probability per 32 ms frame, level and decisions, second by second, on the corpus |
+| P2 | a wrong correction would be forever | **`π-ear undo N`**: the model is rebuilt from the base by replaying every row and every other correction at the moment it was first applied |
+| P3 | rows are not how a person thinks | **`--from/--to`**: stream seconds of a session, resolved to rows; the span is kept in the line |
+| P4 | why did it decide that | **`π-ear why ROW`**: then (p, margin, level) and now (the three best explanations, in nats behind) |
+| P5 | candidates never die | **forgetting, learned**: see below |
+
+### Transcription, measured (whisper int8, 2 threads, this container)
+
+| model | WER English (LibriSpeech, 3 files) | WER French (Piper fr_FR, 5 sentences) | seconds per second of audio, French given / detected | words invented on 10 noise clips |
+|---|---|---|---|---|
+| tiny | 6 % | 16 % | 0.05 / 0.12 | 7-9 |
+| base | 5 % | 9 % | 0.06 / 0.17 | 9-10 |
+| **small** | **2 %** | **3 %** | 0.22 / 0.54 | 6-9 |
+
+Every size invents words on coughs, keyboards and laughter: a transcriber cannot be the judge of
+whether there was speech. Hence the **gate, which is not a threshold**: a finished run goes to
+Whisper only if the model recognised a voice in it (`known` or `new`). Music runs, which wrote
+`[MUSIC]` and invented Japanese in the live session, never reach it now (`runs_without_voice`).
+The French test set is synthetic; the real French number is owed by the live microphone.
+
+### Forgetting: the design that failed first, and the one that holds
+
+First design: a candidate's weight is `exp(-age * rate)`, with the rate estimated by survival
+analysis (confirmations over total waiting time, censored candidates included). **It cannot
+forget**: a candidate that keeps waiting adds its own age to the waiting time, so the rate falls as
+it ages, and its weight never drops below `exp(-confirmations)`. Caught by
+`test_a_candidate_fades_at_the_rate_this_stream_confirms_voices` before it shipped.
+
+What holds: a **cure-rate model**. A candidate is a real voice with probability `pi`, and a real
+voice is confirmed after an exponential delay of rate `lam`; otherwise (a cough, a door) it never
+is. Both are fitted by EM on this stream's own candidates (`sphere.cure_rate`). A candidate's
+weight is the posterior that it is a voice still to come, `pi e^(-lam a) / (pi e^(-lam a) + 1 - pi)`,
+which goes to zero as it waits; when it is exactly zero in float64, the candidate is dropped and
+counted. Before the first confirmation nothing fades. No constant: the delays are this room's.
+
+### Exactness of the replay, and why it needed one line
+
+`undo` is only honest if a replay gives the very same model. It did not at first: the live path
+decided on the float64 embedding, the replay on the float32 row read back from disk. The live
+path now decides on the stored float32 row too, and `test_the_memory_rebuilds_exactly_by_replay`
+compares the two models' JSON, bit for bit.
+
+### A bug the margin revealed
+
+Run tails of 6 to 22 ms (less than one fbank frame) came out of CAM++ as NaN, and v1.0 wrote
+`"p": NaN` into the record (invalid JSON, silently: 6 decisions across the 12 rooms). A sensor that cannot see now
+produces no observation (`unseeable` counter), and every simulated room asserts that no NaN
+reaches the record.
+
+### Unchanged, on purpose
+
+12 random rooms: purity 1.000 and 0 phantoms in 12 of 12, one voice split in 4 of 12: identical to
+v1.0 to the last decimal. Expected: continuity is off without labels, and four minutes is too
+short for forgetting to touch anything. v1.1 changes what the ear can say about itself and how it
+can be taught, not what it hears.

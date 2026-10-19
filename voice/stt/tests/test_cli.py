@@ -61,3 +61,50 @@ def test_replay_then_status_then_correct_by_speaker(tmp_path):
         app, ["correct", "name", "--speaker", key, "--label", "A", "--memory", memory]
     )
     assert result.exit_code == 0 and '"label": "A"' in result.output
+
+
+@needs_data
+def test_from_to_why_undo_and_probe(tmp_path):
+    from π_ear import contract
+
+    scene = Scene(seed=0).silence(2).add("A", libri(contract.DATA)["libri5703"]).silence(2)
+    scene.write(tmp_path / "chunks")
+    root, memory = str(tmp_path / "live"), str(tmp_path / "memory")
+    runner.invoke(
+        app, ["replay", str(tmp_path / "chunks"), "--root", root, "--memory", memory, "--quiet"]
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "correct",
+            "name",
+            "--from",
+            "4",
+            "--to",
+            "8",
+            "--label",
+            "A",
+            "--root",
+            root,
+            "--memory",
+            memory,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    line = json.loads((tmp_path / "memory" / "corrections.jsonl").read_text().splitlines()[0])
+    assert line["rows"] and line["span"]["from"] == 4.0
+
+    result = runner.invoke(app, ["why", str(line["rows"][0]), "--root", root, "--memory", memory])
+    assert result.exit_code == 0 and "then:" in result.output and "behind=" in result.output
+
+    result = runner.invoke(app, ["undo", "1", "--memory", memory])
+    last = json.loads((tmp_path / "memory" / "corrections.jsonl").read_text().splitlines()[-1])
+    assert result.exit_code == 0 and last == {**last, "kind": "undo", "line": 1}
+
+    result = runner.invoke(
+        app, ["probe", str(tmp_path / "chunks"), "--from", "0", "--to", "6", "--root", root]
+    )
+    assert result.exit_code == 0, result.output
+    body = result.output.splitlines()
+    assert len([b for b in body if "20261018-" in b]) == 6 and "speech probability mean" in body[-1]

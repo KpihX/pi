@@ -1,4 +1,4 @@
-# π-ear v1: the streaming ear of π
+# π-ear v1.1: the streaming ear of π
 
 Two servers and one directory, as before. The recorder never stops, the ear follows it, and what
 the ear has learned is on disk at every instant. What changed is everything that decides: v0 was
@@ -14,14 +14,16 @@ stream, and whose only teacher besides the stream is **a correction, said once**
    <the audio directory>        the whole transport between the two servers
            |
    SERVER B: the ear
-     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live)  ->  Whisper (per finished run)
+     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live)
      Model    who is it: argmax of a posterior, never a threshold
+     Scribe   its own thread: Whisper small on each finished run in which a voice was recognised
            |
    /tmp/π/state.json            atomic, ~1/s: what is known now
    /tmp/π/events.jsonl          append-only record: one line per window, per text, per correction
    ~/.cache/π/ear/model.json    the checkpoint: clusters, links, learned statistics (read at launch)
    ~/.cache/π/ear/embeddings.f32  one row per window heard, append-only
-   ~/.cache/π/ear/corrections.jsonl  what KπX said was wrong (append-only, obeyed live)
+   ~/.cache/π/ear/observations.jsonl  when and how each row was decided: the model replays from it
+   ~/.cache/π/ear/corrections.jsonl  what KπX said was wrong (append-only, obeyed live, undoable)
    ~/.cache/π/corpus/*.raw      the audio of the session, bounded, outside RAM
            ^
    /tmp/π/PAUSE  /tmp/π/RESET   control is a file, not a signal
@@ -62,25 +64,44 @@ dot product of their sums). Never from the clusters the model built itself, whic
 self-feeding loop that made v0 create 56 identities. Never from two consecutive windows of one run
 either: measured, they sit closer than one voice does across recordings.
 
-## Corrections: one case, obeyed now, absorbed into the weights
+## Corrections: one case, obeyed now, absorbed into the weights, undoable
 
 ```bash
-π-ear correct same 812 840              # these windows are one voice (fuses, lowers kappa)
-π-ear correct different 812 901         # two voices (splits, and they never re-merge)
-π-ear correct not_voice --speaker KEY   # that "speaker" was never a voice (becomes noise)
-π-ear correct name 812 --label KπX      # call this voice KπX (survives merges and restarts)
+π-ear correct same 812 840                          # these windows are one voice (fuses, lowers kappa)
+π-ear correct different 812 901                     # two voices (splits, never re-merged)
+π-ear correct not_voice --speaker KEY               # that "speaker" was never a voice (becomes noise)
+π-ear correct name 812 --label KπX                  # call this voice KπX
+π-ear correct name --from 163 --to 288 --label vid  # the same, by stream seconds of the latest session
+π-ear undo 3                                        # forget correction number 3, exactly
 ```
 
-Rows are the `row` field of `events.jsonl`. A correction is one appended line in
-`corrections.jsonl`; the running ear applies it at its next tick (fast clock), logs it in the
-record, and re-estimates its parameters (slow clock). Rows are global and survive restarts, so a
-correction can point at anything the ear has heard.
+Rows are the `row` field of `events.jsonl`; `--from/--to` is the human shortcut, resolved to the
+rows of that span (the span is kept in the correction line, the rows are the truth). A correction
+is one appended line in `corrections.jsonl`; the running ear applies it at its next tick (fast
+clock), logs it in the record with its `line` number, and re-estimates its parameters (slow
+clock). `undo N` appends one more line: the ear rebuilds its whole model from the base by
+replaying every row and every other correction at the moment it was first applied. The replay is
+bit for bit (`test_the_memory_rebuilds_exactly_by_replay`), so an undo is exact, not approximate.
+
+Two corrections also teach what the stream cannot: a `same` or `different` on two **adjacent**
+windows of one run is a labelled transition, the only evidence the continuity prior learns from.
+
+## Looking under a decision
+
+```bash
+π-ear why 812                      # what was decided then (p, margin, level), the 3 best explanations now
+π-ear probe --from 84 --to 163     # the corpus, second by second: dBFS, Silero's own probability, decisions
+π-ear probe --from 84 --to 163 --asr   # + Whisper on the whole span, ungated
+```
+
+`probe` answers "was it not speech, or speech the detector missed?" from the audio itself, the
+question RETURNS.md left open for the 81-second hole.
 
 ## Setup, in this order
 
 ```bash
 make sync     # 1. numpy + sherpa-onnx (+ sherpa-onnx-core: its onnxruntime) + typer
-make fetch    # 2. models + public corpora, ~470 MB, once, into ~/.cache/π
+make fetch    # 2. models + public corpora: ~1.1 GB downloaded once, ~850 MB kept in ~/.cache/π
 ```
 
 Then three panes:
@@ -91,22 +112,32 @@ make run      # pane 2: the ear. One line per decision.
 make watch    # pane 3: the state moving on disk.
 ```
 
-Then `make status`, `make events`, `make correct C="different 812 901"`, `make pause`,
-`make resume`, `make snapshot`, `make diff`, `make reset`, `make corpus`, `make replay-corpus`.
+Then `make status`, `make events`, `make correct C="different 812 901"`, `make undo N=3`,
+`make why ROW=812`, `make probe FROM=84 TO=163`, `make pause`, `make resume`, `make snapshot`,
+`make diff`, `make reset`, `make corpus`, `make replay-corpus`.
 
-## The record
+`PI_EAR_WHISPER=base` (or `tiny`) trades transcription quality for CPU; `PI_EAR_LANGUAGE=fr`
+skips language detection (2.5x faster, and no invented Japanese over music).
+
+## The record, and the port (`port.py`, version 1; values below are illustrative)
 
 ```json
-{"row":42,"session":"20261018-235134","t0":82.6,"t1":84.6,"decided_at":84.62,"utc":"…",
- "kind":"known","speaker":"1abeee72123db13d","label":"KπX","p":1.0,
- "runner_up":{"id":null,"p":0.0},"evidence":12,"learned":true,"run":80.6,"rms_dbfs":-28.7}
-{"kind":"text","session":"…","t0":80.6,"t1":88.1,"rows":[41,42,43],"text":"…"}
-{"kind":"correction","what":"different","rows":[812,901],"utc":"…","applied":"…"}
+{"port":1,"session":"20261019-071257","kind":"session","weights":"…","rows":121,"first_chunk":"20261019-071259.raw"}
+{"port":1,"session":"…","row":42,"t0":82.6,"t1":84.6,"decided_at":84.62,"kind":"known",
+ "speaker":"1abeee72123db13d","label":"KπX","p":1.0,"margin":187.4,
+ "runner_up":{"id":null,"p":0.0},"evidence":12,"learned":true,"run":80.6,"rms_dbfs":-28.7,"rel_db":24.1}
+{"port":1,"session":"…","kind":"text","t0":80.6,"t1":88.1,"rows":[41,42,43],"text":"…"}
+{"port":1,"session":"…","kind":"correction","what":"different","rows":[812,901],"line":3,"refused":null}
 ```
 
 `kind` is `unknown` (heard once, or a glimpse nobody matches), `new` (this window made a speaker),
-`known`, or `noise`. `p` is the posterior of the decision, `runner_up` the second explanation
-(`null` is "someone new"). Numbers only, no verdict labels. `text` lines carry the rows they cover.
+`known`, or `noise`. `p` is the posterior; it saturates at 1.0 on 192 dimensions, so **`margin`**
+(nats between the decision and the runner up) carries the doubt. `rel_db` is the level above this
+session's non-speech floor, learned from the stream (no calibration, no SPL guess). A record that
+does not start on the port (v0, v1.0) is archived whole when the ear starts.
+
+A consumer reads the port, never the internals: `port.read(path, session)` gives typed
+`Session`, `Decision`, `Text` and `Correction` events, `port.follow(path)` yields them live.
 
 ## What is measured (2026-10-18, this repository's simulated rooms)
 
@@ -120,12 +151,12 @@ Then `make status`, `make events`, `make correct C="different 812 901"`, `make p
 | sherpa-onnx Mandarin file, 4 speakers | 4 speakers |
 | synthetic twins (Piper), fused by the sensor, one `different` each | apart in the next session |
 | a laugh that became a "person", one `not_voice` | goes to noise in the next session |
-| speed | ~50x real time on 2 CPU threads |
+| speed | ~50x real time on 2 CPU threads; Whisper never on the decision loop (v1.1) |
 
 ## Tests
 
 ```bash
-make test-fast   # 43 tests, no model, no download, < 1 s: law, maths, model, disk
+make test-fast   # 50 tests, no model, no download, < 1 s: law, maths, model, disk
 make test        # + the real sensors and 20 simulated rooms (needs make fetch), ~6 min
 make check       # ruff
 ```

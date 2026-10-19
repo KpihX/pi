@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 from conftest import needs_data
 
-from π_ear import contract
-from π_ear.ear import Ear, Places, correction
+from π_ear import contract, port
+from π_ear.ear import Ear, Places, correction, rebuild
 from π_ear.io import read_json, read_jsonl
 from π_ear.public import Scene, fsdd, libri
 
@@ -177,3 +177,121 @@ def test_state_is_readable_json_with_the_numbers_downstream_needs(tmp_path, two_
         "rms_dbfs",
     } <= set(line)
     assert line["decided_at"] >= line["t1"]
+
+
+# -- v1.1 ---------------------------------------------------------------------------
+
+
+def test_every_line_is_on_the_port_and_a_session_opens_the_record(tmp_path, two_voices):
+    places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
+    places.ensure()
+    with open(places.events, "w") as handle:  # a v0 record left in /tmp/π
+        handle.write('{"t": 1.0, "speaker": {"kind": "unknown"}}\n')
+    _scene(*two_voices[:2]).write(places.audio_dir)
+    ear = _replay(places)
+    lines = read_jsonl(places.events)[0]
+    assert lines[0]["kind"] == "session" and lines[0]["first_chunk"] == "20261018-000000.raw"
+    assert all(line["port"] == 1 and line["session"] == ear.session for line in lines)
+    assert list((places.root / "archive").glob("*events.jsonl")), "the v0 record was archived"
+    decisions = [e for e in port.read(places.events) if isinstance(e, port.Decision)]
+    assert decisions and all(e.margin >= 0 for e in decisions)
+    assert any(e.rel_db is not None for e in decisions)
+
+
+def test_candidates_are_visible_in_the_state(tmp_path, two_voices):
+    places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
+    _scene(*two_voices[:2]).write(places.audio_dir)
+    _replay(places)
+    state = read_json(places.state)
+    assert "candidates" in state and state["audio"]["floor_dbfs"] is not None
+    for c in state["candidates"]:
+        assert {"id", "evidence", "rows", "waiting_s", "weight"} <= set(c)
+
+
+class SlowScribe:
+    """A transcriber that takes one second: the loop must not wait for it."""
+
+    calls = 0
+
+    def __init__(self, models):
+        pass
+
+    @staticmethod
+    def available(models):
+        return True
+
+    def __call__(self, samples):
+        SlowScribe.calls += 1
+        time.sleep(1.0)
+        return "slow words"
+
+
+def test_the_decision_loop_never_waits_for_whisper(tmp_path, two_voices, monkeypatch):
+    monkeypatch.setattr("π_ear.ear.Transcriber", SlowScribe)
+    places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
+    _scene(*two_voices[:2]).write(places.audio_dir)
+    ear = Ear(places, from_start=True, live=False)
+    started = time.monotonic()
+    while ear.tick():
+        pass
+    ear._handle(*ear.sensor.flush())
+    looped = time.monotonic() - started
+    runs = ear.counters.get("runs_transcribed", 0)
+    assert runs >= 2 and looped < runs * 1.0, "the loop waited for the scribe"
+    ear.scribe.drain()
+    texts = [e for e in read_jsonl(places.events)[0] if e.get("kind") == "text"]
+    assert len(texts) == runs and texts[0]["text"] == "slow words"
+
+
+def test_a_run_without_a_recognised_voice_is_not_transcribed(tmp_path, monkeypatch):
+    monkeypatch.setattr("π_ear.ear.Transcriber", SlowScribe)
+    from π_ear.public import esc50
+
+    laugh = esc50(contract.DATA)["laughing"][0]
+    places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
+    Scene(seed=0).silence(1).add("laugh", laugh).silence(1).write(places.audio_dir)
+    ear = Ear(places, from_start=True, live=False)
+    ear.run(drain=True)
+    assert ear.counters.get("runs_transcribed", 0) == 0
+
+
+def _frozen(model):
+    return json.dumps({k: v for k, v in model.to_dict().items()}, sort_keys=True)
+
+
+def test_the_memory_rebuilds_exactly_by_replay(tmp_path, two_voices):
+    places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
+    _scene(*two_voices[:2]).write(places.audio_dir)
+    ear = _replay(places)
+    again = rebuild(places, ear.applied)
+    assert _frozen(again) == _frozen(ear.model)
+
+
+def test_undo_forgets_one_correction_exactly(tmp_path, two_voices):
+    places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
+    _scene(*two_voices[:2]).write(places.audio_dir)
+    ear = _replay(places)
+    before = _frozen(ear.model)
+    a, b = _speakers(ear)
+    rows = [ear.model.clusters[a].members[0], ear.model.clusters[b].members[0]]
+    correction(places, "same", rows)
+    ear.tick()
+    assert len(_speakers(ear)) == 1
+    correction(places, "undo", [], line=1)
+    ear.tick()
+    assert _frozen(ear.model) == before
+    logged = [e for e in read_jsonl(places.events)[0] if e.get("kind") == "correction"]
+    assert [e["what"] for e in logged] == ["same", "undo"] and logged[1]["refused"] is None
+
+
+def test_a_tail_too_short_for_the_encoder_is_not_an_observation(tmp_path, two_voices):
+    """Measured: tails of 6-22 ms made CAM++ return NaN, and NaN reached the record."""
+    from π_ear.sense import Sensor
+
+    sensor = Sensor(contract.MODELS)
+    assert not np.all(np.isfinite(sensor.embed(two_voices[0][:100])))
+    places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
+    _scene(*two_voices[:2]).write(places.audio_dir)
+    _replay(places)
+    text = places.events.read_text()
+    assert "NaN" not in text and "Infinity" not in text

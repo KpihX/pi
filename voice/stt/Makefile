@@ -9,7 +9,7 @@ JQ := $(shell command -v jq 2>/dev/null || echo jq)
 #
 #   1. make sync      the env: numpy + sherpa-onnx (+ its onnxruntime) + typer
 #   2. make fetch     the models (Silero, CAM++, Whisper tiny, Piper voices) and
-#                     the public test corpora: ~470 MB, once, into ~/.cache/π
+#                     the public test corpora: ~1.1 GB once, ~850 MB kept, ~/.cache/π
 #   3. make rec       PANE 1: the recorder, endless 1 s chunks. NEVER stopped.
 #   4. make run       PANE 2: the ear. One line per decision, state live on disk.
 #   5. make watch     PANE 3: the state moving.
@@ -38,7 +38,7 @@ RUN_FLAGS ?=
 EAR := $(UV) run π-ear
 
 .PHONY: help sync fetch base check test test-fast rec run watch events state status \
-	pause resume reset snapshot diff correct corpus replay-corpus clean
+	pause resume reset snapshot diff correct undo why probe corpus replay-corpus clean
 
 help:  ## Show the setup order and every target
 	@echo "π-ear setup order: sync -> fetch -> rec + run + watch (three panes)"
@@ -49,7 +49,7 @@ help:  ## Show the setup order and every target
 sync:  ## [setup 1] The env, resolved by uv
 	@$(UV) sync
 
-fetch:  ## [setup 2] Models + public corpora into ~/.cache/π (~470 MB, once)
+fetch:  ## [setup 2] Models + public corpora into ~/.cache/π (~1.1 GB, once)
 	@$(EAR) fetch all
 
 base:  ## Re-measure the base weights on public voices and sounds the tests never use
@@ -88,6 +88,15 @@ status:  ## Human-readable summary
 
 correct:  ## One correction: make correct C="different 812 901" (see README)
 	@$(EAR) correct $(C) --memory $(MEMORY)
+
+undo:  ## Forget one correction exactly: make undo N=3 (its `line` in the record)
+	@$(EAR) undo $(N) --memory $(MEMORY)
+
+why:  ## What the ear decided for one window, and why: make why ROW=812
+	@$(EAR) why $(ROW) --root $(ROOT) --memory $(MEMORY)
+
+probe:  ## The corpus under the decisions: make probe FROM=84 TO=163 [ASR=--asr]
+	@$(EAR) probe $(CORPUS_DIR) --from $(FROM) --to $(TO) --root $(ROOT) $(ASR)
 
 pause:  ## Freeze the ear; the recorder keeps going and the audio becomes a backlog
 	@$(EAR) ctl pause --root $(ROOT)

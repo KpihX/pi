@@ -29,6 +29,16 @@ it. A correction changes the clusters at once (fast clock) and the weights at th
 next refresh (slow clock): the error is obeyed now and absorbed into the
 parameters, so it does not come back.
 
+Two more things are learned, never set (v1.1):
+
+* **forgetting**: a candidate (a voice heard once) loses weight as it waits.
+  The rate is the inverse of the mean time real candidates took to be confirmed
+  in this stream; before any confirmation, nothing is forgotten;
+* **continuity**: the chance that the next window of a speech run keeps the
+  same voice. It learns only from *labelled* transitions (a correction on two
+  adjacent windows), never from the model's own decisions, which would feed
+  themselves. Before any such label, windows are decided independently.
+
 The law: this module contains no numeric literal but 0 and 1, and compares
 nothing to a constant (``tests/test_law.py``).
 """
@@ -43,7 +53,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from π_ear.contract import KEY_BYTES
-from π_ear.sphere import crp_alpha, kappa_from_rho, log_c, rho2, unit
+from π_ear.sphere import crp_alpha, cure_rate, kappa_from_rho, log_c, rho2, unit
 
 VOICE = ("candidate", "speaker")
 
@@ -186,6 +196,11 @@ class Model:
         self.cannot: set[tuple[int, int]] = set()
         self.absorbed: dict[str, str] = {}
         self.pairs: dict[str, float] = {"dot": 0.0, "count": 0.0}
+        self.confirm: dict[str, float] = {"gaps": 0.0, "count": 0.0, "forgotten": 0.0}
+        self.cure: tuple[float, float] | None = None
+        self.turns: dict[str, float] = {"stay": 0.0, "switch": 0.0}
+        self.after: dict[int, int] = {}  # row -> the previous learned row of its run
+        self.now = 0.0
         for index, raw in enumerate(weights.noise):
             key = f"base-noise-{index}"
             total = np.asarray(raw["total"], dtype=np.float64)
@@ -227,9 +242,12 @@ class Model:
         self.mean0 = unit(directions)
         self.prior = self.kappa0 * self.mean0
 
+        self.cure = self._confirmation()
         voices = [c for c in self.clusters.values() if c.kind in VOICE]
+        alive = [self.survival(c) for c in voices]
         self.alpha = crp_alpha(
-            base.tables_obs + sum(c.n for c in voices), base.tables_k + len(voices)
+            base.tables_obs + sum(c.n * w for c, w in zip(voices, alive, strict=True)),
+            base.tables_k + sum(alive),
         )
         self.log_alpha = math.log(self.alpha)
         self.log_c_kappa = log_c(self.dim, self.kappa)
@@ -244,19 +262,61 @@ class Model:
         return self.log_c_kappa + self._lc(total) - self._lc(total + x)
 
     # -- the decision (fast clock) ---------------------------------------------
-    def scores(self, x: np.ndarray, kinds: tuple[str, ...]) -> dict[str | None, float]:
-        """Log posterior of every explanation of ``x``, unnormalised. None is "new"."""
-        out: dict[str | None, float] = {
-            key: math.log(c.n) + self.predictive(c.total, x)
-            for key, c in self.clusters.items()
-            if c.kind in kinds
-        }
-        out[None] = self.log_alpha + self.predictive(np.zeros(self.dim), x)
-        return out
+    def _confirmation(self):
+        """(pi, lam): how many candidates are real voices, and how fast they confirm.
 
-    def observe(self, row: int, x: np.ndarray, t: float, learn: bool) -> dict:
-        """Decide who ``x`` is. If ``learn``, the decision also becomes evidence."""
-        scored = self.scores(x, VOICE + ("noise",))
+        Survival analysis with a cured fraction (``sphere.cure_rate``), on this
+        stream's own candidates. Before the first confirmation: None, nothing fades.
+        """
+        ages = [self.now - c.first_seen for c in self.clusters.values() if c.kind == "candidate"]
+        return cure_rate(
+            self.confirm["gaps"], self.confirm["count"], ages, self.confirm["forgotten"]
+        )
+
+    def survival(self, cluster: Cluster) -> float:
+        """A candidate's weight: the posterior that it is a voice still to be confirmed."""
+        if cluster.kind != "candidate" or self.cure is None:
+            return 1.0
+        pi, lam = self.cure
+        alive = pi * math.exp(-lam * (self.now - cluster.first_seen))
+        return alive / (alive + 1 - pi)
+
+    def stay(self) -> float | None:
+        """P(the next window of a run keeps its voice), from labelled transitions only."""
+        stay, switch = self.turns["stay"], self.turns["switch"]
+        return stay / (stay + switch) if stay and switch else None
+
+    def scores(
+        self, x: np.ndarray, kinds: tuple[str, ...], previous: str | None = None
+    ) -> dict[str | None, float]:
+        """Log posterior of every explanation of ``x``, up to one constant. None is "new"."""
+        weights: dict[str | None, float] = {
+            key: c.n * self.survival(c) for key, c in self.clusters.items() if c.kind in kinds
+        }
+        weights[None] = self.alpha
+        weights = {k: w for k, w in weights.items() if w}
+        stay = self.stay()
+        if stay is not None and previous in weights:
+            mass = sum(weights.values())
+            weights = {k: (1 - stay) * w / mass for k, w in weights.items()}
+            weights[previous] += stay
+        zero = np.zeros(self.dim)
+        return {
+            key: math.log(w) + self.predictive(self.clusters[key].total if key else zero, x)
+            for key, w in weights.items()
+        }
+
+    def observe(
+        self, row: int, x: np.ndarray, t: float, learn: bool, follows: int | None = None
+    ) -> dict:
+        """Decide who ``x`` is. If ``learn``, the decision also becomes evidence.
+
+        ``follows`` is the previous learned window of the same speech run, if any:
+        the continuity prior uses it once labelled transitions exist.
+        """
+        self.now = max(self.now, t)
+        previous = self.where.get(follows) if follows is not None else None
+        scored = self.scores(x, VOICE + ("noise",), previous)
         ranked = sorted(scored.items(), key=lambda item: item[1], reverse=True)
         top = ranked[0][1]
         mass = sum(math.exp(value - top) for _, value in ranked)
@@ -264,8 +324,11 @@ class Model:
         runner = ranked[1] if ranked[1:] else (None, top)
         speakers = {k for k, c in self.clusters.items() if c.kind == "speaker"}
         if learn:
+            if follows is not None:
+                self.after[row] = follows
             choice = self._add(choice, row, x, t, "candidate")
             choice = self._merge(self._promote(choice))
+            self._forget()
             self.refresh()
         cluster = self.clusters.get(choice) if choice is not None else None
         kind = self._kind(cluster, speakers)
@@ -275,6 +338,7 @@ class Model:
             "label": cluster.label if cluster is not None else None,
             "p": math.exp(ranked[0][1] - top) / mass,
             "runner_up": {"id": runner[0], "p": math.exp(runner[1] - top) / mass},
+            "margin": top - runner[1],  # nats between the winner and the runner up
             "evidence": cluster.n if cluster is not None else 0,
             "learned": learn,
         }
@@ -325,8 +389,17 @@ class Model:
         one, many = self._one_voice(cluster.members)
         if many < one:
             cluster.kind = "speaker"
+            self.confirm["gaps"] += cluster.last_seen - cluster.first_seen
+            self.confirm["count"] += 1
             self._rename(key, centroid_key(cluster.total))
         return cluster.key
+
+    def _forget(self) -> None:
+        """Drop the candidates whose weight has run out (an exact zero, not a cut)."""
+        for key in [k for k, c in self.clusters.items() if not self.survival(c)]:
+            self.confirm["forgotten"] += 1
+            for row in self.clusters.pop(key).members:
+                self.where.pop(row, None)
 
     def _rename(self, old: str, new: str) -> None:
         cluster = self.clusters.pop(old)
@@ -401,6 +474,11 @@ class Model:
     def correct(self, kind: str, rows: list[int], label: str | None = None) -> None:
         """Obey one correction now. ``refresh`` then absorbs it into the weights."""
         known = [r for r in rows if r in self.where]
+        adjacent = [(a, b) for a in rows for b in rows if self.after.get(b) == a]
+        if kind == "same":
+            self.turns["stay"] += len(adjacent)
+        elif kind == "different":
+            self.turns["switch"] += len(adjacent)
         if kind == "name":
             for row in known:
                 self.clusters[self.where[row]].label = label
@@ -476,6 +554,10 @@ class Model:
             "cannot": sorted(self.cannot),
             "absorbed": self.absorbed,
             "pairs": self.pairs,
+            "confirm": self.confirm,
+            "turns": self.turns,
+            "after": [[row, previous] for row, previous in self.after.items()],
+            "now": self.now,
         }
 
     def load(self, raw: dict) -> None:
@@ -484,6 +566,10 @@ class Model:
         self.cannot = {tuple(pair) for pair in raw.get("cannot", [])}
         self.absorbed = dict(raw.get("absorbed", {}))
         self.pairs = dict(raw.get("pairs", self.pairs))
+        self.confirm = dict(raw.get("confirm", self.confirm))
+        self.turns = dict(raw.get("turns", self.turns))
+        self.after = {row: previous for row, previous in raw.get("after", [])}
+        self.now = raw.get("now", self.now)
         self.refresh()
 
     def summary(self) -> dict:
@@ -494,4 +580,26 @@ class Model:
             "speakers": sum(c.kind == "speaker" for c in self.clusters.values()),
             "candidates": sum(c.kind == "candidate" for c in self.clusters.values()),
             "noise": sum(c.kind == "noise" for c in self.clusters.values()),
+            "stay": self.stay(),
+            "confirmations": self.confirm["count"],
+            "candidates_real": self.cure[0] if self.cure else None,
+            "confirm_rate_per_s": self.cure[1] if self.cure else None,
         }
+
+    def explain(self, x: np.ndarray, previous: str | None = None) -> list[dict]:
+        """Every explanation of ``x`` under the current state, best first: the why."""
+        scored = self.scores(x, VOICE + ("noise",), previous)
+        top = max(scored.values())
+        out = []
+        for key, value in sorted(scored.items(), key=lambda item: item[1], reverse=True):
+            cluster = self.clusters.get(key) if key else None
+            out.append(
+                {
+                    "id": key,
+                    "kind": cluster.kind if cluster else "new",
+                    "label": cluster.label if cluster else None,
+                    "evidence": cluster.n if cluster else 0,
+                    "behind_nats": top - value,
+                }
+            )
+        return out

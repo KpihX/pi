@@ -48,6 +48,7 @@ def replay(tmp_path, scene: Scene, name: str, memory=None, asr=False):
     ear.run(drain=True)
     elapsed = time.monotonic() - started
     events = [e for e in read_jsonl(places.events)[0] if e.get("session") == ear.session]
+    assert "NaN" not in places.events.read_text(), "a NaN reached the record"
     return ear, events, elapsed
 
 
@@ -138,7 +139,8 @@ def test_a_hundred_and_sixty_indoor_sounds_make_nobody(tmp_path, sounds):
 
 def test_two_minutes_of_room_floor_observe_nothing(tmp_path):
     ear, events, _ = replay(tmp_path, Scene(seed=5).silence(120), "silence")
-    assert events == [] and len(ear.store) == 0
+    assert [e["kind"] for e in events] == ["session"] and len(ear.store) == 0
+    assert ear.state()["audio"]["floor_dbfs"] == pytest.approx(-60, abs=1.5)
 
 
 def test_a_fast_two_person_conversation(tmp_path):
@@ -246,7 +248,7 @@ def test_a_sound_said_once_not_to_be_a_voice_does_not_come_back(tmp_path, sounds
 
 def test_what_was_said(tmp_path):
     """Whisper on a finished run: the transcript joins the record, linked by row."""
-    tests = contract.MODELS / contract.WHISPER_DIR / "test_wavs"
+    tests = contract.MODELS / "sherpa-onnx-whisper-tiny" / "test_wavs"
     scene = Scene(seed=0).silence(1).add("libri1089", load(tests / "0.wav")).silence(2)
     _, events, _ = replay(tmp_path, scene, "asr", asr=True)
     texts = [e for e in events if e.get("kind") == "text"]

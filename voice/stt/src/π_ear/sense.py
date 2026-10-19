@@ -112,6 +112,9 @@ class Sensor:
             a = start + self.used
             pieces.append(Piece(a, self._slice(a, end), start, self.index, False))
 
+    def speaking(self) -> bool:
+        return bool(self.vad.is_speech_detected())
+
     def flush(self) -> tuple[list[Piece], list[Run]]:
         """End of a frozen stream: whatever speech is in progress is finished."""
         pieces: list[Piece] = []
@@ -134,17 +137,18 @@ class Transcriber:
 
     def __init__(self, models: Path):
         root = models / contract.WHISPER_DIR
+        size = contract.WHISPER
         self.recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-            encoder=str(root / "tiny-encoder.int8.onnx"),
-            decoder=str(root / "tiny-decoder.int8.onnx"),
-            tokens=str(root / "tiny-tokens.txt"),
+            encoder=str(root / f"{size}-encoder.int8.onnx"),
+            decoder=str(root / f"{size}-decoder.int8.onnx"),
+            tokens=str(root / f"{size}-tokens.txt"),
             language=contract.WHISPER_LANGUAGE,
             num_threads=contract.THREADS,
         )
 
     @staticmethod
     def available(models: Path) -> bool:
-        return (models / contract.WHISPER_DIR / "tiny-encoder.int8.onnx").exists()
+        return (models / contract.WHISPER_DIR / f"{contract.WHISPER}-encoder.int8.onnx").exists()
 
     def __call__(self, samples: np.ndarray) -> str:
         stream = self.recognizer.create_stream()
@@ -156,3 +160,27 @@ class Transcriber:
 def rms_dbfs(samples: np.ndarray) -> float:
     rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
     return 20.0 * float(np.log10(max(rms, 1e-12)))
+
+
+def speech_probability(models: Path, samples: np.ndarray) -> np.ndarray:
+    """Silero's own probability, one per 32 ms frame: what the VAD decision hides.
+
+    The live path only sees Silero's yes/no at its published operating point. A
+    probe needs the number underneath, to tell "not speech" from "speech the
+    detector missed" (RETURNS.md, the 81-second hole).
+    """
+    import onnxruntime
+
+    session = onnxruntime.InferenceSession(
+        str(models / contract.VAD_MODEL), providers=["CPUExecutionProvider"]
+    )
+    shape = session.get_inputs()[1].shape
+    h = np.zeros(shape, dtype=np.float32)
+    c = np.zeros(shape, dtype=np.float32)
+    block = session.get_inputs()[0].shape[1]
+    out = []
+    for start in range(0, len(samples) - block + 1, block):
+        x = samples[start : start + block].astype(np.float32)[None, :]
+        prob, h, c = session.run(None, {"x": x, "h": h, "c": c})
+        out.append(float(prob[0][0]))
+    return np.asarray(out)

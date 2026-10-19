@@ -89,7 +89,7 @@ def fit_base(sensor, data: Path, models: Path):
         return [sensor.embed(w) for w in windows(x)]
 
     groups = {s: [recording(u) for u in fsdd(data, s, range(0, 20))] for s in BASE_FSDD}
-    tests = models / contract.WHISPER_DIR / "test_wavs"
+    tests = models / "sherpa-onnx-whisper-tiny" / "test_wavs"
     groups["libri1089"] = [recording(load(tests / "0.wav"))]
     groups["libri1221"] = [recording(load(tests / "1.wav")), recording(load(tests / "8k.wav"))]
     sizes = {k: sum(len(r) for r in v) for k, v in groups.items()}

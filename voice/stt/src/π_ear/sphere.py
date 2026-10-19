@@ -85,3 +85,30 @@ def crp_alpha(observations: float, tables: float) -> float:
         else:
             high = mid
     return math.exp(0.5 * (low + high))
+
+
+def cure_rate(gaps: float, confirmed: float, ages: list[float], forgotten: float):
+    """(pi, lam) of a cure-rate survival model, by EM.
+
+    A candidate is a real voice with probability ``pi``, and a real voice is
+    confirmed after an exponential delay of rate ``lam``; otherwise it never is
+    (a cough, a door). Inputs: the delays of the confirmed candidates, the ages
+    of the ones still waiting, and how many were already forgotten (their
+    posterior was an exact zero, so they count as never confirmed).
+
+    A plain exponential cannot do this: a candidate that waits long lowers its
+    own rate, so it is never forgotten. The mixture is what lets "heard once,
+    never again" fade to nothing.
+    """
+    if not confirmed:
+        return None
+    ages = np.asarray(ages, dtype=np.float64)
+    waiting = len(ages) + forgotten
+    pi = confirmed / (confirmed + waiting)
+    lam = confirmed / max(gaps + float(ages.sum()), _TINY)
+    for _ in range(50):
+        alive = pi * np.exp(-lam * ages)
+        w = alive / np.maximum(alive + (1.0 - pi), _TINY)
+        pi = (confirmed + float(w.sum())) / (confirmed + waiting)
+        lam = confirmed / max(gaps + float((w * ages).sum()), _TINY)
+    return min(pi, 1.0 - _TINY), lam

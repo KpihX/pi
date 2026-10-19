@@ -2,7 +2,10 @@
 
 π-ear run        the ear, live, following the recorder's directory
 π-ear ctl        pause | resume | reset | status
-π-ear correct    same | different | not_voice | name   ROWS...  (one case, obeyed now)
+π-ear correct    same | different | not_voice | name   ROWS | --from --to | --speaker
+π-ear undo       one correction, forgotten exactly (the model is replayed without it)
+π-ear why        ROW: what the ear decided for that window, and what it would say now
+π-ear probe      a span of recorded audio, second by second: level, speech probability, decisions
 π-ear snapshot   freeze the state, or --diff the last two
 π-ear replay     a recorded directory (the corpus), from a fresh or the current memory
 π-ear fetch      the models and the public corpora
@@ -18,8 +21,8 @@ from pathlib import Path
 
 import typer
 
-from π_ear import contract
-from π_ear.ear import Ear, Places, base_weights_path, correction
+from π_ear import contract, port
+from π_ear.ear import Ear, Places, base_weights_path, correction, load_memory
 from π_ear.io import diff_last_two, read_json, write_atomic
 from π_ear.io import snapshot as take_snapshot
 
@@ -117,47 +120,191 @@ def ctl(action: Action, root: str = ROOT):
                 f"  {s['id']:18s} {s['kind']:8s} {s['label'] or '':12s} evidence={s['evidence']:<5d}"
                 f" silent_for={s['silent_for_s']}s"
             )
+        for c in state.get("candidates", []):
+            typer.echo(
+                f"  {c['id']:18s} candidate              evidence={c['evidence']:<5d}"
+                f" waiting={c['waiting_s']}s weight={c['weight']}"
+            )
+        typer.echo(
+            f"floor    {state['audio'].get('floor_dbfs')} dBFS (this session's non-speech level)"
+        )
         typer.echo(f"counters {json.dumps(state['counters'])}")
 
 
-class Kind(enum.StrEnum):
+class Kind(enum.StrEnum):  # `undo` has its own command
     same = "same"
     different = "different"
     not_voice = "not_voice"
     name = "name"
 
 
+def _rows_between(places: Places, start: float, end: float, session: str | None) -> list[int]:
+    """The rows of a session whose window overlaps [start, end] stream seconds."""
+    session = session or port.latest_session(places.events)
+    return [
+        e.row
+        for e in port.read(places.events, session)
+        if isinstance(e, port.Decision) and e.t0 < end and start < e.t1
+    ]
+
+
 @app.command()
 def correct(
     kind: Kind,
     rows: list[int] = typer.Argument(None, help="row numbers, as printed in events.jsonl"),
+    start: float = typer.Option(None, "--from", help="every row from this stream second..."),
+    end: float = typer.Option(None, "--to", help="...to this one (of --session, default latest)"),
+    session: str = typer.Option(None, help="the session --from/--to refer to"),
     speaker: list[str] = typer.Option(None, help="every row of this speaker key (repeatable)"),
     label: str = typer.Option(None, help="for `name`: what to call this voice"),
+    root: str = ROOT,
     memory: str = MEMORY,
 ):
     """Say once what was wrong. The running ear obeys at once and learns from it.
 
     \b
-      π-ear correct same 812 840            these two windows are one voice
-      π-ear correct different 812 901       these two are two voices
-      π-ear correct not_voice --speaker KEY that "speaker" was never a voice
-      π-ear correct name 812 --label KπX    call this voice KπX
+      π-ear correct same 812 840               these two windows are one voice
+      π-ear correct different 812 901          these two are two voices
+      π-ear correct name --from 163 --to 288 --label vidéo
+      π-ear correct not_voice --speaker KEY    that "speaker" was never a voice
+      π-ear correct name 812 --label KπX       call this voice KπX
     """
-    places = _places(memory=memory)
+    places = _places(root, memory)
     rows = list(rows or [])
+    extra = {}
+    if (start is None) != (end is None):
+        raise typer.BadParameter("--from and --to go together")
+    if start is not None:
+        found = _rows_between(places, start, end, session)
+        if not found:
+            raise typer.BadParameter(f"no decided window between {start} s and {end} s")
+        rows += found
+        extra["span"] = {
+            "from": start,
+            "to": end,
+            "session": session or port.latest_session(places.events),
+        }
     if speaker:
-        saved = read_json(places.checkpoint, {}) or {}
-        clusters = {c["key"]: c for c in saved.get("model", {}).get("clusters", [])}
+        model, _, _ = load_memory(places)
         for key in speaker:
-            if key not in clusters:
+            if key not in model.clusters:
                 raise typer.BadParameter(f"no speaker {key} in {places.checkpoint}")
-            rows += clusters[key]["members"]
+            rows += model.clusters[key].members
     if not rows:
-        raise typer.BadParameter("give rows, or --speaker")
+        raise typer.BadParameter("give rows, --from/--to, or --speaker")
     if kind is Kind.name and not label:
         raise typer.BadParameter("`name` needs --label")
-    line = correction(places, kind.value, rows, label)
-    typer.echo(f"written: {json.dumps(line)}")
+    line = correction(places, kind.value, sorted(set(rows)), label, **extra)
+    typer.echo(f"written: {json.dumps(line, ensure_ascii=False)}")
+
+
+@app.command()
+def undo(
+    line: int = typer.Argument(..., help="the correction's line number (`line` in the record)"),
+    memory: str = MEMORY,
+):
+    """Forget one correction. The running ear replays its whole memory without it."""
+    written = correction(_places(memory=memory), "undo", [], line=line)
+    typer.echo(f"written: {json.dumps(written)}")
+
+
+@app.command()
+def why(row: int, root: str = ROOT, memory: str = MEMORY):
+    """What the ear decided for this window, and how it would explain it now."""
+    places = _places(root, memory)
+    model, store, _ = load_memory(places)
+    if row >= len(store):
+        raise typer.BadParameter(f"row {row} does not exist ({len(store)} rows)")
+    then = next(
+        (e for e in port.read(places.events) if isinstance(e, port.Decision) and e.row == row),
+        None,
+    )
+    if then:
+        typer.echo(
+            f"row {row}  session {then.session}  [{then.t0}-{then.t1}] s  {then.rms_dbfs} dBFS"
+            f"  rel {then.rel_db} dB  learned={then.learned}"
+        )
+        typer.echo(
+            f"  then: {then.kind} {then.label or then.speaker or ''}  p={then.p}"
+            f"  margin={then.margin} nats  evidence={then.evidence}"
+        )
+    where = model.where.get(row)
+    typer.echo(
+        f"  now : in {where or 'no cluster'}"
+        + (f" ({model.clusters[where].kind})" if where else "")
+    )
+    previous = model.where.get(model.after.get(row)) if row in model.after else None
+    for rank, option in enumerate(model.explain(store(row), previous)[:3], 1):
+        typer.echo(
+            f"    {rank}. {option['id'] or 'someone new':18s} {option['kind']:9s}"
+            f" {option['label'] or '':10s} evidence={option['evidence']:<5d}"
+            f" behind={option['behind_nats']:.1f} nats"
+        )
+
+
+@app.command()
+def probe(
+    audio_dir: str = typer.Argument(None, help="recorded chunks (default: the corpus)"),
+    start: float = typer.Option(0.0, "--from", help="stream second where the span starts"),
+    end: float = typer.Option(None, "--to", help="stream second where it ends"),
+    session: str = typer.Option(None, help="map seconds through this session's first chunk"),
+    asr: bool = typer.Option(False, "--asr", help="also transcribe the whole span, ungated"),
+    root: str = ROOT,
+):
+    """Look under the decisions: Silero's own probability, second by second.
+
+    Answers "was it not speech, or speech the detector missed?" from the audio
+    itself, without touching the memory.
+    """
+    import numpy as np
+
+    from π_ear.io import load_raw
+    from π_ear.sense import Transcriber, rms_dbfs, speech_probability
+
+    places = _places(root)
+    directory = Path(audio_dir) if audio_dir else contract.CORPUS
+    chunks = sorted(directory.glob("*.raw"))
+    if not chunks:
+        raise typer.BadParameter(f"no chunk in {directory}")
+    session = session or port.latest_session(places.events)
+    opening = next(
+        (e for e in port.read(places.events, session) if isinstance(e, port.Session)), None
+    )
+    names = [c.name for c in chunks]
+    origin = names.index(opening.first_chunk) if opening and opening.first_chunk in names else 0
+    first = origin + int(start)
+    last = min(len(chunks), origin + int(end if end is not None else len(chunks)))
+    span = chunks[first:last]
+    if not span:
+        raise typer.BadParameter("the span holds no chunk")
+    audio = [load_raw(c) for c in span]
+    probs = speech_probability(contract.MODELS, np.concatenate(audio))
+    per = len(probs) / max(len(span), 1)
+    decided = (
+        [e for e in port.read(places.events, session) if isinstance(e, port.Decision)]
+        if opening
+        else []
+    )
+    typer.echo(f"{directory}  chunks {first}..{last - 1}  session {session if opening else '-'}")
+    typer.echo("  t(s)  chunk                  dBFS   speech p mean / max   ear")
+    for index, (chunk, x) in enumerate(zip(span, audio, strict=True)):
+        p = probs[int(index * per) : int((index + 1) * per)]
+        t = start + index
+        said = [
+            f"{e.kind}:{(e.label or e.speaker or '-')[:8]}"
+            for e in decided
+            if e.t0 <= t + 1 and t < e.t1
+        ]
+        typer.echo(
+            f"  {t:5.0f}  {chunk.name:22s} {rms_dbfs(x):6.1f}   {p.mean() if p.size else 0:6.3f} /"
+            f" {p.max() if p.size else 0:5.3f}       {' '.join(sorted(set(said)))}"
+        )
+    typer.echo(
+        f"  span: speech probability mean {probs.mean():.3f}, max {probs.max():.3f},"
+        f" over {len(probs)} frames of 32 ms"
+    )
+    if asr and Transcriber.available(contract.MODELS):
+        typer.echo(f"  whisper (ungated): {Transcriber(contract.MODELS)(np.concatenate(audio))!r}")
 
 
 @app.command()

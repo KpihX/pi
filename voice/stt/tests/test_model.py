@@ -11,6 +11,7 @@ import numpy as np
 from conftest import World, vmf
 
 from π_ear.model import Model
+from π_ear.sphere import unit
 
 
 def _purity(model: Model, truth: dict[int, int]) -> tuple[int, float]:
@@ -171,3 +172,105 @@ def test_keys_are_stable_and_merges_keep_the_oldest():
         world.feed(model, store, x)
     assert model.where[0] == key
     assert np.isfinite(model.kappa)
+
+
+# -- v1.1 ---------------------------------------------------------------------------
+
+
+def test_the_margin_says_what_p_hides(world):
+    """p saturates at 1.0 on 192 dimensions; the margin in nats keeps the doubt legible."""
+    model, store = world.model()
+    a, b = world.voices(2)
+    for mu in (a, b):
+        for x in world.windows(mu, 6):
+            world.feed(model, store, x)
+    clear = world.feed(model, store, world.windows(a, 1)[0])
+    halfway = unit(a + b)
+    torn = world.feed(model, store, halfway, learn=False)
+    assert clear["p"] == torn["p"] == 1.0 or clear["margin"] > torn["margin"]
+    assert clear["margin"] > torn["margin"] >= 0
+
+
+def test_nothing_is_forgotten_before_anything_was_confirmed(world):
+    model, store = world.model()
+    for x in world.voices(5):
+        world.feed(model, store, x)
+    model.now += 10**6
+    assert all(model.survival(c) == 1.0 for c in model.clusters.values())
+
+
+def test_a_candidate_fades_at_the_rate_this_stream_confirms_voices():
+    world = World(seed=21)
+    model, store = world.model()
+    voice = world.voices(1)[0]
+    for x in world.windows(voice, 3):  # confirmed one second after its first window
+        world.feed(model, store, x)
+    lonely = world.voices(1)[0]
+    world.feed(model, store, lonely)
+    key = model.where[len(store) - 1]
+    fresh = model.survival(model.clusters[key])
+    model.now += 60
+    model.refresh()
+    assert model.survival(model.clusters[key]) < fresh
+    model.now += 10**6  # long enough for the weight to be an exact zero
+    model.refresh()
+    model._forget()
+    assert key not in model.clusters, "a weight of exactly zero is forgotten"
+
+
+def test_candidates_that_never_come_back_are_explained_as_noise():
+    """Survival with a cured fraction: windows heard once and never again lower
+    the share of candidates that are real voices, instead of slowing everyone."""
+    world = World(seed=22)
+    model, store = world.model()
+    for x in world.windows(world.voices(1)[0], 3):
+        world.feed(model, store, x)
+    alone = model.cure[0]
+    for x in world.voices(10):
+        world.feed(model, store, x)
+    model.now += 100
+    model.refresh()
+    assert model.cure[0] < alone
+
+
+def test_continuity_learns_only_from_labelled_transitions(world):
+    model, store = world.model()
+    voice = world.voices(1)[0]
+    rows = []
+    for x in world.windows(voice, 6):
+        store.append(x)
+        row = len(store) - 1
+        model.observe(row, x, float(row), True, rows[-1] if rows else None)
+        rows.append(row)
+    assert model.stay() is None, "the model's own decisions never teach it continuity"
+    model.correct("same", rows[:3])
+    assert model.stay() is None, "one kind of label only: still nothing to estimate"
+    model.correct("different", rows[3:5])
+    assert model.stay() == 2 / 3
+
+
+def test_continuity_breaks_a_tie_toward_the_voice_that_was_speaking():
+    world = World(seed=23)
+    model, store = world.model()
+    a, b = world.voices(2)
+    last = {}
+    for mu, name in ((a, "a"), (b, "b")):
+        for x in world.windows(mu, 8):
+            world.feed(model, store, x)
+            last[name] = len(store) - 1
+    model.turns.update(stay=99.0, switch=1.0)
+    tie = unit(a + b)
+    after_a = model.explain(tie, model.where[last["a"]])[0]["id"]
+    after_b = model.explain(tie, model.where[last["b"]])[0]["id"]
+    assert after_a == model.where[last["a"]] and after_b == model.where[last["b"]]
+
+
+def test_explain_ranks_every_explanation(world):
+    model, store = world.model()
+    voice = world.voices(1)[0]
+    for x in world.windows(voice, 4):
+        world.feed(model, store, x)
+    options = model.explain(world.windows(voice, 1)[0])
+    assert options[0]["id"] == model.where[0] and options[0]["behind_nats"] == 0
+    assert any(o["id"] is None for o in options), "someone new is always an option"
+    assert [o["behind_nats"] for o in options] == sorted(o["behind_nats"] for o in options)

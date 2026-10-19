@@ -568,3 +568,20 @@ document.
 
 End of the document. If you are continuing the work: the ear is honest, the record is complete, and
 the next real gain is not a new model, it is a labelled case.
+
+---
+
+## 12. Rectifications (2026-10-19, Claude, after reading this file against the code)
+
+Append-only: the sections above stay as written; these lines correct what they say about v1, so
+that the next reader does not build on a misreading. Each one was checked in the code.
+
+| § | As written above | What the code does |
+|---|---|---|
+| 4, item 1 | "the base carries two kinds of voices (recorded and synthetic)" | Both kinds are **recorded**: FSDD and LibriSpeech. The Piper voices only ever appear in tests (the twins case). |
+| 4, items 2 and 3 | "a hidden Unknown mass", "kappa = 192 is a zero information sphere" | The base holds **five noise clusters** measured on ESC-50 folds 1-3; they compete with the voices like any cluster. `kappa` is estimated from pairs of windows taken from two *different* recordings of one voice, on the true 192-d sphere (Banerjee's inversion of the mean resultant length). |
+| 5.3 | "two windows decided unknown, then absorbed anyway: the unconscious absorption path" | Simpler: the first window of every voice is `unknown` (a singleton), and becomes a member when the second joins it and the pair is promoted. 13 `known` + 1 `new` + that first window = 15 members. There is no hidden absorption path. |
+| 5.3 | "`c70` will die if it never recurs" | In v1.0 **nothing died**: there was no forgetting in the code. This was a real gap, fixed in v1.1 (a cure-rate survival model, learned from the stream). |
+| 5.4 | "the first window of a run is a glimpse that the next window confirms" | A glimpse is the *tail* of a run, shorter than the 2 s encoder window (`learned: false` in the record). The first window of a run is a full window. |
+
+What v1.1 does with the proposals of section 8 is in `voice/stt/IDEAS.md`, section "v1.1".

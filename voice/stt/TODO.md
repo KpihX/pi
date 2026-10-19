@@ -285,3 +285,20 @@ comes from public recordings replayed through the real path. In three panes: `ma
 `make run`, `make watch`; then a film, a second person, coughs, KπX's own whisper. After it,
 correct what is wrong with `π-ear correct`, and run it again: the paradigm says the same errors do
 not come back, and that is now a measurement to make, not a promise.
+
+---
+
+## Done 2026-10-19: v1.1, from RETURNS.md (KπX: "carte blanche pour la v1.1")
+
+All ten proposals of `../../RETURNS.md` section 8, plus five of Claude's, are in, measured, and
+tested (91 tests). The list, the numbers and the two designs that failed on the way are in
+`IDEAS.md`, section "v1.1".
+
+**Owed by KπX on the real microphone, in this order:**
+
+1. `make probe FROM=84 TO=163` on the corpus of session `20261019-071257`, if it is still in the
+   corpus (one hour rolling): it says whether the 81-second hole was speech or not.
+2. One correction, live: `make correct C="name ROW --label KπX"`, then the same situation again.
+3. One `undo`, to see the model come back exactly.
+4. A conversation with a second person in the room, then `make why ROW=...` on a doubtful window
+   (the smallest `margin` in the record).

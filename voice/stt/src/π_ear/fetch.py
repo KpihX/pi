@@ -38,7 +38,9 @@ MODELS = {
     contract.ENCODER: f"{RELEASES}/speaker-recongition-models/{contract.ENCODER}",
 }
 ARCHIVES = {
-    contract.WHISPER_DIR: f"{RELEASES}/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
+    # tiny is kept: its archive carries the LibriSpeech test files the base is measured on
+    "sherpa-onnx-whisper-tiny": f"{RELEASES}/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
+    contract.WHISPER_DIR: f"{RELEASES}/asr-models/{contract.WHISPER_DIR}.tar.bz2",
     "vits-piper-en_US-libritts_r-medium": f"{RELEASES}/tts-models/vits-piper-en_US-libritts_r-medium.tar.bz2",
 }
 
@@ -82,6 +84,8 @@ def models(root: Path = contract.MODELS, echo=print) -> None:
             tarfile.open(fileobj=io.BytesIO(response.read()), mode="r:bz2").extractall(
                 root, filter="data"
             )
+        for heavy in (root / name).glob("*coder.onnx"):  # only the int8 models are used
+            heavy.unlink()
         echo(f"model   {root / name}")
 
 
