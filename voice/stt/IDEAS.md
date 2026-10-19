@@ -272,3 +272,94 @@ What is left to build is the sensor, not the state.
 only as numbers, so the exact session could not be replayed at all. The ear now copies every chunk
 it ingests into a durable, bounded corpus under the home (`--corpus-dir`, one hour by default),
 outside the RAM directory. That is what turns the sentence above into a plan instead of a hope.
+
+---
+
+## The rebuild: π-ear v1 (2026-10-18, night, on KπX's order "refais entièrement l'oreille")
+
+The order of `TODO.md` ("the POC is to be rebuilt, ultra compact") is executed. v0's decision layer
+(`physics.py`, `inventory.py`, 582 lines, seven deciding constants) is gone; the transport, the
+atomic state, the append-only record, the file controls and the corpus survived, as planned. The
+package is now 1928 lines, 1407 of them code once docstrings and comments are out: 1116 for the
+system itself and 291 for the downloads and the simulated rooms (`fetch.py`, `public.py`). The
+decision module, `model.py`, is 374 lines of code, and `tests/test_law.py` fails if a hand-set
+number comes back into it. Honest note against the target of "a few hundred lines": the system is
+smaller than v0 (1543 lines of source) but not yet a few hundred; the docstrings are long on
+purpose, they carry the measurements.
+
+### The answer to "the form of a correction" (left open above, now proposed and built)
+
+A correction is **a constraint between rows of the record**: `same`, `different`, `not_voice`,
+`name`. One line appended to `corrections.jsonl`, written by `π-ear correct`. It is obeyed at the
+next tick (the clusters change at once) and absorbed into the weights at the refresh that follows
+(`same` adds every cross pair to the statistics `kappa` is estimated from; `different` adds a
+cannot-link that no merge may cross; `not_voice` moves the windows into a noise cluster, which then
+competes for every future window). Still open for KπX: whether a correction should also be able to
+name a *time span* ("from this second to that second there were two voices"); rows were chosen
+because they point at exact evidence.
+
+### Sensor choice: measured, not taken from the literature
+
+EER on real public voices, 2-second windows unless stated (lab script, 2026-10-18):
+
+| encoder | LibriSpeech (3 spk) | FSDD (6 spk) | Piper TTS (12 voices) |
+|---|---|---|---|
+| **CAM++ zh-cn common (27 MB, 192-d)**, 1.0 s | 11.8 % | 12.7 % | 26.8 % |
+| **CAM++ zh-cn common**, 1.5 s | 4.7 % | 9.3 % | 21.0 % |
+| **CAM++ zh-cn common**, 2.0 s, **chosen** | **0.0 %** | **8.9 %** | 13.3 % |
+| CAM++ en VoxCeleb, 2.0 s | 0.0 % | 17.4 % | 33.3 % |
+| WeSpeaker ResNet34, 2.0 s | 3.1 % | 19.8 % | 11.7 % |
+| ERes2Net base, 2.0 s | 0.6 % | 9.3 % | 6.7 % |
+
+Synthetic voices are the hardest case: one VITS model makes 904 voices that sit closer to each
+other than real people do. ERes2Net is the upgrade path if the twins case matters (38 MB).
+
+### Three measured failures of v1 during its own build, and what they changed
+
+| What was tried | What was measured | What replaced it |
+|---|---|---|
+| `kappa` estimated from the model's own clusters | the v0 loop again in a new form: tighter clusters raise kappa, which cuts tighter clusters | `kappa` learns only from pairs *known* to share a voice: the labelled base and the `same` corrections |
+| `kappa` from two consecutive windows of one run (self-supervision from time) | kappa 283 -> 527 in five simulated minutes: adjacent windows are closer than one voice across recordings | dropped |
+| an "effective dimension" vMF (d_eff ~ 11 measured from pair moments) | more fragmentation, not less: a broad prior on an 11-sphere makes "someone new" too probable | reverted to the true 192-d sphere |
+| no noise model at all | a sustained pouring-water clip, which Silero calls speech, became a "speaker" in 1 room of 6 | the base hears ESC-50 folds 1-3 (5 noise clusters); tests only use fold 5 |
+
+### Measurements of v1 (simulated rooms from public recordings, 1 s chunks, the real path)
+
+- **12 random rooms** (6 real voices, indoor sounds between turns, gains -12..0 dB, floor -70..-50
+  dBFS): purity **1.000 in 12/12**, phantoms **0 in 12/12**, coverage 0.85-0.91. One voice split
+  in two in **4/12** rooms (FSDD lucas across takes, LibriSpeech 5703 across gains). The split is
+  the safe error, and one `same` fixes it for the next sessions (`test_a_split_voice_said_once_to_be_one_stays_one`).
+- **160 indoor sounds** never heard by the base: no speaker, except at most one long laugh. That is
+  not a phantom by the pole's own definition: CAM++ hears the person who laughs.
+- **two minutes of room floor**: zero observations (v0 registered a person in four seconds).
+- **fast conversation** (pyannote sample): 2 speakers, purity >= 0.7 with 2 s windows over turns
+  of 0.4-4 s. This is the window's limit, not the model's.
+- **four Mandarin speakers**: 4.
+- **restart**: same keys for the same voices the next day, rows and revision continue (E4, now
+  answered across restarts).
+- **cost**: ~50x real time on 2 CPU threads; a record line is ~270 bytes (E5).
+
+### What the hypotheses E1..E9 now say
+
+| # | status after v1 |
+|---|---|
+| E1 explicit state, useful at t=0 | **confirmed**: unknown, then new, then known, from an empty memory, no ritual |
+| E2 evidence-gated registration | **replaced and confirmed**: the evidence bar is a posterior, 0 phantoms in 12 rooms + 160 sounds |
+| E3 adaptive threshold | falsified (v0), and there is no threshold left to adapt |
+| E4 stable key across restarts | **confirmed** (`test_a_restart_keeps_every_name_and_every_row`) |
+| E5 cheap record | **confirmed**: ~270 B per window, ten hours of speech ~5 MB |
+| E6 `f0_pctl` separates speakers | **dropped**: the pitch estimator was hand-written physics; CAM++ separates, and the record carries `rms_dbfs` only |
+| E7 TTT bias-only adaptation | open, next |
+| E8 the record is sufficient for the agentic pole | open: needs the arbiter |
+| E9 whisper regime | open: needs KπX's own voice, on the real microphone |
+
+### Next, in order
+
+1. **The real microphone.** Everything above is simulated from public recordings. `make rec` +
+   `make run` on `plughw:0,6`, KπX's voice, a film, a second person: the numbers that matter.
+2. **Fragmentation across conditions.** The model treats windows as independent given a voice,
+   which is over-confident when one voice has modes (two rooms, two days). The principled next
+   step is a third level (voice -> condition -> window), with the condition spread learned from
+   `same` corrections. Measured cost of not having it: one split voice in 4 rooms out of 12.
+3. **Turn changes inside a 2 s window** (the conversation case): a sub-window re-cut when the
+   posterior flips, or a speaker-change detector in front of the encoder.

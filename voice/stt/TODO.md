@@ -263,3 +263,25 @@ matrices). Both are Phase 4 material at the earliest.
 
 The three questions of `IDEAS.md` answered with numbers, written back into `IDEAS.md`, and every
 hypothesis marked confirmed, falsified, or still open.
+
+---
+
+## Done 2026-10-18 (night): the ear is rebuilt (KπX: "refais entièrement l'oreille, end to end")
+
+The section "The POC is to be rebuilt, ultra compact" above is executed. Summary, details in
+`IDEAS.md` ("The rebuild: π-ear v1") and `README.md`:
+
+- **dead**: the descriptor, the pitch estimator, the voicing gate, the identity boundary, the seven
+  deciding constants, and the tests that held them;
+- **kept**: the transport, the completeness gate, PAUSE/RESET as files, the live loop, the atomic
+  state, the append-only record, the durable corpus, the replay;
+- **new**: Silero + CAM++ as frozen sensors, one Bayesian model (vMF + CRP) whose parameters are
+  statistics, base weights measured on public data, corrections as a channel, a checkpoint read
+  back at launch (the two items "still owed" above are both fixed: every line carries a `session`,
+  and the state is read back, so a voice keeps its key across restarts), and a law test.
+
+**Still owed, and only KπX can do it: the live test on the real microphone.** Every number above
+comes from public recordings replayed through the real path. In three panes: `make rec`,
+`make run`, `make watch`; then a film, a second person, coughs, KπX's own whisper. After it,
+correct what is wrong with `π-ear correct`, and run it again: the paradigm says the same errors do
+not come back, and that is now a measurement to make, not a promise.

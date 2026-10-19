@@ -165,3 +165,17 @@ choose.
 - Choosing a model before measuring it.
 - A voice that cannot be interrupted.
 - A cloned voice chosen before the identity question is settled.
+
+---
+
+## Status update, 2026-10-18 (night): the ear is rebuilt
+
+The header line "nothing measured yet inside π" is out of date for the ear (the mouth is unchanged).
+`stt/` now holds **π-ear v1**: frozen sensors (Silero VAD, CAM++), one Bayesian model with no
+hand-set number in its decision path (enforced by a test), base weights measured on public data,
+corrections as a channel (`same`, `different`, `not_voice`, `name`), and a memory read back at
+launch. Measured on simulated rooms built from public recordings: purity 1.000 and zero phantoms in
+12 rooms out of 12. Slice B ("a me / not-me score every 100 ms") is superseded by the shape the law
+asked for: a speaker posterior every 2 s of speech, from an empty state. Slice E (the gate as the
+arbiter's non-semantic prior) is now possible: the record carries `speaker`, `label` and `p`.
+Details: `stt/IDEAS.md`, section "The rebuild: π-ear v1". Owed next: the real microphone.
