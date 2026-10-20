@@ -1,0 +1,199 @@
+"""The recognisers: *what* was said. Frozen sensors, pluggable, measured.
+
+Every recogniser is a callable ``samples -> Hypothesis``: a text, its words with
+their times and their log-probabilities when the model gives them, and the
+language. Nothing here decides which reading is right; that is ``words.py``.
+
+International by default, measured 2026-10-20 on real and synthetic speech
+(``voice/ear/IDEAS.md``, "v2, the what"):
+
+    recogniser            WER en   WER fr   s per s of audio   words invented on noise
+    parakeet-v3 (fast)     3 %      6 %         0.16                2 / 10
+    whisper-turbo (slow)   2 %      9 %         1.14                8 / 10
+    whisper-small          2 %     19 %         0.89                6 / 10
+    canary-180m            1 %     15 %         0.25                2-9 / 10
+
+Parakeet TDT 0.6b v3 (25 European languages, punctuation, word times) hears
+first; Whisper turbo (99 languages) hears again in the silences. Two different
+models on purpose: where they disagree is where the ear does not know.
+
+Anything else plugs in by name (``REGISTRY``) or by import path
+(``PI_EAR_FAST=mypackage.module:factory``): a factory takes the models directory
+and returns a callable with this signature.
+"""
+
+from __future__ import annotations
+
+import importlib
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+from π_ear import contract
+
+
+@dataclass(frozen=True, slots=True)
+class Word:
+    text: str
+    t0: float
+    t1: float
+    logp: float | None  # mean token log-probability, when the recogniser gives one
+
+
+@dataclass(frozen=True, slots=True)
+class Hypothesis:
+    text: str
+    words: tuple[Word, ...] = field(default_factory=tuple)
+    language: str | None = None
+    source: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "text": self.text,
+            "language": self.language,
+            "source": self.source,
+            "words": [[w.text, round(w.t0, 2), round(w.t1, 2), w.logp] for w in self.words],
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> Hypothesis | None:
+        if not raw:
+            return None
+        words = tuple(Word(t, a, b, p) for t, a, b, p in raw.get("words", []))
+        return cls(raw["text"], words, raw.get("language"), raw.get("source", ""))
+
+
+Recognizer = Callable[[np.ndarray], Hypothesis]
+
+
+def words_of(tokens, times, logps, end: float) -> tuple[Word, ...]:
+    """Tokens to words: a token that starts with a space (or ``▁``) starts a word."""
+    words: list[Word] = []
+    current, start, scores = "", 0.0, []
+
+    def at(index: int) -> float:
+        return times[index] if index < len(times) else end
+
+    for index, token in enumerate(tokens):
+        begins = token.startswith((" ", "▁")) or not current
+        if begins and current.strip():
+            words.append(_word(current, start, at(index), scores))
+            current, scores = "", []
+        if begins and not current:
+            start = at(index)
+        current += token.replace("▁", " ")
+        if logps is not None and index < len(logps):
+            scores.append(float(logps[index]))
+    if current.strip():
+        words.append(_word(current, start, end, scores))
+    return tuple(words)
+
+
+def _word(text: str, t0: float, t1: float, scores: list[float]) -> Word:
+    return Word(text.strip(), float(t0), float(t1), float(np.mean(scores)) if scores else None)
+
+
+class Sherpa:
+    """Any sherpa-onnx offline recogniser, wrapped into a ``Recognizer``."""
+
+    def __init__(self, name: str, recognizer, language: str | None = None):
+        self.name = name
+        self.recognizer = recognizer
+        self.language = language
+
+    def __call__(self, samples: np.ndarray) -> Hypothesis:
+        stream = self.recognizer.create_stream()
+        stream.accept_waveform(contract.RATE, samples)
+        self.recognizer.decode_stream(stream)
+        result = stream.result
+        logps = list(result.ys_log_probs) if len(result.ys_log_probs) else None
+        end = len(samples) / contract.RATE
+        words = words_of(list(result.tokens), list(result.timestamps), logps, end)
+        language = (result.lang or "").strip("<|>") or self.language
+        return Hypothesis(result.text.strip(), words, language, self.name)
+
+
+def _parakeet(models: Path) -> Sherpa:
+    import sherpa_onnx
+
+    root = models / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    return Sherpa(
+        "parakeet-v3",
+        sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=str(root / "encoder.int8.onnx"),
+            decoder=str(root / "decoder.int8.onnx"),
+            joiner=str(root / "joiner.int8.onnx"),
+            tokens=str(root / "tokens.txt"),
+            num_threads=contract.THREADS,
+            model_type="nemo_transducer",
+        ),
+    )
+
+
+def _whisper(size: str):
+    def build(models: Path) -> Sherpa:
+        import sherpa_onnx
+
+        root = models / f"sherpa-onnx-whisper-{size}"
+        return Sherpa(
+            f"whisper-{size}",
+            sherpa_onnx.OfflineRecognizer.from_whisper(
+                encoder=str(root / f"{size}-encoder.int8.onnx"),
+                decoder=str(root / f"{size}-decoder.int8.onnx"),
+                tokens=str(root / f"{size}-tokens.txt"),
+                language=contract.LANGUAGE,
+                num_threads=contract.THREADS,
+            ),
+            contract.LANGUAGE or None,
+        )
+
+    return build
+
+
+def _canary(models: Path) -> Sherpa:
+    """Canary needs its language: the ear's ``PI_EAR_LANGUAGE``, English otherwise."""
+    import sherpa_onnx
+
+    root = models / "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8"
+    language = contract.LANGUAGE or "en"
+    return Sherpa(
+        "canary-180m",
+        sherpa_onnx.OfflineRecognizer.from_nemo_canary(
+            encoder=str(root / "encoder.int8.onnx"),
+            decoder=str(root / "decoder.int8.onnx"),
+            tokens=str(root / "tokens.txt"),
+            src_lang=language,
+            tgt_lang=language,
+            num_threads=contract.THREADS,
+        ),
+        language,
+    )
+
+
+REGISTRY: dict[str, tuple[str, Callable[[Path], Recognizer]]] = {
+    "parakeet-v3": ("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8", _parakeet),
+    "whisper-turbo": ("sherpa-onnx-whisper-turbo", _whisper("turbo")),
+    "whisper-small": ("sherpa-onnx-whisper-small", _whisper("small")),
+    "whisper-base": ("sherpa-onnx-whisper-base", _whisper("base")),
+    "canary-180m": ("sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8", _canary),
+}
+
+
+def available(name: str, models: Path) -> bool:
+    if not name or name == "none":
+        return False
+    if ":" in name:
+        return True
+    return name in REGISTRY and (models / REGISTRY[name][0]).exists()
+
+
+def build(name: str, models: Path) -> Recognizer | None:
+    """A recogniser by registry name or ``module:factory``; None if absent or ``none``."""
+    if not available(name, models):
+        return None
+    if ":" in name:
+        module, factory = name.split(":", 1)
+        return getattr(importlib.import_module(module), factory)(models)
+    return REGISTRY[name][1](models)

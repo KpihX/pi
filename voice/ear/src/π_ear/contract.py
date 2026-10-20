@@ -8,7 +8,7 @@ forbid a format. Three kinds of number live here, and nowhere else:
 * the **sensor's own operating points**: the frozen encoder and the frozen VAD
   are used the way their authors published them, exactly like their weights.
   ``ENCODER_WINDOW_S`` is the one value chosen here, and it was measured, not
-  guessed (``voice/stt/IDEAS.md``, "Sensor choice"): CAM++ on 1.0 s of speech
+  guessed (``voice/ear/IDEAS.md``, "Sensor choice"): CAM++ on 1.0 s of speech
   gives an EER of 11.8 % on real LibriSpeech voices, 0.0 % on 2.0 s. Below that
   length an embedding is a glimpse, decided but never learned from;
 * **resource bounds**: how much disk a store may take, how often the loop
@@ -35,8 +35,21 @@ DEVICE = os.environ.get("PI_EAR_DEVICE", "plughw:0,6")
 ENCODER = os.environ.get("PI_EAR_ENCODER", "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 ENCODER_WINDOW_S = 2.0
 VAD_MODEL = "silero_vad.onnx"
+# What was said (asr.py): international by default, measured 2026-10-20 (IDEAS.md,
+# "v2, the what"). FAST hears first and is re-run on the speech in progress, so the
+# text appears while it is said; SLOW hears again in the silences. Any registry name,
+# any "module:factory", or "none".
+FAST = os.environ.get("PI_EAR_FAST", "parakeet-v3")
+SLOW = os.environ.get("PI_EAR_SLOW", "whisper-turbo")
+LANGUAGE = os.environ.get("PI_EAR_LANGUAGE", "")  # empty: the recognisers detect it
+# Voice out of music before the slow reading (Q6). Off: measured 2026-10-20, the
+# sherpa-onnx Spleeter int8 stems came out 130 times louder than their input and
+# uncorrelated with the voice (WER 3 % -> 18 % at 0 dB music), while Parakeet and
+# Whisper turbo read through the music on their own (3 % and 5 % at 0 dB). The
+# slot stays: "sherpa-onnx-spleeter-2stems-int8", or any separator that works.
+SEPARATOR = os.environ.get("PI_EAR_SEPARATOR", "none")
+# kept for the base: its archive carries the LibriSpeech test files
 WHISPER_DIR = "sherpa-onnx-whisper-tiny"
-WHISPER_LANGUAGE = os.environ.get("PI_EAR_LANGUAGE", "")  # empty: whisper detects it
 
 # --- formats -----------------------------------------------------------------
 KEY_BYTES = 8  # a speaker key is 16 hex characters

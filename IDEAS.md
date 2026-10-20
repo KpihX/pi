@@ -5,7 +5,7 @@
 > **Correction 2026-10-18 (KπX): the rest of this line was my misreading and is superseded.**
 > The original said "no code structure, no codebase to set up, no framework chosen". What was
 > actually said: *do not rush into a frozen architecture, brainstorm first, build POCs, mini
-> projects*. A POC is allowed to be a package, and the ear's POC now is one (`voice/stt/`, uv
+> projects*. A POC is allowed to be a package, and the ear's POC now is one (`voice/ear/`, uv
 > package `π-ear`). What survives from the original line: no GUI, and no framework decision
 > before measurement.
 > English only. Related umbrella: `../../KpihX-Labs/𝛱/` (strategy, capital, business vectors).
@@ -98,7 +98,7 @@ score normalisation. The user never performs a setup, and the system still has a
 number written by hand is a decision the model should have taken. Every threshold of the first ear
 POC (the identity descriptor, the pitch estimator, the voicing gate, the identity boundary) is
 therefore an architectural defect, not a tuning detail, and the list lives in
-`voice/stt/TODO.md` with the line counts.
+`voice/ear/TODO.md` with the line counts.
 
 **The direction is not data science.** Classic practice cleans a dataset, trains, deploys, then
 finds out in the field whether it works, and a correction costs a new dataset and a new training
@@ -134,6 +134,37 @@ fixed. No format is written into this project until it is.
 **Why this is not perfectionism.** A hand-set constant is a place the system cannot learn, and
 therefore a place where the same error will happen again forever. A model corrected once does not
 repeat that error, which is the only real definition of a system that improves with use.
+
+### The third law: every model knows when it does not know (KπX, 2026-10-20)
+
+**The guiding line of every model brick of π, in every pole: a self-aware model.** Not a model that
+always runs toward a minimum and answers with the same assurance whether it is right or lost, but
+one that carries, with each output, an honest account of its own state: *I know*, *I am unsure*,
+*I do not know*, *I did not understand*. Being able to say "I don't know" is not a failure mode to
+be trained away; it is the first output of a model one can trust.
+
+In engineering terms, a brick is lawful only if:
+
+1. **Its doubt is an output, not a log.** Every decision travels with a measure of its own
+   confidence that a consumer can read (in the ear: `kind = unknown`, `margin` in nats, `p`), and
+   that measure is honest: high where the model is often right, low where it is often wrong.
+2. **"I don't know" is a first-class answer**, never a fallback or an exception: `unknown`, a
+   candidate, a clarification asked, a silence. A model forced to always pick its best guess hides
+   its ignorance inside its answer.
+3. **It knows what kind of not-knowing it is in.** "I have never met this" (missing knowledge, it
+   should learn) is not "this is truly ambiguous" (noise, two readings are equally possible), and
+   neither is "my sensor cannot see this" (a 6 ms tail, a mixture, a whisper). Each calls for a
+   different act: learn, ask, or abstain.
+4. **It uses its doubt.** It asks when two readings lead to two different actions, it revisits a
+   decision when new evidence lands, and it spends its slow clock on what it was least sure of.
+5. **It is checked.** Like the second law: a brick whose stated confidence is never compared with
+   what actually happened (the corrections are exactly that comparison) is not lawful yet.
+
+Why this is the same paradigm, not a fourth idea: the human model of the second law is corrected
+one case at a time, and you can only correct well a model that tells you where it hesitates. A
+model that is sure of everything makes every correction a surprise; a model that says "here I am
+not sure" makes the correction a conversation. That is what trust is made of.
+
 
 ---
 
@@ -204,7 +235,7 @@ several languages, whatever wins on measurement. The outside is **one contract**
 - **Integrable, not dependent.** π plugs into any host system as a whole module and
   depends on none. Same module on the workstation and on the phone.
 - **Latency is a design constraint, not a tuning afterthought.** Measured, printed,
-  and owned by the architecture. Numbers in `voice/stt/RESEARCH.md` section 8.
+  and owned by the architecture. Numbers in `voice/ear/RESEARCH.md` section 8.
 
 ---
 
@@ -212,7 +243,7 @@ several languages, whatever wins on measurement. The outside is **one contract**
 
 | Pole | Question it answers | Directory | Existing evidence |
 |---|---|---|---|
-| **Vocal** | **the ear**: who is speaking, is it me, is it addressed to me, what was said. **The mouth**: what to say, in which voice, and whether to speak at all | `voice/` (`stt/`, `tts/`) | live-listen, `colab`, atlas STT/TTS, opencode-web-stream |
+| **Vocal** | **the ear**: who is speaking, is it me, is it addressed to me, what was said. **The mouth**: what to say, in which voice, and whether to speak at all | `voice/` (`ear/`, `tts/`) | live-listen, `colab`, atlas STT/TTS, opencode-web-stream |
 | **Memory** | what is true, what changed, what do I know about him | `memory/` | atlas typed memory, live-listen single summary, meeting-colab ledger + replayable projections, LiveMem |
 | **Agentic** | should I act now, how, through which agent | `agentic/` | `colab` (ACP), opencode-web-stream streamer, atlas floor manager, kairos `decide/` |
 | **Visual** | how to show it live, in the same clock as the voice | `vision/` | `../../KpihX-Labs/𝛱/live/` (Scene IR + Live Motor + Conductor) |
@@ -220,7 +251,7 @@ several languages, whatever wins on measurement. The outside is **one contract**
 The vocal pole is **bidirectional**, which is why it carries two research dossiers
 instead of one. They have opposite constraints:
 
-- **The ear** (`voice/stt/`): survive a very low signal, and answer *whose* voice it is.
+- **The ear** (`voice/ear/`): survive a very low signal, and answer *whose* voice it is.
   Its enemy is invention, a model that hallucinates as energy drops.
 - **The mouth** (`voice/tts/`): be believable, and be stoppable in the middle of a
   phrase. Its enemy is latency (a sentence that arrives after it was useful) and monotony.
@@ -280,7 +311,7 @@ question is answered*, never *never build anything*. Measured state today:
 
 - `π/` is a git repository (`git init`, branch `master`: this machine is the single infra allowed
   to commit on master).
-- The ear's POC is a real uv package at `voice/stt/` (`π-ear`, module `π_ear`; the distribution name
+- The ear's POC is a real uv package at `voice/ear/` (`π-ear`, module `π_ear`; the distribution name
   stays `pi-ear` because the packaging standard is ASCII-only): `pyproject.toml`, `src/`, `tests/`,
   `Makefile`. Dependencies are added with `uv add` only, never hand-written into the dependency list.
 - The repository is named `pi` on both remotes (`github.com/kpihx-labs/pi` and
@@ -304,8 +335,8 @@ question is answered*, never *never build anything*. Measured state today:
    write original code.
 6. **One pole, one ideas file.** Graved 2026-10-18: every pole owns an `IDEAS.md` next to its
    `RESEARCH.md`, and a pole is never left with a blank `RESEARCH.md` and no `IDEAS.md`. Current
-   map: `voice/IDEAS.md` is the pole hub, `voice/stt/IDEAS.md` owns the ear,
-   `voice/tts/IDEAS.md` owns the mouth, and the live ear test plan is `voice/stt/TODO.md`.
+   map: `voice/IDEAS.md` is the pole hub, `voice/ear/IDEAS.md` owns the ear,
+   `voice/tts/IDEAS.md` owns the mouth, and the live ear test plan is `voice/ear/TODO.md`.
 7. **Kernel hands off. Standing order, graved 2026-10-18 (KπX).** Do not touch `k-context`, or
    any file outside `π/`, without an explicit request from KπX in the current conversation.
    No action that was not explicitly requested. This order is recorded here because `π/` is the

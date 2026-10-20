@@ -1,4 +1,4 @@
-# stt/: the ear, ideas, hypotheses, what to test
+# ear/: the ear, ideas, hypotheses, what to test
 
 > Numbers and sources: `RESEARCH.md` (Part 0 is the current spine, Part 1 is the frozen baseline).
 > Pole level (the law, the ear/mouth split, the shared hypotheses H1..H10, the slices A..G):
@@ -363,3 +363,205 @@ other than real people do. ERes2Net is the upgrade path if the twins case matter
    `same` corrections. Measured cost of not having it: one split voice in 4 rooms out of 12.
 3. **Turn changes inside a 2 s window** (the conversation case): a sub-window re-cut when the
    posterior flips, or a speaker-change detector in front of the encoder.
+
+---
+
+## v1.1 (2026-10-19): the returns of the first live session, answered
+
+`../../RETURNS.md` (the first live session on the real microphone, 21 minutes) made ten proposals,
+R1 to R10; Claude's reading added five, P1 to P5. All fifteen are in. What each became:
+
+| # | What it asked | What v1.1 does |
+|---|---|---|
+| R1 | continuity between windows | a **continuity prior** P(the next window of a run keeps its voice), learned **only** from labelled transitions (a `same` or `different` on two adjacent windows). Off until both kinds exist. Learned from the model's own decisions it would feed itself, which is the v0 loop |
+| R2 | the doubt is invisible (`p = 1.0` 104 times in 112) | **`margin`** in nats on every decision. Measured on 12 rooms, 1041 decisions: p = 1.0 in 91 %, while the margin spans 8.9 (5th percentile) to 110 nats (95th), median 56; 5 windows sit below 1 nat. Those are the ones worth a look |
+| R3 | negative dBFS is hard to read | **`rel_db`**: the level above this session's non-speech floor, the floor learned from the chunks where the VAD heard no speech. 2 min of room floor at -60 dBFS reads -60.0 +/- 1.5 (`test_two_minutes_of_room_floor_observe_nothing`) |
+| R4 | Whisper on the loop: 144 % of a core | a **scribe thread**: the loop queues a finished run and goes on. Tested with a transcriber that takes 1 s per run: the loop finishes in less than one run's time |
+| R5 | voices inside music | not built: separation and target-speaker extraction come after the arbiter. Gating (below) removes the music runs from Whisper |
+| R6 | the record mixes v0 and v1 lines | every line carries **`port: 1`** and its `session`; a `session` line opens each session (with its first chunk); a record that does not start on the port is archived whole at startup |
+| R7 | no correction was ever written | owed by KπX, live. Everything it needs is tested: obey, log, absorb, undo |
+| R8 | candidates are invisible | `candidates` in the state: rows, evidence, waiting time, current weight |
+| R9 | Whisper tiny is poor | **measured** (below), default is now `small`, int8, off the loop; `PI_EAR_WHISPER` and `PI_EAR_LANGUAGE` choose otherwise |
+| R10 | a contract for consumers | **`port.py`**, version 1: typed `Session`, `Decision`, `Text`, `Correction`, `read()` and `follow()` |
+| P1 | the 81-second hole, unexplained | **`π-ear probe`**: Silero's own probability per 32 ms frame, level and decisions, second by second, on the corpus |
+| P2 | a wrong correction would be forever | **`π-ear undo N`**: the model is rebuilt from the base by replaying every row and every other correction at the moment it was first applied |
+| P3 | rows are not how a person thinks | **`--from/--to`**: stream seconds of a session, resolved to rows; the span is kept in the line |
+| P4 | why did it decide that | **`π-ear why ROW`**: then (p, margin, level) and now (the three best explanations, in nats behind) |
+| P5 | candidates never die | **forgetting, learned**: see below |
+
+### Transcription, measured (whisper int8, 2 threads, this container)
+
+| model | WER English (LibriSpeech, 3 files) | WER French (Piper fr_FR, 5 sentences) | seconds per second of audio, French given / detected | words invented on 10 noise clips |
+|---|---|---|---|---|
+| tiny | 6 % | 16 % | 0.05 / 0.12 | 7-9 |
+| base | 5 % | 9 % | 0.06 / 0.17 | 9-10 |
+| **small** | **2 %** | **3 %** | 0.22 / 0.54 | 6-9 |
+
+Every size invents words on coughs, keyboards and laughter: a transcriber cannot be the judge of
+whether there was speech. Hence the **gate, which is not a threshold**: a finished run goes to
+Whisper only if the model recognised a voice in it (`known` or `new`). Music runs, which wrote
+`[MUSIC]` and invented Japanese in the live session, never reach it now (`runs_without_voice`).
+The French test set is synthetic; the real French number is owed by the live microphone.
+
+### Forgetting: the design that failed first, and the one that holds
+
+First design: a candidate's weight is `exp(-age * rate)`, with the rate estimated by survival
+analysis (confirmations over total waiting time, censored candidates included). **It cannot
+forget**: a candidate that keeps waiting adds its own age to the waiting time, so the rate falls as
+it ages, and its weight never drops below `exp(-confirmations)`. Caught by
+`test_a_candidate_fades_at_the_rate_this_stream_confirms_voices` before it shipped.
+
+What holds: a **cure-rate model**. A candidate is a real voice with probability `pi`, and a real
+voice is confirmed after an exponential delay of rate `lam`; otherwise (a cough, a door) it never
+is. Both are fitted by EM on this stream's own candidates (`sphere.cure_rate`). A candidate's
+weight is the posterior that it is a voice still to come, `pi e^(-lam a) / (pi e^(-lam a) + 1 - pi)`,
+which goes to zero as it waits; when it is exactly zero in float64, the candidate is dropped and
+counted. Before the first confirmation nothing fades. No constant: the delays are this room's.
+
+### Exactness of the replay, and why it needed one line
+
+`undo` is only honest if a replay gives the very same model. It did not at first: the live path
+decided on the float64 embedding, the replay on the float32 row read back from disk. The live
+path now decides on the stored float32 row too, and `test_the_memory_rebuilds_exactly_by_replay`
+compares the two models' JSON, bit for bit.
+
+### A bug the margin revealed
+
+Run tails of 6 to 22 ms (less than one fbank frame) came out of CAM++ as NaN, and v1.0 wrote
+`"p": NaN` into the record (invalid JSON, silently: 6 decisions across the 12 rooms). A sensor that cannot see now
+produces no observation (`unseeable` counter), and every simulated room asserts that no NaN
+reaches the record.
+
+### Unchanged, on purpose
+
+12 random rooms: purity 1.000 and 0 phantoms in 12 of 12, one voice split in 4 of 12: identical to
+v1.0 to the last decimal. Expected: continuity is off without labels, and four minutes is too
+short for forgetting to touch anything. v1.1 changes what the ear can say about itself and how it
+can be taught, not what it hears.
+
+---
+
+## The third law, in this pole: a model that knows when it does not know (KπX, 2026-10-20)
+
+The guiding line of every model brick of π (`../../IDEAS.md`, section 0): not a model that always
+runs toward a minimum, but one that says, with each output, whether it knows, hesitates, or does
+not know, and which kind of not-knowing it is in.
+
+What the ear already does, and what it still lacks:
+
+| | already | still owed |
+|---|---|---|
+| who | `unknown` as an answer, `margin` in nats, `p`, candidates that fade | calibration of the margin against corrections (is a small margin often wrong?) |
+| what | nothing: Whisper writes text with no doubt attached | a per-word confidence, "I did not understand" as an output, a revision in the silences (proposed 2026-10-20, not decided yet) |
+| the sensor | a NaN tail is not an observation | saying *which* doubt: unseen voice, true ambiguity, or a sensor out of its domain (music, whisper, overlap) |
+
+---
+
+## v2 (2026-10-20): who and what, one ear (KπX: "W1 à W6, Q1 à Q6, la totale")
+
+The third law, built in both halves. Every number below is measured on public recordings
+written as 1 s chunks and replayed through the real path; the tests hold them.
+
+### What, the plan and what it became
+
+| | asked | built |
+|---|---|---|
+| W1 | the text while it is said | `partial` lines: the fast recogniser (Parakeet TDT 0.6b v3) re-reads the run in progress whenever it is free, latest audio wins, nothing queues |
+| W2 | revise in the silences | `text` r0 from the fast reading at the run's end, r1 from Whisper turbo in the next silence; corrections are absorbed there too (the scribe's thread never runs ahead of the decision loop) |
+| W3 | say what it does not know | a named doubt per text, a trust and `agreed`/`new` marks per word, the other readings kept, and a `question` when the doubt is `ambiguous` or `not_understood` |
+| W4 | corrections of text | `text` corrections and answers: a lexicon per voice, substitutions learned from the alignment, recall of corrected runs; candidates, never silent rewrites |
+| W5 | learned weights | the reader is a Bayesian conditional logit, evidence maximised (`sphere.fit_choice`), refitted on the slow clock on every example ever seen |
+| W6 | calibrated | `p` of the chosen reading is the logit's own, trained on outcomes; words likewise |
+
+The recognisers, measured (WER en on LibriSpeech, fr on Piper UPMC, int8, 2 threads):
+parakeet-v3 3 % / 6 % at 0.16 s per s; whisper-turbo 2 % / 9 % at 1.14; whisper-small 2 % /
+19 %; canary-180m 1 % / 15 % but 2 to 9 words invented on 10 noise clips. Two different models on
+purpose: where they disagree is where the ear does not know.
+
+**A correction is trusted the first time.** First design: the base weights learned on plain runs
+only; the weights of `edits` and `recall` started at zero and a corrected error came back once
+before the reader learned to trust what it was taught. Fixed by *correction episodes* in the
+base: every public run the recognisers got wrong is corrected once and heard again, with and
+without the recall of that very run.
+
+**The first sentence of a new voice was never read.** v1.1 sent a run to Whisper only if a voice
+was recognised in it; a voice's first run is still a candidate (`unknown`), so its first sentence
+was lost. Now every run that is not entirely a known sound is read, and whether anything was said
+is the reader's call. To make that call honest the reader gained `none_unspoken`, one minus
+Silero's mean speech probability over the run (measured: 0.82 to 0.94 on speech, under 0.78 on 27
+of 28 indoor sounds that pass the VAD), and the base now hears the ESC-50 sounds as the VAD lets
+them through. On the 160 sounds of fold 5, 14 runs reach the reader: 8 invented a word before, 4
+now (`"Yeah."`, marked `unseen`), 10 are `not_understood`.
+
+**A word confirmed by its own reading.** The two recognisers agreeing put a word in the lexicon
+*before* the decision, so a word heard for the first time was already "known" and the doubt read
+`clear`. The lexicon now learns after the decision: the first time is `unseen`, then known.
+
+**A doubt the memory resolves is not a doubt.** After one answer, the recognisers still disagree on
+"KπX", and v2's first build asked again every time. New doubt kind `taught`: they disagree, and
+what KπX taught is the most probable reading. Not asked.
+
+### Who, v2
+
+**Q2, conditions and voices.** Base kappa is now measured *within* one recording in one place
+(465), kappa_c across places for one voice (449). 12 random rooms: no voice split (v1: 4 of 12).
+
+**The place prior, found by a failure.** With the hierarchy alone the pyannote two-person sample
+became *one* voice. Not kappa (forcing it from 476 to 600 changed nothing) and not the code: the
+generative model itself preferred one voice by 26 nats, because the two voices of that room are
+closer to each other (cos 0.49) than the population says two voices are (0.35): they share a
+channel. Centring the prior of a new voice on the room reversed it (+42 nats for two). Built as a
+level of the model: places, with `kappa_in` (voices around their place, 212) and `kappa_p`
+(places around the population, 359), measured on four simulated places in which every base voice
+was heard, and the place's mean estimated from the voices already heard there. The pyannote
+sample: 2 voices.
+
+**Q4, turns.** Shadow windows offset by 1 s are decided (never learned: they would count the same
+audio twice), and the `turns` line gives each half window the voice of the more confident window
+covering it: 0.625 of the learned windows right on the pyannote sample, 0.75 of the time by the
+turns; 0.99 or more in the rooms. **Failed design**: detecting a turn inside a window by
+comparing its two 1 s halves. Measured on that sample: same-speaker halves at cos 0.40 to 0.72,
+two-speaker halves at 0.28 to 0.51. Too much overlap for a sensor; not built.
+
+**Another place, another day.** The six voices of day 1 heard on day 2 through another simulated
+place: most come back under new keys (the place moves every voice further than the base's places
+did). One `same` per voice, and day 3, in that second place, gives each voice its day-1 key
+again. Two things this needed: noise heard through places too in the base (a door and a toilet
+flush heard through a reverberant room became two phantoms), and the memory's clock never running
+backwards (a replay faster than real time started its session before the last one ended, and
+"the oldest voice keeps its name" kept the wrong one).
+
+**Q3, person or device.** The mean spectral shape of a voice's windows (24 mel bands, level
+removed) against two diagonal Gaussians learned on public recordings heard live and through a
+simulated loudspeaker. 3 pairs (a person in the room, another voice from a loudspeaker): 5 of 6
+right, the miss a device heard as a person at p 0.77. `device` or `person` said once is final for
+that voice and teaches the two classes.
+
+**Q1, trust.** `trust` = P(right | margin), a logistic on the margin fitted on the base's own
+replay (182 public decisions, 93 % right: 0.50 at 0 nats, 0.71 at 10, 0.94 at 30), then on what
+every correction says about the decisions it touches. None before it has seen itself both right
+and wrong.
+
+**Q5, asking a name.** A voice of an earlier session, back and still nameless: one `question`,
+answered by `inbox.answer(id, text=...)`; the answer is replayed exactly by `undo`.
+
+**Q6, music: separation measured and refused.** Spleeter (2 stems, int8, sherpa-onnx 1.13.8) made
+reading worse at every level of music: WER 2 % -> 5 % at 6 dB, 3 % -> 18 % at 0 dB, 5 % -> 36 %
+at -6 dB (Parakeet; Whisper turbo worse still). Its stems came out about 130 times louder than the
+input and uncorrelated with the voice; only their sum gave the mix back. The recognisers read
+through the music on their own. The separator slot stays (`PI_EAR_SEPARATOR`), off. For who:
+the room with music all along at 10 dB under the speech keeps purity 1.000 and no split; at 5 dB
+two voices split (the safe error); the music alone is never a person.
+
+### The plug points
+
+`port.py` is version 2: `Turns`, `Partial`, `Text`, `Question` join `Session`, `Decision` and
+`Correction`. `port.Inbox` is the one way in, for a terminal, the arbiter or a voice: `correct`,
+`answer`, `undo`. Recognisers by registry name or `module:factory`. Nothing in the ear knows who
+is on the other side of the inbox, which is the point: when the mouth exists, a spoken answer
+is the same line as a typed one.
+
+**Who is asked, and when.** First build: a `question` for every `ambiguous` or `not_understood`
+text, so every cough that reached the reader asked "what was said?". Now: `ambiguous` asks; a
+`not_understood` asks only in a run of a known voice (someone spoke and the ear missed it); a
+sound nobody owns, not understood, asks nothing. Measured on fold 5: no question from 160 sounds.

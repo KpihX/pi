@@ -121,3 +121,15 @@ The **interface between the visual pole and π**, nothing else.
   renderer attached at all, which is exactly the "integrable, not dependent" test.
 - **What is the minimal proof?** One spoken sentence and one Scene IR patch that moves on
   the same clock. No styling, no polish.
+
+---
+
+## The third law, in this pole: a model that knows when it does not know (KπX, 2026-10-20)
+
+The guiding line of every model brick of π (`../IDEAS.md`, section 0): not a model that always
+runs toward a minimum, but one that says, with each output, whether it knows, hesitates, or does
+not know, and which kind of not-knowing it is in.
+
+For the visual pole: a figure shown on an uncertain reading must look uncertain (or not be shown),
+and the renderer must be able to say "I have no figure for this" instead of producing a
+plausible but wrong one.

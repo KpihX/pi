@@ -149,3 +149,16 @@ afterwards, the transparency requirement is not met.
 - State that lives in a UI.
 - Silent failure. A visible degraded state beats a hidden one (`PBS-008`: TTS was down
   while speeches were recorded as played).
+
+---
+
+## The third law, in this pole: a model that knows when it does not know (KπX, 2026-10-20)
+
+The guiding line of every model brick of π (`../IDEAS.md`, section 0): not a model that always
+runs toward a minimum, but one that says, with each output, whether it knows, hesitates, or does
+not know, and which kind of not-knowing it is in.
+
+For the arbiter: "I do not know whether to speak" is a state, not a coin flip. Idea 6 above
+("ask when two readings lead to two different actions") is the third law in this pole; the
+ear's `margin` and the memory's confidences are its inputs, and an uncertain arbiter stays
+silent or asks, it never acts loudly on a guess.

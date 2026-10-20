@@ -1,4 +1,4 @@
-# stt/TODO.md: the live test on the microphone
+# ear/TODO.md: the live test on the microphone
 
 > The paradigm is not tested by a download (`../RESEARCH.md` R0.11). It is tested by **one capture
 > session** and **three questions**. Everything below runs on this machine, locally, offline.
@@ -285,3 +285,43 @@ comes from public recordings replayed through the real path. In three panes: `ma
 `make run`, `make watch`; then a film, a second person, coughs, KπX's own whisper. After it,
 correct what is wrong with `π-ear correct`, and run it again: the paradigm says the same errors do
 not come back, and that is now a measurement to make, not a promise.
+
+---
+
+## Done 2026-10-19: v1.1, from RETURNS.md (KπX: "carte blanche pour la v1.1")
+
+All ten proposals of `../../RETURNS.md` section 8, plus five of Claude's, are in, measured, and
+tested (91 tests). The list, the numbers and the two designs that failed on the way are in
+`IDEAS.md`, section "v1.1".
+
+**Owed by KπX on the real microphone, in this order:**
+
+1. `make probe FROM=84 TO=163` on the corpus of session `20261019-071257`, if it is still in the
+   corpus (one hour rolling): it says whether the 81-second hole was speech or not.
+2. One correction, live: `make correct C="name ROW --label KπX"`, then the same situation again.
+3. One `undo`, to see the model come back exactly.
+4. A conversation with a second person in the room, then `make why ROW=...` on a doubtful window
+   (the smallest `margin` in the record).
+
+---
+
+## Done 2026-10-20: v2, who and what (KπX: "fais la totale, W1 à W6 et Q1 à Q6")
+
+Built, measured and tested: the *what* (W1 partials while it is said, W2 revision in the
+silences, W3 named doubt and word trust, W4 text corrections with a living lexicon,
+substitutions and recall, W5 a learned reader refitted on the slow clock, W6 calibrated trust),
+the *who* v2 (Q1 trust from the margin, Q2 voices / conditions / places, Q3 person or device,
+Q4 turns by the half window, Q5 asking a name, Q6 music: measured, see `IDEAS.md`), and the
+plug points (`port.Inbox`, questions, any recogniser by name or import path). The numbers and the
+designs that failed are in `IDEAS.md`, section "v2".
+
+**Owed by KπX on the real microphone, in this order:**
+
+1. `make fetch` (Parakeet v3 and Whisper turbo, ~1.6 GB more), then `make run` and speak: the
+   `partial` lines should follow the voice, the `text` r1 lines come in the silences.
+2. Say a name the recognisers do not know (KπX itself). `make questions`, then
+   `make answer Q=… A="…"`, then say it again: no question the second time.
+3. A video playing on the laptop's speakers while KπX speaks: `source: device` expected for the
+   video's voices; if not, `make correct C="device --speaker KEY"`, once.
+4. The same session in another room, the next day: if a voice comes back under a new key,
+   one `same`, and it should not happen again in that room.

@@ -1,6 +1,6 @@
 # π: the ambient agent. This file is the repository's entry point.
 #
-# The live ear POC has its own Makefile at voice/stt/Makefile, and that is where
+# The live ear POC has its own Makefile at voice/ear/Makefile, and that is where
 # the running system is driven from (recorder, ear, state, corpus, replay). This
 # one carries only the repository: the kernel's push pattern (all remotes, never
 # one alone) and the two things a reader asks first.
@@ -27,7 +27,7 @@ git-status:  ## git status --short
 	@git status --short
 
 test:  ## The ear's test suite (the only code in the tree for now)
-	@cd voice/stt && uv run pytest -q
+	@cd voice/ear && uv run pytest -q
 
-run:  ## The ear, live, on the microphone (read voice/stt/README.md first)
-	@cd voice/stt && make run
+run:  ## The ear, live, on the microphone (read voice/ear/README.md first)
+	@cd voice/ear && make run

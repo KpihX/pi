@@ -18,7 +18,7 @@ Provenance of the numbers, in one line each:
 | `~/.cache/π/ear/model.json` | the weights on disk: the base statistics, the clusters, the counters |
 | `~/.cache/π/ear/embeddings.f32` | the durable evidence vectors, 192 float32 per observation |
 | `~/.cache/π/corpus/` | the durable audio corpus, one second raw chunks |
-| `voice/stt/tests/artefacts/` | the archived v0 sessions, kept as regression corpus |
+| `voice/ear/tests/artefacts/` | the archived v0 sessions, kept as regression corpus |
 | the commands quoted inline | everything else |
 
 ---
@@ -53,11 +53,11 @@ Commit history, oldest first:
    kairos and meeting-colab found on the machine). The common architectural problem was extracted
    and written into `IDEAS.md`: a chatbox treats the transcript as the state, the turn as the work,
    and the interface as the agent. All three become false as soon as the input is a continuous stream.
-2. `π/` was created in `~/Labs/Explore/π`, with `voice/` (split later into `stt/` and `tts/`),
+2. `π/` was created in `~/Labs/Explore/π`, with `voice/` (split later into `ear/` and `tts/`),
    `memory/`, `agentic/`, `vision/`, and an `IDEAS.md` in each.
 3. Web research was done twice. The first pass was judged to have missed the direction, and was
    redone around online and lifelong learning, stateful streaming architectures, and test time
-   adaptation. The result is `voice/stt/RESEARCH.md`, 799 lines, in two parts: PART 0 is the new
+   adaptation. The result is `voice/ear/RESEARCH.md`, 799 lines, in two parts: PART 0 is the new
    spine, PART 1 is the first pass kept verbatim as a frozen baseline.
 4. Two laws were graved in every `IDEAS.md`: 100 percent stream and 100 percent live; and nothing
    tuned, everything learned. The second law states that a hand set number in a decision path is a
@@ -96,7 +96,7 @@ Not done, deliberately:
 The v0 ear worked, end to end, on the real microphone: a recorder writing one second raw chunks,
 a live loop deciding once per second, an atomic `state.json`, an append only `events.jsonl`, a
 durable corpus, and file based control (`PAUSE`, `RESET`). It is kept in the history as the
-contrast case, and its real sessions are archived in `voice/stt/tests/artefacts/` (1.9 MB) where
+contrast case, and its real sessions are archived in `voice/ear/tests/artefacts/` (1.9 MB) where
 the v1 test suite replays them.
 
 What it measured, all on real audio, all reproducible from the artefacts:
@@ -494,7 +494,7 @@ part of someone else's contract, which is exactly the coupling the project exist
 ### Setup, once
 
 ```
-cd ~/Labs/Explore/π/voice/stt
+cd ~/Labs/Explore/π/voice/ear
 make sync      # the environment, resolved by uv
 make fetch     # models and public corpora into ~/.cache/π, about 470 MB
 ```
@@ -541,10 +541,10 @@ make replay-corpus                           # replay the day into a fresh memor
 |---|---|
 | `IDEAS.md` | the vision, the two laws, the four poles, the four verbs of the mouth, the decisions taken and the ones refused |
 | `voice/IDEAS.md` | the vocal pole: the ear and the mouth, both directions, the shared hypothesis list |
-| `voice/stt/IDEAS.md` | the ear only: state, record contract, hypotheses E1 to E9, the falsified ones with their numbers |
-| `voice/stt/RESEARCH.md` | 799 lines, PART 0 is the current spine, PART 1 is the first pass kept as a frozen baseline |
-| `voice/stt/TODO.md` | what to test next, the acquisition list, and the graved verdict that v0's shape was wrong |
-| `voice/stt/README.md` | the setup order, the targets, the correction syntax, what deliberately is not done |
+| `voice/ear/IDEAS.md` | the ear only: state, record contract, hypotheses E1 to E9, the falsified ones with their numbers |
+| `voice/ear/RESEARCH.md` | 799 lines, PART 0 is the current spine, PART 1 is the first pass kept as a frozen baseline |
+| `voice/ear/TODO.md` | what to test next, the acquisition list, and the graved verdict that v0's shape was wrong |
+| `voice/ear/README.md` | the setup order, the targets, the correction syntax, what deliberately is not done |
 | `voice/tts/IDEAS.md` | the mouth: hypotheses M1 to M8, the record it writes, its anti goals |
 | `memory/IDEAS.md`, `agentic/IDEAS.md`, `vision/IDEAS.md` | the three other poles, ideas only |
 
@@ -568,3 +568,20 @@ document.
 
 End of the document. If you are continuing the work: the ear is honest, the record is complete, and
 the next real gain is not a new model, it is a labelled case.
+
+---
+
+## 12. Rectifications (2026-10-19, Claude, after reading this file against the code)
+
+Append-only: the sections above stay as written; these lines correct what they say about v1, so
+that the next reader does not build on a misreading. Each one was checked in the code.
+
+| § | As written above | What the code does |
+|---|---|---|
+| 4, item 1 | "the base carries two kinds of voices (recorded and synthetic)" | Both kinds are **recorded**: FSDD and LibriSpeech. The Piper voices only ever appear in tests (the twins case). |
+| 4, items 2 and 3 | "a hidden Unknown mass", "kappa = 192 is a zero information sphere" | The base holds **five noise clusters** measured on ESC-50 folds 1-3; they compete with the voices like any cluster. `kappa` is estimated from pairs of windows taken from two *different* recordings of one voice, on the true 192-d sphere (Banerjee's inversion of the mean resultant length). |
+| 5.3 | "two windows decided unknown, then absorbed anyway: the unconscious absorption path" | Simpler: the first window of every voice is `unknown` (a singleton), and becomes a member when the second joins it and the pair is promoted. 13 `known` + 1 `new` + that first window = 15 members. There is no hidden absorption path. |
+| 5.3 | "`c70` will die if it never recurs" | In v1.0 **nothing died**: there was no forgetting in the code. This was a real gap, fixed in v1.1 (a cure-rate survival model, learned from the stream). |
+| 5.4 | "the first window of a run is a glimpse that the next window confirms" | A glimpse is the *tail* of a run, shorter than the 2 s encoder window (`learned: false` in the record). The first window of a run is a full window. |
+
+What v1.1 does with the proposals of section 8 is in `voice/ear/IDEAS.md`, section "v1.1".

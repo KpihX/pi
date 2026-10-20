@@ -2,7 +2,7 @@
 
 > Numbers and sources: `RESEARCH.md` (blank: the mouth is the next research target).
 > Pole level (the law, the ear/mouth split, the hypotheses H7..H10, the slices F and G, the
-> four-verb contract): `../IDEAS.md`. The ear: `../stt/IDEAS.md`. Vision: `../../IDEAS.md` section 0.
+> four-verb contract): `../IDEAS.md`. The ear: `../ear/IDEAS.md`. Vision: `../../IDEAS.md` section 0.
 > Status: **nothing measured yet inside π.** Everything below is a hypothesis, none of it is a decision.
 
 ---
@@ -105,3 +105,24 @@ log:
 - A second synthesis engine before the first one's numbers exist.
 - Waiting for a full sentence before emitting anything.
 - Speaking at a volume that wakes the room.
+
+---
+
+## The third law, in this pole: a model that knows when it does not know (KπX, 2026-10-20)
+
+The guiding line of every model brick of π (`../../IDEAS.md`, section 0): not a model that always
+runs toward a minimum, but one that says, with each output, whether it knows, hesitates, or does
+not know, and which kind of not-knowing it is in.
+
+For the mouth: a voice that can hesitate honestly. When the content it carries is unsure (a
+misheard question, a low-confidence transcript), the mouth must be able to say so in the voice
+itself (a short "if I understood well"), and a refusal to speak because it is unsure is an event
+(`M5`), never a silence.
+
+### What the ear offers the mouth (2026-10-20, ear v2; a fact about the ear, nothing decided here)
+
+The ear now publishes `question` lines on its port (`voice/ear/src/π_ear/port.py`, PORT 2): a
+name it does not know, or a reading it could not choose, with the choices. And it takes answers
+through one inbox (`port.Inbox(memory).answer(question_id, text=... | choice=...)`), the same
+line whether typed or spoken. A mouth that reads a question aloud, and an arbiter that writes the
+answer it hears, are enough for a correction by voice; the ear needs nothing more.
