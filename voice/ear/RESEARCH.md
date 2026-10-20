@@ -1,4 +1,4 @@
-# voice/stt/RESEARCH.md
+# voice/ear/RESEARCH.md
 
 > Research dossier for the vocal pole. Compiled 2026-10-18 from live sources.
 > Every number below cites its source. Nothing here is a decision; decisions go in `IDEAS.md`.

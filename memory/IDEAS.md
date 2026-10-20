@@ -139,3 +139,16 @@ recorded path `$HOME/Work/AI/livemem/` **no longer exists on this machine**. Bef
 building the memory pole on top of it, decide whether it is the substrate or a discarded
 sketch. If it is the substrate, this directory absorbs it; if not, this directory starts
 from the three proven patterns above.
+
+---
+
+## The third law, in this pole: a model that knows when it does not know (KπX, 2026-10-20)
+
+The guiding line of every model brick of π (`../IDEAS.md`, section 0): not a model that always
+runs toward a minimum, but one that says, with each output, whether it knows, hesitates, or does
+not know, and which kind of not-knowing it is in.
+
+For memory: every belief carries its own confidence and its provenance, and the memory knows the
+difference between "I never heard about this" and "I heard two contradicting things". Recall that
+is unsure must say so ("I think you said..."), and the slow clock spends its time on the
+beliefs it is least sure of.

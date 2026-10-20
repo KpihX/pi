@@ -1,4 +1,4 @@
-# stt/: the ear, ideas, hypotheses, what to test
+# ear/: the ear, ideas, hypotheses, what to test
 
 > Numbers and sources: `RESEARCH.md` (Part 0 is the current spine, Part 1 is the frozen baseline).
 > Pole level (the law, the ear/mouth split, the shared hypotheses H1..H10, the slices A..G):
@@ -438,3 +438,19 @@ reaches the record.
 v1.0 to the last decimal. Expected: continuity is off without labels, and four minutes is too
 short for forgetting to touch anything. v1.1 changes what the ear can say about itself and how it
 can be taught, not what it hears.
+
+---
+
+## The third law, in this pole: a model that knows when it does not know (KπX, 2026-10-20)
+
+The guiding line of every model brick of π (`../../IDEAS.md`, section 0): not a model that always
+runs toward a minimum, but one that says, with each output, whether it knows, hesitates, or does
+not know, and which kind of not-knowing it is in.
+
+What the ear already does, and what it still lacks:
+
+| | already | still owed |
+|---|---|---|
+| who | `unknown` as an answer, `margin` in nats, `p`, candidates that fade | calibration of the margin against corrections (is a small margin often wrong?) |
+| what | nothing: Whisper writes text with no doubt attached | a per-word confidence, "I did not understand" as an output, a revision in the silences (proposed 2026-10-20, not decided yet) |
+| the sensor | a NaN tail is not an observation | saying *which* doubt: unseen voice, true ambiguity, or a sensor out of its domain (music, whisper, overlap) |

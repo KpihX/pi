@@ -8,7 +8,7 @@ forbid a format. Three kinds of number live here, and nowhere else:
 * the **sensor's own operating points**: the frozen encoder and the frozen VAD
   are used the way their authors published them, exactly like their weights.
   ``ENCODER_WINDOW_S`` is the one value chosen here, and it was measured, not
-  guessed (``voice/stt/IDEAS.md``, "Sensor choice"): CAM++ on 1.0 s of speech
+  guessed (``voice/ear/IDEAS.md``, "Sensor choice"): CAM++ on 1.0 s of speech
   gives an EER of 11.8 % on real LibriSpeech voices, 0.0 % on 2.0 s. Below that
   length an embedding is a glimpse, decided but never learned from;
 * **resource bounds**: how much disk a store may take, how often the loop
@@ -35,7 +35,7 @@ DEVICE = os.environ.get("PI_EAR_DEVICE", "plughw:0,6")
 ENCODER = os.environ.get("PI_EAR_ENCODER", "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 ENCODER_WINDOW_S = 2.0
 VAD_MODEL = "silero_vad.onnx"
-# Measured 2026-10-19 (voice/stt/IDEAS.md, "Transcription"): WER on French speech
+# Measured 2026-10-19 (voice/ear/IDEAS.md, "Transcription"): WER on French speech
 # tiny 16 %, base 9 %, small 3 %; small costs 0.22 s per second of audio with the
 # language given, 0.54 s without, and runs off the decision loop.
 WHISPER = os.environ.get("PI_EAR_WHISPER", "small")

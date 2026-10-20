@@ -1,4 +1,4 @@
-# stt/TODO.md: the live test on the microphone
+# ear/TODO.md: the live test on the microphone
 
 > The paradigm is not tested by a download (`../RESEARCH.md` R0.11). It is tested by **one capture
 > session** and **three questions**. Everything below runs on this machine, locally, offline.

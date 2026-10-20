@@ -1,10 +1,10 @@
 # voice/: ideas, hypotheses, experiments
 
-> Research and numbers: `stt/RESEARCH.md` (filled and sourced: Part 0 is the current spine, Part 1
+> Research and numbers: `ear/RESEARCH.md` (filled and sourced: Part 0 is the current spine, Part 1
 > the frozen baseline) and `tts/RESEARCH.md` (blank, to be filled). Vision: `../IDEAS.md`.
-> Each half now owns its own ideas file: **`stt/IDEAS.md`** (the ear) and **`tts/IDEAS.md`** (the
+> Each half now owns its own ideas file: **`ear/IDEAS.md`** (the ear) and **`tts/IDEAS.md`** (the
 > mouth). This file stays the pole: the law, the shared hypotheses H1..H10, the slices A..G, the
-> mouth's four-verb contract. Live ear test and acquisition list: **`stt/TODO.md`**.
+> mouth's four-verb contract. Live ear test and acquisition list: **`ear/TODO.md`**.
 > Status: **nothing measured yet inside π.** Everything below is a hypothesis to test.
 
 ---
@@ -53,7 +53,7 @@ makes the wake phrase optional (see "Do we even need a wake phrase" below).
 **No constant, no threshold, no hand-set value in any decision path, in any pole of π. Ever.** A
 number written by hand is a decision the model should have taken. Every threshold of the first ear
 POC (the identity descriptor, the pitch estimator, the voicing gate, the identity boundary) is
-therefore an architectural defect, not a tuning detail, and the list lives in `stt/TODO.md` with
+therefore an architectural defect, not a tuning detail, and the list lives in `ear/TODO.md` with
 the line counts.
 
 **The direction is not data science.** Classic practice cleans a dataset, trains, deploys, then
@@ -74,7 +74,7 @@ This holds for every sub-model: each one must at least learn. The stance is coun
 purpose: refusing the current binary world's habit of spending its time on training first, then
 inference.
 
-**What this pole loses, named:** the boundary inside `stt/IDEAS.md` is still **my** formula
+**What this pole loses, named:** the boundary inside `ear/IDEAS.md` is still **my** formula
 (`z_margin * sigma`), the voicing gate is two constants I chose between two measured bands, the pitch
 estimator and the identity descriptor are hand-written physics, and H2's "3 to 10 s of enrollment" is
 a duration guessed in advance. All four become learned judgements: when a sound counts as speech,
@@ -137,18 +137,18 @@ choose.
 ## Open questions
 
 - **Where does the enrollment live, and how is it protected?** It is a biometric. A
-  recording of the owner's voice must not become a key (see `stt/RESEARCH.md` section 10).
+  recording of the owner's voice must not become a key (see `ear/RESEARCH.md` section 10).
 - **One voiceprint or several?** Room, headset, phone, whisper, and loud speech are
   physically different signals. One vector, or a small set with a selection rule?
 - **Does the gate ever open for a second person on purpose?** In a meeting, the system
   must know *who* spoke, not just *not the owner*. That is diarization, a different port.
 - **Do we even need a wake phrase?** If the voiceprint is the trigger, the phrase becomes
-  optional. That is the conceptual prize (see `stt/RESEARCH.md` section 9).
+  optional. That is the conceptual prize (see `ear/RESEARCH.md` section 9).
 - **Latency floor.** What is the smallest honest end-to-end latency from "he stopped
   speaking" to "first audible sound"? Every stage we add must be charged against it.
 - **Whose voice should π have?** A neutral synthetic voice, a deliberately chosen one, or
   the owner's own cloned voice? The last is the most personal and the most dangerous: it
-  turns the assistant into a forgery of the person it serves (see `stt/RESEARCH.md`
+  turns the assistant into a forgery of the person it serves (see `ear/RESEARCH.md`
   section 10).
 - **Does the mouth have a veto on readiness?** If the arbiter says speak while the
   pipeline is not ready, does the mouth stay silent, delay, or announce?
@@ -171,11 +171,25 @@ choose.
 ## Status update, 2026-10-18 (night): the ear is rebuilt
 
 The header line "nothing measured yet inside π" is out of date for the ear (the mouth is unchanged).
-`stt/` now holds **π-ear v1**: frozen sensors (Silero VAD, CAM++), one Bayesian model with no
+`ear/` now holds **π-ear v1**: frozen sensors (Silero VAD, CAM++), one Bayesian model with no
 hand-set number in its decision path (enforced by a test), base weights measured on public data,
 corrections as a channel (`same`, `different`, `not_voice`, `name`), and a memory read back at
 launch. Measured on simulated rooms built from public recordings: purity 1.000 and zero phantoms in
 12 rooms out of 12. Slice B ("a me / not-me score every 100 ms") is superseded by the shape the law
 asked for: a speaker posterior every 2 s of speech, from an empty state. Slice E (the gate as the
 arbiter's non-semantic prior) is now possible: the record carries `speaker`, `label` and `p`.
-Details: `stt/IDEAS.md`, section "The rebuild: π-ear v1". Owed next: the real microphone.
+Details: `ear/IDEAS.md`, section "The rebuild: π-ear v1". Owed next: the real microphone.
+
+---
+
+## The third law, in this pole: a model that knows when it does not know (KπX, 2026-10-20)
+
+The guiding line of every model brick of π (`../IDEAS.md`, section 0): not a model that always
+runs toward a minimum, but one that says, with each output, whether it knows, hesitates, or does
+not know, and which kind of not-knowing it is in.
+
+For the vocal pole, both directions: the ear says *who* and *what* with its doubt attached (it
+already does for *who*: `unknown`, `margin`), and the mouth must be able to say "I did not
+understand" or "I am not sure" out loud, briefly, instead of answering confidently on a
+misheard sentence. The arbiter decides whether that doubt is worth voicing; the poles must at
+least produce it.
