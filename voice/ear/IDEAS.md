@@ -454,3 +454,114 @@ What the ear already does, and what it still lacks:
 | who | `unknown` as an answer, `margin` in nats, `p`, candidates that fade | calibration of the margin against corrections (is a small margin often wrong?) |
 | what | nothing: Whisper writes text with no doubt attached | a per-word confidence, "I did not understand" as an output, a revision in the silences (proposed 2026-10-20, not decided yet) |
 | the sensor | a NaN tail is not an observation | saying *which* doubt: unseen voice, true ambiguity, or a sensor out of its domain (music, whisper, overlap) |
+
+---
+
+## v2 (2026-10-20): who and what, one ear (KπX: "W1 à W6, Q1 à Q6, la totale")
+
+The third law, built in both halves. Every number below is measured on public recordings
+written as 1 s chunks and replayed through the real path; the tests hold them.
+
+### What, the plan and what it became
+
+| | asked | built |
+|---|---|---|
+| W1 | the text while it is said | `partial` lines: the fast recogniser (Parakeet TDT 0.6b v3) re-reads the run in progress whenever it is free, latest audio wins, nothing queues |
+| W2 | revise in the silences | `text` r0 from the fast reading at the run's end, r1 from Whisper turbo in the next silence; corrections are absorbed there too (the scribe's thread never runs ahead of the decision loop) |
+| W3 | say what it does not know | a named doubt per text, a trust and `agreed`/`new` marks per word, the other readings kept, and a `question` when the doubt is `ambiguous` or `not_understood` |
+| W4 | corrections of text | `text` corrections and answers: a lexicon per voice, substitutions learned from the alignment, recall of corrected runs; candidates, never silent rewrites |
+| W5 | learned weights | the reader is a Bayesian conditional logit, evidence maximised (`sphere.fit_choice`), refitted on the slow clock on every example ever seen |
+| W6 | calibrated | `p` of the chosen reading is the logit's own, trained on outcomes; words likewise |
+
+The recognisers, measured (WER en on LibriSpeech, fr on Piper UPMC, int8, 2 threads):
+parakeet-v3 3 % / 6 % at 0.16 s per s; whisper-turbo 2 % / 9 % at 1.14; whisper-small 2 % /
+19 %; canary-180m 1 % / 15 % but 2 to 9 words invented on 10 noise clips. Two different models on
+purpose: where they disagree is where the ear does not know.
+
+**A correction is trusted the first time.** First design: the base weights learned on plain runs
+only; the weights of `edits` and `recall` started at zero and a corrected error came back once
+before the reader learned to trust what it was taught. Fixed by *correction episodes* in the
+base: every public run the recognisers got wrong is corrected once and heard again, with and
+without the recall of that very run.
+
+**The first sentence of a new voice was never read.** v1.1 sent a run to Whisper only if a voice
+was recognised in it; a voice's first run is still a candidate (`unknown`), so its first sentence
+was lost. Now every run that is not entirely a known sound is read, and whether anything was said
+is the reader's call. To make that call honest the reader gained `none_unspoken`, one minus
+Silero's mean speech probability over the run (measured: 0.82 to 0.94 on speech, under 0.78 on 27
+of 28 indoor sounds that pass the VAD), and the base now hears the ESC-50 sounds as the VAD lets
+them through. On the 160 sounds of fold 5, 14 runs reach the reader: 8 invented a word before, 4
+now (`"Yeah."`, marked `unseen`), 10 are `not_understood`.
+
+**A word confirmed by its own reading.** The two recognisers agreeing put a word in the lexicon
+*before* the decision, so a word heard for the first time was already "known" and the doubt read
+`clear`. The lexicon now learns after the decision: the first time is `unseen`, then known.
+
+**A doubt the memory resolves is not a doubt.** After one answer, the recognisers still disagree on
+"KπX", and v2's first build asked again every time. New doubt kind `taught`: they disagree, and
+what KπX taught is the most probable reading. Not asked.
+
+### Who, v2
+
+**Q2, conditions and voices.** Base kappa is now measured *within* one recording in one place
+(465), kappa_c across places for one voice (449). 12 random rooms: no voice split (v1: 4 of 12).
+
+**The place prior, found by a failure.** With the hierarchy alone the pyannote two-person sample
+became *one* voice. Not kappa (forcing it from 476 to 600 changed nothing) and not the code: the
+generative model itself preferred one voice by 26 nats, because the two voices of that room are
+closer to each other (cos 0.49) than the population says two voices are (0.35): they share a
+channel. Centring the prior of a new voice on the room reversed it (+42 nats for two). Built as a
+level of the model: places, with `kappa_in` (voices around their place, 212) and `kappa_p`
+(places around the population, 359), measured on four simulated places in which every base voice
+was heard, and the place's mean estimated from the voices already heard there. The pyannote
+sample: 2 voices.
+
+**Q4, turns.** Shadow windows offset by 1 s are decided (never learned: they would count the same
+audio twice), and the `turns` line gives each half window the voice of the more confident window
+covering it: 0.625 of the learned windows right on the pyannote sample, 0.75 of the time by the
+turns; 0.99 or more in the rooms. **Failed design**: detecting a turn inside a window by
+comparing its two 1 s halves. Measured on that sample: same-speaker halves at cos 0.40 to 0.72,
+two-speaker halves at 0.28 to 0.51. Too much overlap for a sensor; not built.
+
+**Another place, another day.** The six voices of day 1 heard on day 2 through another simulated
+place: most come back under new keys (the place moves every voice further than the base's places
+did). One `same` per voice, and day 3, in that second place, gives each voice its day-1 key
+again. Two things this needed: noise heard through places too in the base (a door and a toilet
+flush heard through a reverberant room became two phantoms), and the memory's clock never running
+backwards (a replay faster than real time started its session before the last one ended, and
+"the oldest voice keeps its name" kept the wrong one).
+
+**Q3, person or device.** The mean spectral shape of a voice's windows (24 mel bands, level
+removed) against two diagonal Gaussians learned on public recordings heard live and through a
+simulated loudspeaker. 3 pairs (a person in the room, another voice from a loudspeaker): 5 of 6
+right, the miss a device heard as a person at p 0.77. `device` or `person` said once is final for
+that voice and teaches the two classes.
+
+**Q1, trust.** `trust` = P(right | margin), a logistic on the margin fitted on the base's own
+replay (182 public decisions, 93 % right: 0.50 at 0 nats, 0.71 at 10, 0.94 at 30), then on what
+every correction says about the decisions it touches. None before it has seen itself both right
+and wrong.
+
+**Q5, asking a name.** A voice of an earlier session, back and still nameless: one `question`,
+answered by `inbox.answer(id, text=...)`; the answer is replayed exactly by `undo`.
+
+**Q6, music: separation measured and refused.** Spleeter (2 stems, int8, sherpa-onnx 1.13.8) made
+reading worse at every level of music: WER 2 % -> 5 % at 6 dB, 3 % -> 18 % at 0 dB, 5 % -> 36 %
+at -6 dB (Parakeet; Whisper turbo worse still). Its stems came out about 130 times louder than the
+input and uncorrelated with the voice; only their sum gave the mix back. The recognisers read
+through the music on their own. The separator slot stays (`PI_EAR_SEPARATOR`), off. For who:
+the room with music all along at 10 dB under the speech keeps purity 1.000 and no split; at 5 dB
+two voices split (the safe error); the music alone is never a person.
+
+### The plug points
+
+`port.py` is version 2: `Turns`, `Partial`, `Text`, `Question` join `Session`, `Decision` and
+`Correction`. `port.Inbox` is the one way in, for a terminal, the arbiter or a voice: `correct`,
+`answer`, `undo`. Recognisers by registry name or `module:factory`. Nothing in the ear knows who
+is on the other side of the inbox, which is the point: when the mouth exists, a spoken answer
+is the same line as a typed one.
+
+**Who is asked, and when.** First build: a `question` for every `ambiguous` or `not_understood`
+text, so every cough that reached the reader asked "what was said?". Now: `ambiguous` asks; a
+`not_understood` asks only in a run of a known voice (someone spoke and the ear missed it); a
+sound nobody owns, not understood, asks nothing. Measured on fold 5: no question from 160 sounds.

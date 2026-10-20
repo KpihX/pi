@@ -108,3 +108,36 @@ def test_from_to_why_undo_and_probe(tmp_path):
     assert result.exit_code == 0, result.output
     body = result.output.splitlines()
     assert len([b for b in body if "20261018-" in b]) == 6 and "speech probability mean" in body[-1]
+
+
+def test_questions_are_listed_and_answered_in_one_line(tmp_path):
+    """What the arbiter or a voice would do through the mouth, typed."""
+    root, memory = tmp_path / "live", tmp_path / "memory"
+    root.mkdir()
+    question = {
+        "port": 2,
+        "session": "s1",
+        "kind": "question",
+        "id": "s1:4.2#text",
+        "about": "text",
+        "run": "s1:4.2",
+        "rows": [3, 4],
+        "speaker": "v1",
+        "choices": ["call pi x now", "call pie ex now"],
+        "doubt": "ambiguous",
+    }
+    (root / "events.jsonl").write_text(json.dumps(question) + "\n")
+    listed = runner.invoke(app, ["questions", "--root", str(root)])
+    assert (
+        listed.exit_code == 0
+        and "s1:4.2#text" in listed.output
+        and "[1] call pie ex" in listed.output
+    )
+    for args in (["s1:4.2#text", "call KπX now"], ["s1:4.2#text", "--choice", "1"]):
+        result = runner.invoke(app, ["answer", *args, "--memory", str(memory)])
+        assert result.exit_code == 0, result.output
+    lines = [json.loads(x) for x in (memory / "corrections.jsonl").read_text().splitlines()]
+    assert [x["kind"] for x in lines] == ["answer", "answer"]
+    assert lines[0]["text"] == "call KπX now" and lines[1]["choice"] == 1
+    refused = runner.invoke(app, ["answer", "s1:4.2#text", "--memory", str(memory)])
+    assert refused.exit_code != 0

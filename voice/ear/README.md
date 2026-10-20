@@ -1,10 +1,10 @@
-# π-ear v1.1: the streaming ear of π
+# π-ear v2: the streaming ear of π, who and what
 
 Two servers and one directory, as before. The recorder never stops, the ear follows it, and what
-the ear has learned is on disk at every instant. What changed is everything that decides: v0 was
-582 lines of hand-made rules and seven hand-set constants; v1 is **one probabilistic model** whose
-decisions are posteriors, whose parameters are statistics learned from public data and from the
-stream, and whose only teacher besides the stream is **a correction, said once**.
+the ear has learned is on disk at every instant. v1 answered **who**; v2 answers **what** too, in
+the same spirit: one learned model per question, every decision a posterior, every doubt named,
+and one teacher besides the stream, **a correction said once** (typed, or spoken through the
+mouth and heard back by the ear: the inbox does not care).
 
 ```
       [microphone]
@@ -14,152 +14,172 @@ stream, and whose only teacher besides the stream is **a correction, said once**
    <the audio directory>        the whole transport between the two servers
            |
    SERVER B: the ear
-     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live)
-     Model    who is it: argmax of a posterior, never a threshold
-     Scribe   its own thread: Whisper small on each finished run in which a voice was recognised
+     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live, + shadow windows offset by 1 s)
+     Model    who: windows -> conditions -> voices, in a place; person or device
+     Scribe   what, on its own thread: Parakeet v3 while it is said, Whisper turbo in the silence,
+              a learned reader choosing between them, the memory of what KπX taught
            |
-   /tmp/π/state.json            atomic, ~1/s: what is known now
-   /tmp/π/events.jsonl          append-only record: one line per window, per text, per correction
-   ~/.cache/π/ear/model.json    the checkpoint: clusters, links, learned statistics (read at launch)
-   ~/.cache/π/ear/embeddings.f32  one row per window heard, append-only
-   ~/.cache/π/ear/observations.jsonl  when and how each row was decided: the model replays from it
-   ~/.cache/π/ear/corrections.jsonl  what KπX said was wrong (append-only, obeyed live, undoable)
-   ~/.cache/π/corpus/*.raw      the audio of the session, bounded, outside RAM
-           ^
-   /tmp/π/PAUSE  /tmp/π/RESET   control is a file, not a signal
+   /tmp/π/state.json                  atomic, ~1/s: what is known now
+   /tmp/π/events.jsonl                the port (out): one line per window, turn, text, question, correction
+   ~/.cache/π/ear/corrections.jsonl   the inbox (in): corrections and answers, append-only, undoable
+   ~/.cache/π/ear/model.json          the checkpoint (who + the reader)
+   ~/.cache/π/ear/embeddings.f32      one row per window heard; spectra.f32 its spectral shape
+   ~/.cache/π/ear/observations.jsonl  when, how and where each row was decided: the replay
+   ~/.cache/π/ear/runs.jsonl          every reading of every run; taught.jsonl every text taught
+   ~/.cache/π/corpus/*.raw            the audio of the session, bounded, outside RAM
 ```
 
-## The model, in one screen
+## The three laws, as code
+
+1. **100 % stream.** No setup phase, no calibration phase: the first window is decided like the
+   thousandth.
+2. **Nothing tuned, everything learned.** `tests/test_law.py` parses `model.py`, `words.py` and
+   `source.py` and fails on any numeric literal but 0 and 1, and on any comparison with a
+   constant. The numbers live in `weights/base-*.json`, measured by `π-ear base` on public
+   recordings no test uses, then moved by the stream and by corrections.
+3. **Every model knows when it does not know.** Who: `unknown`, `margin` (nats), `trust` (a
+   calibrated probability). What: a named doubt per text (`clear`, `unseen`, `taught`,
+   `ambiguous`, `not_understood`), a trust per word, and *questions* when it hesitates between
+   readings, or when a known voice spoke and it did not understand (a cough asks nothing).
+
+## Who (`model.py`), in one screen
 
 ```
-  speaker means   mu_k ~ vMF(mean0, kappa0)     what voices look like, as a population
-  one window      x    ~ vMF(mu_k,  kappa)      how much one voice varies
-  who it is       z    ~ CRP(alpha)             how often a new voice shows up
+  a place        p     ~ vMF(mean0, kappa_p)    rooms and microphones differ
+  a voice        v     ~ vMF(p, kappa_in)       voices of one place share its channel
+  a condition    mu_c  ~ vMF(v, kappa_c)        one voice drifts across rooms and days
+  one window     x     ~ vMF(mu_c, kappa)       how much one voice varies in one place
+  who            CRP(alpha) over conditions, CRP(alpha_v) over voices
 ```
 
-Every window is scored against every cluster and against "someone new", and the most probable
-explanation wins. Every v0 rule has a probabilistic replacement:
+Every concentration is measured on the base: FSDD and LibriSpeech voices heard in four simulated
+places (`public.place`: a room, a microphone band, a gain, a noise floor), then refined by `same`
+corrections. What each level fixed, measured:
 
-| v0 rule (dead) | v1 mechanism |
-|---|---|
-| `voiced_floor`, `level_floor_db`, a hand-written pitch estimator | Silero VAD at its published operating point, plus **noise clusters**: the base heard ESC-50 folds 1-3, and `not_voice` corrections add more |
-| `tau_floor`, `z_margin` (the identity boundary) | the vMF likelihood, with `kappa` and `kappa0` **estimated**, never chosen |
-| `k_evidence = 3` (the anti-phantom bar) | a cluster becomes a speaker when "one voice" is more probable than "all different voices". With one window the two are equal, so **one window never makes a person** |
-| the merge invariant | two clusters fuse when one voice explains them better than two |
-| a fixed window of 3 s | `ENCODER_WINDOW_S = 2.0`, the sensor's validity domain, **measured** (EER 11.8 % at 1 s, 0.0 % at 2 s on real LibriSpeech voices). Shorter leftovers are *glimpses*: decided, never learned from |
+| level | without it | with it |
+|---|---|---|
+| conditions -> voices (Q2) | 4 of 12 random rooms split a voice | 0 of 12 |
+| the place prior | the pyannote sample's two voices heard as one (they share a channel: cos 0.49 where the population says 0.35) | two voices |
+| shadow windows + `turns` (Q4) | who spoke when, by the 2 s window | by the half window: 0.625 -> 0.75 of the time on that sample, 0.99+ in the rooms |
+| person / device (Q3) | a loudspeaker is a person | spectral shape, learned on simulated loudspeakers: 5 of 6 right, the miss unsure (p 0.77); `device` once fixes it for good |
+| trust (Q1) | a margin in nats | P(right \| margin), from the base's own replay, then from every correction |
 
-**The law is a test.** `tests/test_law.py` parses `model.py` and fails if it contains a numeric
-literal other than 0 and 1, or a comparison against a constant. It also checks that the checker
-itself catches the v0 shape (`cos_best >= 0.5 and margin >= 3.0 * sigma`).
+A voice heard again in a later session, still nameless, makes the ear **ask its name, once** (Q5).
 
-**Where the numbers live.** `src/π_ear/weights/base-*.json`: sufficient statistics measured by
-`π-ear base` on public voices and sounds that no test uses (FSDD jackson/nicolas/theo, two
-LibriSpeech speakers, ESC-50 folds 1-3). The stream adds its own statistics on top, and `refresh`
-re-estimates every parameter after each decision, never before it. `contract.py` holds what is
-not a decision: the audio format, the sensors' published operating points, resource bounds.
+## What (`asr.py`, `words.py`, `lexicon.py`, `scribe.py`)
 
-**What `kappa` learns from, and what it refuses to learn from.** Only pairs *known* to share a
-voice: the labelled base, then every `same` correction (all cross pairs of the two clusters, in one
-dot product of their sums). Never from the clusters the model built itself, which is the
-self-feeding loop that made v0 create 56 identities. Never from two consecutive windows of one run
-either: measured, they sit closer than one voice does across recordings.
+International by default, French measured too, anything else plugs in:
 
-## Corrections: one case, obeyed now, absorbed into the weights, undoable
+| recogniser (int8, 2 threads) | WER en | WER fr | s per s of audio | words invented on 10 noise clips |
+|---|---|---|---|---|
+| **parakeet-v3** (fast, 25 languages) | 3 % | 6 % | 0.16 | 2 |
+| **whisper-turbo** (slow, 99 languages) | 2 % | 9 % | 1.14 | 8 |
+| whisper-small | 2 % | 19 % | 0.89 | 6 |
+| canary-180m | 1 % | 15 % | 0.25 | 2-9 |
+
+```
+ speaking ... partial (fast, re-read while the run goes on: the text appears as it is said)
+ run ends ... text r0 (fast, at once)
+ silence  ... text r1 (slow)   the reader chooses among: fast, slow, the substitutions it
+                               learned, the corrected runs it recalls, and "I did not understand"
+ doubt    ... question         when it is ambiguous or not understood: answer it once
+```
+
+The **reader** is a Bayesian conditional logit (evidence maximisation, no hand-set prior) over 11
+features of each reading: who wrote it, how much the other recogniser agrees, token confidence,
+learned substitutions, recall of a corrected run, known words, and, for "I did not understand",
+low confidence, two recognisers apart, and a run Silero itself found little like speech. Its base
+weights come from 80 public runs (Piper voices in English and French, clean and degraded) and the
+ESC-50 sounds as the VAD lets them through, plus *correction episodes*: every run the
+recognisers got wrong, corrected once and heard again, so that a correction is trusted from the
+first time. Each word carries its own trust and `agreed` / `new` marks.
+
+## The port and the inbox: plug anything in
+
+```json
+{"port":2,"kind":"session","weights":"…","fast":"parakeet-v3","slow":"whisper-turbo",…}
+{"port":2,"row":42,"t0":82.6,"t1":84.6,"kind":"known","speaker":"1abe…","condition":"9f0c…",
+ "label":"KπX","source":"person","source_p":0.99,"p":1.0,"margin":187.4,"trust":0.998,"shadow":false,…}
+{"port":2,"kind":"turns","run":"…:80.6","segments":[[80.6,81.6,"1abe…"],[81.6,84.6,"77d2…"]]}
+{"port":2,"kind":"partial","run":"…:80.6","text":"send the notes to"}
+{"port":2,"kind":"text","run":"…:80.6","revision":1,"text":"send the notes to KπX","doubt":"taught",
+ "p":0.97,"words":[{"w":"send","trust":0.99,"agreed":true,"new":false},…],"readings":[…]}
+{"port":2,"kind":"question","id":"…:80.6#text","about":"text","choices":["… pi x","… pie ex"],"doubt":"ambiguous"}
+{"port":2,"kind":"correction","what":"text","answers":"…:80.6#text","line":7,"refused":null}
+```
+
+A consumer (the arbiter, the mouth) reads `port.read()` / `port.follow()` and gets typed events;
+it never reads the internals. It speaks back through **`port.Inbox`**, the same three calls a
+terminal uses:
+
+```python
+inbox = port.Inbox(memory)
+inbox.correct("text", rows, text="send the notes to KπX")   # or same/different/not_voice/name/person/device
+inbox.answer(question_id, text="Alice")                        # a name, or what was said
+inbox.answer(question_id, choice=1)                            # or one of the question's choices
+inbox.undo(line)                                               # forget one, exactly
+```
+
+So a vocal correction is: the mouth reads a `question` aloud, the ear hears the answer, the
+arbiter calls `inbox.answer`. Recognisers plug in by name (`PI_EAR_FAST`, `PI_EAR_SLOW`: any
+`asr.REGISTRY` name, `none`, or `package.module:factory`); a factory takes the models directory
+and returns `samples -> Hypothesis`.
+
+## Corrections
 
 ```bash
-π-ear correct same 812 840                          # these windows are one voice (fuses, lowers kappa)
-π-ear correct different 812 901                     # two voices (splits, never re-merged)
-π-ear correct not_voice --speaker KEY               # that "speaker" was never a voice (becomes noise)
-π-ear correct name 812 --label KπX                  # call this voice KπX
-π-ear correct name --from 163 --to 288 --label vid  # the same, by stream seconds of the latest session
-π-ear undo 3                                        # forget correction number 3, exactly
+π-ear correct same 812 840                        # one voice (joins voices, teaches kappa_c)
+π-ear correct different 812 901                   # two voices
+π-ear correct not_voice --speaker KEY             # never a voice
+π-ear correct name 812 --label KπX                # call it KπX
+π-ear correct device --speaker KEY                # a loudspeaker (or `person`)
+π-ear correct text --from 163 --to 170 --text "le cours de Galois"   # what was said
+π-ear questions                                   # what the ear is asking
+π-ear answer 'S:163.2#text' --choice 1            # answer it (or give the text)
+π-ear undo 3                                      # forget correction 3, exactly
 ```
 
-Rows are the `row` field of `events.jsonl`; `--from/--to` is the human shortcut, resolved to the
-rows of that span (the span is kept in the correction line, the rows are the truth). A correction
-is one appended line in `corrections.jsonl`; the running ear applies it at its next tick (fast
-clock), logs it in the record with its `line` number, and re-estimates its parameters (slow
-clock). `undo N` appends one more line: the ear rebuilds its whole model from the base by
-replaying every row and every other correction at the moment it was first applied. The replay is
-bit for bit (`test_the_memory_rebuilds_exactly_by_replay`), so an undo is exact, not approximate.
-
-Two corrections also teach what the stream cannot: a `same` or `different` on two **adjacent**
-windows of one run is a labelled transition, the only evidence the continuity prior learns from.
-
-## Looking under a decision
-
-```bash
-π-ear why 812                      # what was decided then (p, margin, level), the 3 best explanations now
-π-ear probe --from 84 --to 163     # the corpus, second by second: dBFS, Silero's own probability, decisions
-π-ear probe --from 84 --to 163 --asr   # + Whisper on the whole span, ungated
-```
-
-`probe` answers "was it not speech, or speech the detector missed?" from the audio itself, the
-question RETURNS.md left open for the 81-second hole.
+Every line is obeyed at the next tick and absorbed into the weights. `undo` rebuilds by replay:
+the model of who from the base, every row and every other correction at the moment it was
+applied (bit for bit, tested); the reader from its base and every other text taught. A text
+correction finds its run even sessions later (`runs.jsonl`).
 
 ## Setup, in this order
 
 ```bash
-make sync     # 1. numpy + sherpa-onnx (+ sherpa-onnx-core: its onnxruntime) + typer
-make fetch    # 2. models + public corpora: ~1.1 GB downloaded once, ~850 MB kept in ~/.cache/π
-```
-
-Then three panes:
-
-```bash
+make sync     # 1. numpy, scipy, onnxruntime, sherpa-onnx, typer
+make fetch    # 2. models + public corpora into ~/.cache/π (~2.4 GB downloaded once)
 make rec      # pane 1: the recorder. Start once, never stop.
-make run      # pane 2: the ear. One line per decision.
+make run      # pane 2: the ear. One line per decision and per text.
 make watch    # pane 3: the state moving on disk.
 ```
 
-Then `make status`, `make events`, `make correct C="different 812 901"`, `make undo N=3`,
-`make why ROW=812`, `make probe FROM=84 TO=163`, `make pause`, `make resume`, `make snapshot`,
-`make diff`, `make reset`, `make corpus`, `make replay-corpus`.
+Then `make status`, `make events`, `make questions`, `make answer Q=… A="…"`,
+`make correct C="text 812 --text '…'"`, `make undo N=3`, `make why ROW=812`,
+`make probe FROM=84 TO=163`, `make pause`, `make resume`, `make snapshot`, `make diff`.
 
-`PI_EAR_WHISPER=base` (or `tiny`) trades transcription quality for CPU; `PI_EAR_LANGUAGE=fr`
-skips language detection (2.5x faster, and no invented Japanese over music).
+`PI_EAR_LANGUAGE=fr` fixes Whisper's language; `PI_EAR_SLOW=none` keeps only the fast reader;
+`PI_EAR_FAST=none` turns the *what* off.
 
-## The record, and the port (`port.py`, version 1; values below are illustrative)
+## What is measured (2026-10-20, real public recordings written as 1 s chunks, the real path)
 
-```json
-{"port":1,"session":"20261019-071257","kind":"session","weights":"…","rows":121,"first_chunk":"20261019-071259.raw"}
-{"port":1,"session":"…","row":42,"t0":82.6,"t1":84.6,"decided_at":84.62,"kind":"known",
- "speaker":"1abeee72123db13d","label":"KπX","p":1.0,"margin":187.4,
- "runner_up":{"id":null,"p":0.0},"evidence":12,"learned":true,"run":80.6,"rms_dbfs":-28.7,"rel_db":24.1}
-{"port":1,"session":"…","kind":"text","t0":80.6,"t1":88.1,"rows":[41,42,43],"text":"…"}
-{"port":1,"session":"…","kind":"correction","what":"different","rows":[812,901],"line":3,"refused":null}
-```
-
-`kind` is `unknown` (heard once, or a glimpse nobody matches), `new` (this window made a speaker),
-`known`, or `noise`. `p` is the posterior; it saturates at 1.0 on 192 dimensions, so **`margin`**
-(nats between the decision and the runner up) carries the doubt. `rel_db` is the level above this
-session's non-speech floor, learned from the stream (no calibration, no SPL guess). A record that
-does not start on the port (v0, v1.0) is archived whole when the ear starts.
-
-A consumer reads the port, never the internals: `port.read(path, session)` gives typed
-`Session`, `Decision`, `Text` and `Correction` events, `port.follow(path)` yields them live.
-
-## What is measured (2026-10-18, this repository's simulated rooms)
-
-| Scene (real public recordings, written as 1 s chunks) | Result |
+| scene | result |
 |---|---|
-| 6 real voices taking turns + coughs, doors, keyboard, laughter, noise floor (`room`) | 6 speakers, 0 phantoms, purity 1.000, coverage 0.86-0.91 |
-| the same room, 12 random seeds, random gains (-12..0 dB) and floors (-70..-50 dBFS) | purity 1.000 in 12/12, 0 phantoms in 12/12 (see `IDEAS.md` for fragmentation) |
-| 160 indoor sounds of fold 5, never heard by the base, no voice | 0 speakers apart from, at most, one long laugh (laughter is a voice) |
-| 2 minutes of room floor | 0 observations |
-| pyannote two-person sample, turns of 0.4-4 s | 2 speakers, purity >= 0.7 |
-| sherpa-onnx Mandarin file, 4 speakers | 4 speakers |
-| synthetic twins (Piper), fused by the sensor, one `different` each | apart in the next session |
-| a laugh that became a "person", one `not_voice` | goes to noise in the next session |
-| speed | ~50x real time on 2 CPU threads; Whisper never on the decision loop (v1.1) |
+| 6 voices + coughs, doors, keyboard, laughter (`room`) | 6 speakers, 0 phantoms, purity 1.000 |
+| 12 random rooms (gains, floors, takes) | purity 1.000 in 12/12, no voice split (v1: 4/12), one laugh heard as the person who laughs |
+| the same people in another place (day 2) | most voices come back under new keys; one `same` each, and on day 3 each is its day-1 voice |
+| the room with music all along, 10 dB under speech | purity 1.000, no split, the music never a person |
+| pyannote two-person sample | 2 speakers, turns right 75 % of the time |
+| 4 Mandarin speakers | 4 speakers |
+| 160 indoor sounds, no voice | nobody (but, at most, one laugh); with the recognisers on, 14 runs read: 10 `not_understood`, 4 one-word inventions marked `unseen`, no question |
+| person vs loudspeaker, 3 pairs | 5/6 right, the miss unsure; corrected once, it stays |
+| English + French, clean and under music at 0 dB, Parakeet + turbo | 3 errors in 49 words (6 %), two of them one homophone; every text revised in the silence |
+| a name mis-heard, answered once | written right the next time, no question asked |
 
 ## Tests
 
 ```bash
-make test-fast   # 50 tests, no model, no download, < 1 s: law, maths, model, disk
-make test        # + the real sensors and 20 simulated rooms (needs make fetch), ~6 min
+make test-fast   # no model, no download: law, maths, model, reader, disk, CLI
+make test        # + the real sensors, recognisers and simulated rooms (needs make fetch)
 make check       # ruff
 ```
-
-`tests/artefacts/` keeps the two v0 event logs of 2026-10-18: the evidence of the 56-identity
-failure. v1 cannot replay them (they hold numbers, not audio), which is why the corpus exists.

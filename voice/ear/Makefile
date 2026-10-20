@@ -5,16 +5,17 @@ UV := $(shell command -v uv 2>/dev/null || echo uv)
 JQ := $(shell command -v jq 2>/dev/null || echo jq)
 
 # ===========================================================================
-# π-ear v1: the streaming ear of π. Setup, IN THIS ORDER:
+# π-ear v2: the streaming ear of π, who and what. Setup, IN THIS ORDER:
 #
-#   1. make sync      the env: numpy + sherpa-onnx (+ its onnxruntime) + typer
-#   2. make fetch     the models (Silero, CAM++, Whisper tiny, Piper voices) and
-#                     the public test corpora: ~1.1 GB once, ~850 MB kept, ~/.cache/π
+#   1. make sync      the env: numpy, scipy, onnxruntime, sherpa-onnx, typer
+#   2. make fetch     the models (Silero, CAM++, Parakeet v3, Whisper turbo, Piper
+#                     voices) and the public test corpora: ~2.4 GB once, ~/.cache/π
 #   3. make rec       PANE 1: the recorder, endless 1 s chunks. NEVER stopped.
 #   4. make run       PANE 2: the ear. One line per decision, state live on disk.
 #   5. make watch     PANE 3: the state moving.
 #
-#   then: make status / events / correct / pause / resume / snapshot / diff /
+#   then: make status / events / questions / answer / correct / undo / why /
+#         pause / resume / snapshot / diff /
 #         reset / corpus / replay-corpus / test / check / base
 #
 # Nothing here sets a judgement: there is no threshold to pass, because the ear
@@ -38,7 +39,7 @@ RUN_FLAGS ?=
 EAR := $(UV) run π-ear
 
 .PHONY: help sync fetch base check test test-fast rec run watch events state status \
-	pause resume reset snapshot diff correct undo why probe corpus replay-corpus clean
+	pause resume reset snapshot diff correct undo questions answer why probe corpus replay-corpus clean
 
 help:  ## Show the setup order and every target
 	@echo "π-ear setup order: sync -> fetch -> rec + run + watch (three panes)"
@@ -49,7 +50,7 @@ help:  ## Show the setup order and every target
 sync:  ## [setup 1] The env, resolved by uv
 	@$(UV) sync
 
-fetch:  ## [setup 2] Models + public corpora into ~/.cache/π (~1.1 GB, once)
+fetch:  ## [setup 2] Models + public corpora into ~/.cache/π (~2.4 GB, once)
 	@$(EAR) fetch all
 
 base:  ## Re-measure the base weights on public voices and sounds the tests never use
@@ -64,7 +65,8 @@ test:  ## Every test: the law, the maths, the model, the server, the simulated r
 	@$(UV) run pytest -q
 
 test-fast:  ## Only what needs no model and no download (< 1 s)
-	@$(UV) run pytest -q tests/test_law.py tests/test_sphere.py tests/test_model.py tests/test_io.py
+	@$(UV) run pytest -q tests/test_law.py tests/test_sphere.py tests/test_model.py tests/test_io.py \
+	  tests/test_words.py tests/test_cli.py -k "not replay and not from_to"
 
 rec:  ## [setup 3, PANE 1] Recorder: endless 1 s raw chunks. NEVER stopped.
 	@mkdir -p $(AUDIO)
@@ -86,11 +88,17 @@ state:  ## Print the state once
 status:  ## Human-readable summary
 	@$(EAR) ctl status --root $(ROOT)
 
-correct:  ## One correction: make correct C="different 812 901" (see README)
+correct:  ## One correction: make correct C="different 812 901" or C="text 812 --text '...'"
 	@$(EAR) correct $(C) --memory $(MEMORY)
 
 undo:  ## Forget one correction exactly: make undo N=3 (its `line` in the record)
 	@$(EAR) undo $(N) --memory $(MEMORY)
+
+questions:  ## What the ear is asking (names, readings it could not choose)
+	@$(EAR) questions --root $(ROOT)
+
+answer:  ## Answer one: make answer Q='S:163.2#text' A="what was said" (or C=1 for a choice)
+	@$(EAR) answer '$(Q)' $(if $(A),"$(A)",--choice $(C)) --memory $(MEMORY)
 
 why:  ## What the ear decided for one window, and why: make why ROW=812
 	@$(EAR) why $(ROW) --root $(ROOT) --memory $(MEMORY)

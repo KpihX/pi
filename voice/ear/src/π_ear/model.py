@@ -53,7 +53,17 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from π_ear.contract import KEY_BYTES
-from π_ear.sphere import crp_alpha, cure_rate, kappa_from_rho, log_c, rho2, unit
+from π_ear.sphere import (
+    choice_probabilities,
+    crp_alpha,
+    cure_rate,
+    fit_choice,
+    kappa_from_rho,
+    log_c,
+    rho2,
+    rho_of,
+    unit,
+)
 
 VOICE = ("candidate", "speaker")
 
@@ -68,6 +78,7 @@ class Cluster:
     last_seen: float = 0.0
     label: str | None = None
     heard: int = 0  # windows absorbed from public data, held only as a sum
+    voice: str | None = None  # the voice this condition belongs to (speakers only)
 
     @property
     def n(self) -> int:
@@ -82,6 +93,7 @@ class Cluster:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "heard": self.heard,
+            "voice": self.voice,
             "total": self.total.tolist(),
         }
 
@@ -96,7 +108,32 @@ class Cluster:
             last_seen=raw["last_seen"],
             label=raw["label"],
             heard=raw.get("heard", 0),
+            voice=raw.get("voice"),
         )
+
+
+@dataclass(slots=True)
+class Voice:
+    """One person (or one device): the conditions it was heard in, and what is known of it."""
+
+    key: str
+    conditions: list[str] = field(default_factory=list)
+    label: str | None = None
+    source: str | None = None  # "person" | "device", once known
+    first_seen: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "conditions": self.conditions,
+            "label": self.label,
+            "source": self.source,
+            "first_seen": self.first_seen,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> Voice:
+        return cls(**raw)
 
 
 @dataclass(slots=True)
@@ -111,8 +148,19 @@ class Weights:
     between_count: float
     tables_obs: float
     tables_k: float
+    conditions_norm2: float = 0.0  # recording means of one voice: how far its conditions drift
+    conditions_count: float = 0.0
+    conditions_pairs: float = 0.0
+    places_norm2: float = 0.0  # condition means of DIFFERENT voices in one place: kappa_in
+    places_count: float = 0.0
+    places_pairs: float = 0.0
+    place_sum: np.ndarray | None = None  # sum of the unit means of the places: kappa_p
+    place_count: float = 0.0
     source: str = ""
     noise: list[dict] = field(default_factory=list)
+    spectra: dict = field(default_factory=dict)  # person/device spectral shapes (source.py)
+    reader: dict = field(default_factory=dict)  # the reader's base weights (words.py)
+    calibration: list = field(default_factory=list)  # [margin, right] on public windows (Q1)
     kappa: float = 0.0
     kappa0: float = 0.0
     mean0: np.ndarray | None = None
@@ -128,8 +176,19 @@ class Weights:
             "between_count": self.between_count,
             "tables_obs": self.tables_obs,
             "tables_k": self.tables_k,
+            "conditions_norm2": self.conditions_norm2,
+            "conditions_count": self.conditions_count,
+            "conditions_pairs": self.conditions_pairs,
+            "places_norm2": self.places_norm2,
+            "places_count": self.places_count,
+            "places_pairs": self.places_pairs,
+            "place_sum": None if self.place_sum is None else self.place_sum.tolist(),
+            "place_count": self.place_count,
             "source": self.source,
             "noise": self.noise,
+            "spectra": self.spectra,
+            "reader": self.reader,
+            "calibration": self.calibration,
         }
 
     @classmethod
@@ -143,38 +202,89 @@ class Weights:
             between_count=raw["between_count"],
             tables_obs=raw["tables_obs"],
             tables_k=raw["tables_k"],
+            conditions_norm2=raw.get("conditions_norm2", 0.0),
+            conditions_count=raw.get("conditions_count", 0.0),
+            conditions_pairs=raw.get("conditions_pairs", 0.0),
+            places_norm2=raw.get("places_norm2", 0.0),
+            places_count=raw.get("places_count", 0.0),
+            places_pairs=raw.get("places_pairs", 0.0),
+            place_sum=(
+                None
+                if raw.get("place_sum") is None
+                else np.asarray(raw["place_sum"], dtype=np.float64)
+            ),
+            place_count=raw.get("place_count", 0.0),
             source=raw.get("source", ""),
             noise=raw.get("noise", []),
+            spectra=raw.get("spectra", {}),
+            reader=raw.get("reader", {}),
+            calibration=raw.get("calibration", []),
         )
 
 
-def fit_weights(groups: dict[str, list[list[np.ndarray]]], source: str) -> Weights:
+def fit_weights(
+    groups: dict[str, list[list[np.ndarray]]],
+    source: str,
+    places: list[list[tuple[str, int]]] | None = None,
+) -> Weights:
     """Base statistics from labelled public windows: the "good bases" of the ear.
 
-    ``groups`` maps a voice to its recordings, each a list of windows. ``kappa``
-    is measured on pairs of windows from two DIFFERENT recordings of one voice
-    only, because the ear will meet a voice across rooms and days, not inside
-    one sentence.
+    ``groups`` maps a voice to its recordings, each a list of windows. Two
+    levels, measured separately (v2, Q2): ``kappa`` on pairs of windows of the
+    SAME recording (how much one voice varies inside one condition), and
+    ``kappa_c`` on the means of DIFFERENT recordings of one voice (how far a voice
+    drifts between rooms, days and microphones). v1 measured kappa across
+    recordings, which folded the drift into the window level and split a voice
+    heard in two conditions into two people.
+
+    ``places`` (v2), when given, lists the recordings heard in one same place, as
+    (voice, recording index): several voices through one room and one microphone.
+    Measured there: ``kappa_in``, how close different voices of one place are to
+    each other (they share the channel), and ``kappa_p``, how far places are from
+    each other. Without it, two people in one room were predicted as far apart as
+    two people anywhere, and measured on the pyannote sample (cos 0.49 between its
+    two voices where the population said 0.35), the ear heard them as one.
     """
     dim = len(next(iter(groups.values()))[0][0])
     cross, pairs, speakers, count = 0.0, 0.0, np.zeros(dim), 0
+    cond_norm2, cond_count, cond_pairs = 0.0, 0, 0
     for recordings in groups.values():
         sums = [sum(r, np.zeros(dim)) for r in recordings]
         sizes = [len(r) for r in recordings]
         total = sum(sums, np.zeros(dim))
-        cross += float(total @ total) - sum(float(s @ s) for s in sums)
-        pairs += sum(sizes) * sum(sizes) - sum(m * m for m in sizes)
+        cross += sum(float(s @ s) for s in sums) - sum(sizes)
+        pairs += sum(m * (m - 1) for m in sizes)
         speakers = speakers + unit(total)
         count += sum(sizes)
+        means = sum((unit(s) for s in sums), np.zeros(dim))
+        cond_norm2 += float(means @ means)
+        cond_count += len(sums)
+        cond_pairs += len(sums) * (len(sums) - 1)
+    in_norm2, in_count, in_pairs, place_sum = 0.0, 0, 0, np.zeros(dim)
+    for place in places or []:
+        means = [unit(sum(groups[v][i], np.zeros(dim))) for v, i in place]
+        together = sum(means, np.zeros(dim))
+        in_norm2 += float(together @ together)
+        in_count += len(means)
+        in_pairs += len(means) * (len(means) - 1)
+        place_sum = place_sum + unit(together)
     return Weights(
         dim=dim,
         within_norm2=cross,
-        within_count=0,
+        within_count=0,  # the norms above already have the diagonal removed
         within_pairs=pairs,
         between_sum=speakers,
         between_count=len(groups),
         tables_obs=count,
         tables_k=len(groups),
+        conditions_norm2=cond_norm2,
+        conditions_count=cond_count,
+        conditions_pairs=cond_pairs,
+        places_norm2=in_norm2,
+        places_count=in_count,
+        places_pairs=in_pairs,
+        place_sum=place_sum if places else None,
+        place_count=len(places or []),
         source=source,
     )
 
@@ -192,14 +302,23 @@ class Model:
         self.dim = weights.dim
         self.vec_of = vec_of
         self.clusters: dict[str, Cluster] = {}
+        self.voices: dict[str, Voice] = {}
         self.where: dict[int, str] = {}
         self.cannot: set[tuple[int, int]] = set()
+        self.must: set[tuple[int, int]] = set()  # rows said to share a voice: never unlinked
+        self.links: dict[str, float] = {"dot": 0.0, "count": 0.0}  # labelled condition pairs
         self.absorbed: dict[str, str] = {}
         self.pairs: dict[str, float] = {"dot": 0.0, "count": 0.0}
         self.confirm: dict[str, float] = {"gaps": 0.0, "count": 0.0, "forgotten": 0.0}
         self.cure: tuple[float, float] | None = None
         self.turns: dict[str, float] = {"stay": 0.0, "switch": 0.0}
         self.after: dict[int, int] = {}  # row -> the previous learned row of its run
+        self.margin_of: dict[int, float] = {}  # row -> the margin it was decided with
+        self.place: str | None = None  # where the ear is listening (the ear's session)
+        self.here: set[str] = set()  # the speaker conditions heard in this place
+        # [margin, was it right]: the base's public windows, then every correction
+        self.calibration: list[list[float]] = [list(x) for x in weights.calibration]
+        self.trust_weights: np.ndarray | None = None
         self.now = 0.0
         for index, raw in enumerate(weights.noise):
             key = f"base-noise-{index}"
@@ -233,10 +352,23 @@ class Model:
             ),
         )
 
-        speakers = [c for c in self.clusters.values() if c.kind == "speaker"]
-
-        directions = base.between_sum + sum((unit(c.total) for c in speakers), np.zeros(base.dim))
-        k = base.between_count + len(speakers)
+        # kappa_c, how far one voice drifts between conditions (rooms, days,
+        # microphones), learns like kappa: from the recordings of the base, then
+        # from every pair of conditions a "same" correction joined.
+        twice = self.links["count"] + self.links["count"]
+        self.kappa_c = kappa_from_rho(
+            self.dim,
+            math.sqrt(
+                rho2(
+                    base.conditions_norm2 + twice + self.links["dot"] + self.links["dot"],
+                    base.conditions_count + twice,
+                    base.conditions_pairs + twice,
+                )
+            ),
+        )
+        means = [unit(self.voice_total(v)) for v in self.voices.values()]
+        directions = base.between_sum + sum(means, np.zeros(base.dim))
+        k = base.between_count + len(means)
         between = float(directions @ directions)
         self.kappa0 = kappa_from_rho(self.dim, math.sqrt(rho2(between, k, k * (k - 1))))
         self.mean0 = unit(directions)
@@ -252,6 +384,44 @@ class Model:
         self.log_alpha = math.log(self.alpha)
         self.log_c_kappa = log_c(self.dim, self.kappa)
         self.log_c_kappa0 = log_c(self.dim, self.kappa0)
+        conditions = sum(len(v.conditions) for v in self.voices.values())
+        self.alpha_v = crp_alpha(
+            base.conditions_count + conditions, base.tables_k + len(self.voices)
+        )
+        self.log_alpha_v = math.log(self.alpha_v)
+        self.log_c_kappa_c = log_c(self.dim, self.kappa_c)
+        self._centre()
+
+    def _centre(self) -> None:
+        """The prior of a new voice, centred on the place the ear is in.
+
+        Voices heard through one room and one microphone share that channel: their
+        means lie around the place's mean with ``kappa_in``, and places lie around
+        the population's mean with ``kappa_p`` (both measured on the base's
+        simulated places). The place's mean is estimated from the voices already
+        heard here; a new voice is predicted around it, with the place's own
+        uncertainty composed in (A_d(k_new) = A_d(kappa_in) A_d(||a||)). Before
+        any voice is heard here, this is the population prior again, broadened.
+        """
+        base = self.base
+        if base.place_sum is None or not base.places_pairs:
+            return
+        kappa_in = kappa_from_rho(
+            self.dim, math.sqrt(rho2(base.places_norm2, base.places_count, base.places_pairs))
+        )
+        spread = float(base.place_sum @ base.place_sum)
+        count = base.place_count
+        kappa_p = kappa_from_rho(self.dim, math.sqrt(rho2(spread, count, count * (count - 1))))
+        here = [c for c in self.here if c in self.clusters and self.clusters[c].kind == "speaker"]
+        a = kappa_p * self.mean0 + kappa_in * sum(
+            (unit(self.clusters[c].total) for c in here), np.zeros(self.dim)
+        )
+        self.kappa_in, self.kappa_p = kappa_in, kappa_p
+        self.kappa0 = kappa_from_rho(
+            self.dim, rho_of(self.dim, kappa_in) * rho_of(self.dim, float(np.linalg.norm(a)))
+        )
+        self.prior = self.kappa0 * unit(a)
+        self.log_c_kappa0 = log_c(self.dim, self.kappa0)
 
     def _lc(self, total: np.ndarray) -> float:
         """log C_d(||kappa0 mean0 + kappa total||): the posterior of a cluster mean."""
@@ -260,6 +430,94 @@ class Model:
     def predictive(self, total: np.ndarray, x: np.ndarray) -> float:
         """log p(x | the windows already in a cluster), the mean integrated out."""
         return self.log_c_kappa + self._lc(total) - self._lc(total + x)
+
+    # -- the second level: conditions grouped into voices ----------------------------
+    def voice_total(self, voice: Voice, without: str | None = None) -> np.ndarray:
+        """Sum of the unit means of a voice's conditions (one excluded, if asked)."""
+        return sum(
+            (unit(self.clusters[c].total) for c in voice.conditions if c != without),
+            np.zeros(self.dim),
+        )
+
+    def _rows_of(self, keys) -> set[int]:
+        return {r for k in keys for r in self.clusters[k].members}
+
+    def _conflicts(self, cluster: Cluster, voice: Voice) -> bool:
+        rows = self._rows_of(c for c in voice.conditions if c != cluster.key)
+        return any(
+            (a, b) in self.cannot or (b, a) in self.cannot for a in cluster.members for b in rows
+        )
+
+    def _bound(self, cluster: Cluster) -> str | None:
+        """The voice a correction tied this condition to, if any."""
+        for voice in self.voices.values():
+            rows = self._rows_of(c for c in voice.conditions if c != cluster.key)
+            if any(
+                (a, b) in self.must or (b, a) in self.must for a in cluster.members for b in rows
+            ):
+                return voice.key
+        return None
+
+    def voice_scores(self, cluster: Cluster) -> dict[str | None, float]:
+        """Log posterior of "this condition is that voice", for every voice, and "a new one".
+
+        Conditions of one voice spread around it with concentration ``kappa_c``;
+        a condition's windows are integrated through ``kappa``. A new voice is
+        drawn from the population (``kappa0``, ``mean0``).
+        """
+        out: dict[str | None, float] = {}
+        for key, voice in self.voices.items():
+            others = [c for c in voice.conditions if c != cluster.key]
+            if not others or self._conflicts(cluster, voice):
+                continue
+            centre = self.kappa_c * unit(self.voice_total(voice, cluster.key))
+            spread = float(np.linalg.norm(centre + self.kappa * cluster.total))
+            out[key] = math.log(len(others)) + self.log_c_kappa_c - log_c(self.dim, spread)
+        out[None] = self.log_alpha_v + self.log_c_kappa0 - self._lc(cluster.total)
+        return out
+
+    def _link(self, key: str) -> None:
+        """Put a speaker condition in its most probable voice (it may move as it grows)."""
+        cluster = self.clusters.get(key)
+        if cluster is None or cluster.kind != "speaker":
+            return
+        bound = self._bound(cluster)
+        if bound is None:
+            scored = self.voice_scores(cluster)
+            bound = max(scored, key=scored.get)
+        if bound is not None and bound == cluster.voice:
+            return
+        old = self._detach(cluster)
+        if bound is None:
+            vkey = (
+                cluster.key
+                if cluster.key not in self.voices
+                else centroid_key(np.append(cluster.total, float(len(self.voices))))
+            )
+            self.voices[vkey] = Voice(vkey, [], label=cluster.label, first_seen=cluster.first_seen)
+            bound = vkey
+        voice = self.voices[bound]
+        voice.conditions.append(cluster.key)
+        voice.label = voice.label or cluster.label
+        cluster.voice = bound
+        if old is not None and old not in self.voices:
+            self.absorbed[old] = bound
+
+    def _detach(self, cluster: Cluster) -> str | None:
+        old = cluster.voice
+        if old is not None and old in self.voices:
+            voice = self.voices[old]
+            if cluster.key in voice.conditions:
+                voice.conditions.remove(cluster.key)
+            if not voice.conditions:
+                del self.voices[old]
+        cluster.voice = None
+        return old
+
+    def voice_of(self, row: int) -> Voice | None:
+        key = self.where.get(row)
+        cluster = self.clusters.get(key) if key else None
+        return self.voices.get(cluster.voice) if cluster and cluster.voice else None
 
     # -- the decision (fast clock) ---------------------------------------------
     def _confirmation(self):
@@ -307,49 +565,67 @@ class Model:
         }
 
     def observe(
-        self, row: int, x: np.ndarray, t: float, learn: bool, follows: int | None = None
+        self,
+        row: int,
+        x: np.ndarray,
+        t: float,
+        learn: bool,
+        follows: int | None = None,
+        place: str | None = None,
     ) -> dict:
         """Decide who ``x`` is. If ``learn``, the decision also becomes evidence.
 
         ``follows`` is the previous learned window of the same speech run, if any:
-        the continuity prior uses it once labelled transitions exist.
+        the continuity prior uses it once labelled transitions exist. ``place`` is
+        where the ear listens (its session): voices of one place share a channel.
         """
         self.now = max(self.now, t)
+        if place != self.place:
+            self.place, self.here = place, set()
+            self._centre()
         previous = self.where.get(follows) if follows is not None else None
         scored = self.scores(x, VOICE + ("noise",), previous)
         ranked = sorted(scored.items(), key=lambda item: item[1], reverse=True)
         top = ranked[0][1]
+        self.margin_of[row] = top - (ranked[1][1] if ranked[1:] else top)
         mass = sum(math.exp(value - top) for _, value in ranked)
         choice = ranked[0][0]
         runner = ranked[1] if ranked[1:] else (None, top)
-        speakers = {k for k, c in self.clusters.items() if c.kind == "speaker"}
+        known = set(self.voices)
         if learn:
             if follows is not None:
                 self.after[row] = follows
             choice = self._add(choice, row, x, t, "candidate")
             choice = self._merge(self._promote(choice))
+            if choice is not None and self.clusters[choice].kind == "speaker":
+                self.here.add(choice)
+            self._link(choice)
             self._forget()
             self.refresh()
         cluster = self.clusters.get(choice) if choice is not None else None
-        kind = self._kind(cluster, speakers)
+        voice = self.voices.get(cluster.voice) if cluster is not None and cluster.voice else None
+        kind = self._kind(cluster, voice, known)
         return {
             "kind": kind,
-            "speaker": cluster.key if cluster is not None and kind != "unknown" else None,
-            "label": cluster.label if cluster is not None else None,
+            "speaker": voice.key if voice else (cluster.key if kind == "noise" else None),
+            "condition": cluster.key if cluster is not None else None,
+            "label": voice.label if voice else (cluster.label if cluster is not None else None),
+            "source": voice.source if voice else None,
             "p": math.exp(ranked[0][1] - top) / mass,
             "runner_up": {"id": runner[0], "p": math.exp(runner[1] - top) / mass},
             "margin": top - runner[1],  # nats between the winner and the runner up
+            "trust": self.trust(top - runner[1]),
             "evidence": cluster.n if cluster is not None else 0,
             "learned": learn,
         }
 
     @staticmethod
-    def _kind(cluster: Cluster | None, speakers: set[str]) -> str:
-        if cluster is None or cluster.kind == "candidate":
-            return "unknown"
-        if cluster.kind == "noise":
+    def _kind(cluster: Cluster | None, voice: Voice | None, known: set[str]) -> str:
+        if cluster is not None and cluster.kind == "noise":
             return "noise"
-        return "known" if cluster.key in speakers else "new"
+        if voice is None:
+            return "unknown"
+        return "known" if voice.key in known else "new"
 
     # -- learning --------------------------------------------------------------
     def _add(self, key: str | None, row: int, x: np.ndarray, t: float, kind: str) -> str:
@@ -371,6 +647,7 @@ class Model:
         cluster.members.remove(row)
         cluster.total = cluster.total - self.vec_of(row)
         if not cluster.n:
+            self._detach(cluster)
             del self.clusters[key]
 
     def _one_voice(self, members: list[int]) -> tuple[float, float]:
@@ -392,6 +669,7 @@ class Model:
             self.confirm["gaps"] += cluster.last_seen - cluster.first_seen
             self.confirm["count"] += 1
             self._rename(key, centroid_key(cluster.total))
+            self._link(cluster.key)
         return cluster.key
 
     def _forget(self) -> None:
@@ -407,6 +685,9 @@ class Model:
         self.clusters[new] = cluster
         for row in cluster.members:
             self.where[row] = new
+        voice = self.voices.get(cluster.voice) if cluster.voice else None
+        if voice is not None and old in voice.conditions:
+            voice.conditions[voice.conditions.index(old)] = new
         self.absorbed[old] = new
 
     def _linked(self, a: Cluster, b: Cluster) -> bool:
@@ -448,9 +729,14 @@ class Model:
         keep.heard += drop.heard
         for row in drop.members:
             self.where[row] = keep.key
+        dropped_voice = self._detach(drop)
         del self.clusters[drop.key]
         self.absorbed[drop.key] = keep.key
-        self._promote(keep.key)
+        key = self._promote(keep.key)
+        self._link(key)
+        survivor = self.clusters[key].voice
+        if dropped_voice is not None and dropped_voice not in self.voices and survivor:
+            self.absorbed[dropped_voice] = survivor
         return self.where[keep.members[0]]
 
     def hear_noise(self, x: np.ndarray) -> None:
@@ -472,8 +758,14 @@ class Model:
 
     # -- corrections -------------------------------------------------------------
     def correct(self, kind: str, rows: list[int], label: str | None = None) -> None:
-        """Obey one correction now. ``refresh`` then absorbs it into the weights."""
+        """Obey one correction now. ``refresh`` then absorbs it into the weights.
+
+        ``same``/``different`` speak about voices (people), not about conditions:
+        "these windows are one person" joins their voices and teaches ``kappa_c``;
+        "these are two people" separates them, down to the window if needed.
+        """
         known = [r for r in rows if r in self.where]
+        self._calibrate(kind, rows)
         adjacent = [(a, b) for a in rows for b in rows if self.after.get(b) == a]
         if kind == "same":
             self.turns["stay"] += len(adjacent)
@@ -481,22 +773,35 @@ class Model:
             self.turns["switch"] += len(adjacent)
         if kind == "name":
             for row in known:
+                self._as_speaker(row)
+                voice = self.voice_of(row)
+                if voice is not None:
+                    voice.label = label
                 self.clusters[self.where[row]].label = label
+        elif kind in ("person", "device"):
+            for row in known:
+                self._as_speaker(row)
+                voice = self.voice_of(row)
+                if voice is not None:
+                    voice.source = kind
         elif kind == "same":
-            # Every window of one cluster against every window of the other is now a
-            # labelled same-voice pair, and the dot products of all of them are one
-            # product of the two sums. One sentence from KπX, many pairs of evidence.
             self.cannot -= {(a, b) for a in rows for b in rows}
-            keys = list(dict.fromkeys(self.where[r] for r in known))
-            while keys[1:]:
-                a, b = self.clusters[keys[0]], self.clusters[keys[1]]
-                self.pairs["dot"] += float(a.total @ b.total)
-                self.pairs["count"] += a.n * b.n
-                self._fuse(a, b)
-                keys = list(dict.fromkeys(self.where[r] for r in known))
+            self.must |= {(a, b) for a in known for b in known if a != b}
+            for row in known:
+                self._as_speaker(row)
+            self._join([self.voice_of(r).key for r in known if self.voice_of(r)])
         elif kind == "different":
+            self.must -= {(a, b) for a in rows for b in rows}
             self.cannot |= {(a, b) for a in rows for b in rows if a != b}
             self._split(known)
+            for row in known[1:]:
+                key = self.where.get(row)
+                if key and self.clusters[key].kind == "speaker":
+                    self._link(key)
+                    cluster = self.clusters[key]
+                    if self._conflicts(cluster, self.voices[cluster.voice]):
+                        self._detach(cluster)
+                        self._link(key)
         elif kind == "not_voice":
             for row in known:
                 when = self.clusters[self.where[row]].last_seen
@@ -505,6 +810,85 @@ class Model:
                 scored = self.scores(x, ("noise",))
                 self._add(max(scored, key=scored.get), row, x, when, "noise")
         self.refresh()
+
+    # -- calibration (Q1): is a margin of so many nats often right? -------------------------
+    def _calibrate(self, kind: str, rows: list[int]) -> None:
+        """What a correction says about the decisions it touches, kept against their margin."""
+        decided = [(r, self.voice_of(r)) for r in rows if r in self.margin_of]
+        voices = [v.key if v else None for _, v in decided]
+        right: list[tuple[int, bool]] = []
+        if kind == "same" and voices:
+            counts = {v: voices.count(v) for v in voices if v is not None}
+            majority = max(counts, key=counts.get) if counts else None
+            right = [
+                (r, v is not None and v == majority)
+                for (r, _), v in zip(decided, voices, strict=True)
+            ]
+        elif kind == "different":
+            seen: set[str] = set()
+            for (r, _), v in zip(decided, voices, strict=True):
+                right.append((r, v is None or v not in seen))
+                if v is not None:
+                    seen.add(v)
+        elif kind == "not_voice":
+            right = [(r, v is None) for (r, _), v in zip(decided, voices, strict=True)]
+        elif kind == "name":
+            right = [(r, True) for (r, _), v in zip(decided, voices, strict=True) if v is not None]
+        for row, ok in right:
+            self.calibration.append([self.margin_of[row], float(ok)])
+        if right:
+            self.trust_weights = None
+
+    def trust(self, margin: float) -> float | None:
+        """P(this decision is right | its margin), learned from corrections; None before
+        corrections have shown both a right and a wrong decision."""
+        outcomes = {ok for _, ok in self.calibration}
+        if {0.0, 1.0} <= outcomes and self.trust_weights is None:
+            examples = [
+                (np.array([[m, 1], [0, 0]], dtype=np.float64), 0 if ok else 1)
+                for m, ok in self.calibration
+            ]
+            self.trust_weights, _ = fit_choice(examples, examples[0][0].shape[1])
+        if self.trust_weights is None:
+            return None
+        return float(choice_probabilities(np.array([[margin, 1], [0, 0]]), self.trust_weights)[0])
+
+    def _as_speaker(self, row: int) -> None:
+        """A window a correction speaks about is a voice, whatever it was decided to be."""
+        cluster = self.clusters[self.where[row]]
+        if cluster.kind == "candidate":
+            cluster.kind = "speaker"
+            self._rename(cluster.key, centroid_key(cluster.total))
+            self._link(self.where[row])
+        elif cluster.kind == "speaker" and cluster.voice is None:
+            self._link(cluster.key)
+
+    def _join(self, keys: list[str]) -> None:
+        """Make one voice of several: the oldest keeps its key, its name and its source.
+
+        Every pair of conditions joined is a labelled pair for ``kappa_c``: the
+        dot products of their unit means, one correction, many pairs of evidence.
+        """
+        keys = [k for k in dict.fromkeys(keys) if k in self.voices]
+        if not keys[1:]:
+            return
+        voices = sorted((self.voices[k] for k in keys), key=lambda v: v.first_seen)
+        keep = voices[0]
+        for voice in voices[1:]:
+            mine = sum((unit(self.clusters[c].total) for c in keep.conditions), np.zeros(self.dim))
+            theirs = sum(
+                (unit(self.clusters[c].total) for c in voice.conditions), np.zeros(self.dim)
+            )
+            self.links["dot"] += float(mine @ theirs)
+            self.links["count"] += len(keep.conditions) * len(voice.conditions)
+            for condition in voice.conditions:
+                self.clusters[condition].voice = keep.key
+                keep.conditions.append(condition)
+            keep.label = keep.label or voice.label
+            keep.source = keep.source or voice.source
+            keep.first_seen = min(keep.first_seen, voice.first_seen)
+            del self.voices[voice.key]
+            self.absorbed[voice.key] = keep.key
 
     def _split(self, seeds: list[int]) -> None:
         """Re-cut the cluster(s) holding seeds that may not share a voice."""
@@ -538,11 +922,20 @@ class Model:
                 self.clusters[part.key] = part
             heir = ranked[0]
             heir.label = cluster.label
+            voice = self.voices.get(cluster.voice) if cluster.voice else None
+            if voice is not None:
+                voice.conditions.remove(key)
+                if not voice.conditions:
+                    del self.voices[voice.key]
             if cluster.kind == "speaker":
                 heir.kind = "speaker"
                 self._rename(heir.key, key)
+                if voice is not None:
+                    self.voices.setdefault(voice.key, voice)
+                    voice.conditions.append(key)
+                    heir.voice = voice.key
             for part in ranked:
-                self._promote(part.key)
+                self._link(self._promote(part.key))
 
     def _forbids(self, part: Cluster, row: int) -> bool:
         return any((row, r) in self.cannot or (r, row) in self.cannot for r in part.members)
@@ -551,24 +944,35 @@ class Model:
     def to_dict(self) -> dict:
         return {
             "clusters": [c.to_dict() for c in self.clusters.values()],
+            "voices": [v.to_dict() for v in self.voices.values()],
             "cannot": sorted(self.cannot),
+            "must": sorted(self.must),
+            "links": self.links,
             "absorbed": self.absorbed,
             "pairs": self.pairs,
             "confirm": self.confirm,
             "turns": self.turns,
             "after": [[row, previous] for row, previous in self.after.items()],
+            "margin_of": [[row, m] for row, m in self.margin_of.items()],
+            "calibration": self.calibration,
             "now": self.now,
         }
 
     def load(self, raw: dict) -> None:
         self.clusters = {c["key"]: Cluster.from_dict(c) for c in raw.get("clusters", [])}
+        self.voices = {v["key"]: Voice.from_dict(v) for v in raw.get("voices", [])}
         self.where = {row: c.key for c in self.clusters.values() for row in c.members}
         self.cannot = {tuple(pair) for pair in raw.get("cannot", [])}
+        self.must = {tuple(pair) for pair in raw.get("must", [])}
+        self.links = dict(raw.get("links", self.links))
         self.absorbed = dict(raw.get("absorbed", {}))
         self.pairs = dict(raw.get("pairs", self.pairs))
         self.confirm = dict(raw.get("confirm", self.confirm))
         self.turns = dict(raw.get("turns", self.turns))
         self.after = {row: previous for row, previous in raw.get("after", [])}
+        self.margin_of = {row: m for row, m in raw.get("margin_of", [])}
+        self.calibration = [list(x) for x in raw.get("calibration", [])]
+        self.trust_weights = None
         self.now = raw.get("now", self.now)
         self.refresh()
 
@@ -577,7 +981,11 @@ class Model:
             "kappa": self.kappa,
             "kappa0": self.kappa0,
             "alpha": self.alpha,
-            "speakers": sum(c.kind == "speaker" for c in self.clusters.values()),
+            "kappa_c": self.kappa_c,
+            "kappa_in": getattr(self, "kappa_in", None),
+            "kappa_p": getattr(self, "kappa_p", None),
+            "speakers": len(self.voices),
+            "conditions": sum(c.kind == "speaker" for c in self.clusters.values()),
             "candidates": sum(c.kind == "candidate" for c in self.clusters.values()),
             "noise": sum(c.kind == "noise" for c in self.clusters.values()),
             "stay": self.stay(),
@@ -593,11 +1001,13 @@ class Model:
         out = []
         for key, value in sorted(scored.items(), key=lambda item: item[1], reverse=True):
             cluster = self.clusters.get(key) if key else None
+            voice = self.voices.get(cluster.voice) if cluster and cluster.voice else None
             out.append(
                 {
-                    "id": key,
+                    "id": voice.key if voice else key,
+                    "condition": key,
                     "kind": cluster.kind if cluster else "new",
-                    "label": cluster.label if cluster else None,
+                    "label": voice.label if voice else (cluster.label if cluster else None),
                     "evidence": cluster.n if cluster else 0,
                     "behind_nats": top - value,
                 }

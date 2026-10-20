@@ -1,11 +1,15 @@
 """Every download of the package, in one list, and the public corpora it is tested on.
 
-Models (sherpa-onnx releases on GitHub, ~350 MB with the test voices):
+Models (sherpa-onnx releases on GitHub, ~1.5 GB downloaded, ~1.3 GB kept):
 
-* Silero VAD and CAM++ (the sensors);
-* Whisper tiny, multilingual (the optional transcript);
-* Piper LibriTTS-R, 904 synthetic voices (the hardest test: synthetic voices
-  sit closer to each other than real ones).
+* Silero VAD and CAM++ (the sensors of *who*);
+* Parakeet TDT 0.6b v3 (25 languages) and Whisper turbo (99 languages): the
+  fast and the slow reader of *what* (``asr.py``); Whisper tiny is kept for the
+  LibriSpeech test files of its archive;
+* whatever ``PI_EAR_FAST`` and ``PI_EAR_SLOW`` name from the registry instead
+  (``asr.REGISTRY``), and Spleeter if ``PI_EAR_SEPARATOR`` asks for it;
+* Piper voices, LibriTTS-R (904 English voices) and UPMC (French): synthetic
+  speech whose text is known, for the base and the tests.
 
 Public corpora (raw.githubusercontent.com, ~120 MB), never committed:
 
@@ -15,7 +19,8 @@ Public corpora (raw.githubusercontent.com, ~120 MB), never committed:
 * FSDD (Jackson et al., CC BY-SA 4.0): six real speakers, 3000 recordings;
 * three LibriSpeech excerpts (CC BY 4.0, as mirrored by librosa);
 * the pyannote two-speaker sample with its RTTM (MIT);
-* the sherpa-onnx four-speaker Mandarin test file.
+* the sherpa-onnx four-speaker Mandarin test file;
+* three music tracks mirrored by librosa (CC BY / CC0), to mix under speech.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from π_ear import contract
+from π_ear.asr import REGISTRY
 
 RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 RAW = "https://raw.githubusercontent.com"
@@ -38,11 +44,25 @@ MODELS = {
     contract.ENCODER: f"{RELEASES}/speaker-recongition-models/{contract.ENCODER}",
 }
 ARCHIVES = {
-    # tiny is kept: its archive carries the LibriSpeech test files the base is measured on
-    "sherpa-onnx-whisper-tiny": f"{RELEASES}/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
     contract.WHISPER_DIR: f"{RELEASES}/asr-models/{contract.WHISPER_DIR}.tar.bz2",
+    **{
+        REGISTRY[name][0]: f"{RELEASES}/asr-models/{REGISTRY[name][0]}.tar.bz2"
+        for name in (contract.FAST, contract.SLOW)
+        if name in REGISTRY
+    },
+    **(
+        {contract.SEPARATOR: f"{RELEASES}/source-separation-models/{contract.SEPARATOR}.tar.bz2"}
+        if contract.SEPARATOR != "none"
+        else {}
+    ),
     "vits-piper-en_US-libritts_r-medium": f"{RELEASES}/tts-models/vits-piper-en_US-libritts_r-medium.tar.bz2",
+    "vits-piper-fr_FR-upmc-medium": f"{RELEASES}/tts-models/vits-piper-fr_FR-upmc-medium.tar.bz2",
 }
+MUSIC = (
+    "442789__lena-orsa__happy-music-pistachio-ice-cream-ragtime.ogg",
+    "147793__setuniman__sweet-waltz-0i-22mi.ogg",
+    "Hungarian_Dance_number_5_-_Allegro_in_F_sharp_minor_(string_orchestra).ogg",
+)
 
 ESC50_CLASSES = (
     "coughing sneezing door_wood_knock door_wood_creaks keyboard_typing mouse_click footsteps "
@@ -108,6 +128,8 @@ def data(root: Path = contract.DATA, echo=print) -> None:
                 jobs.append((f"{fsdd}/{name}", root / "fsdd" / name))
     for name in LIBRI:
         jobs.append((f"{RAW}/librosa/data/main/audio/{name}", root / "libri" / name))
+    for name in MUSIC:
+        jobs.append((f"{RAW}/librosa/data/main/audio/{name}", root / "music" / name))
     pyannote = f"{RAW}/pyannote/pyannote-audio/develop/tutorials/assets"
     jobs.append((f"{pyannote}/sample.wav", root / "sample.wav"))
     jobs.append((f"{pyannote}/sample.rttm", root / "sample.rttm"))
@@ -116,5 +138,5 @@ def data(root: Path = contract.DATA, echo=print) -> None:
     )
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda job: _get(*job), jobs))
-    for directory in ("esc50", "fsdd", "libri"):
+    for directory in ("esc50", "fsdd", "libri", "music"):
         echo(f"data    {root / directory}: {len(list((root / directory).iterdir()))} files")

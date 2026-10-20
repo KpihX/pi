@@ -17,8 +17,9 @@ from π_ear.sphere import unit
 def _purity(model: Model, truth: dict[int, int]) -> tuple[int, float]:
     owner = collections.defaultdict(collections.Counter)
     for row, who in truth.items():
-        if row in model.where and model.clusters[model.where[row]].kind == "speaker":
-            owner[model.where[row]][who] += 1
+        voice = model.voice_of(row)
+        if voice is not None:
+            owner[voice.key][who] += 1
     right = sum(c.most_common(1)[0][1] for c in owner.values())
     return len(owner), right / max(sum(sum(c.values()) for c in owner.values()), 1)
 
@@ -74,10 +75,11 @@ def test_one_voice_is_one_speaker_however_long_it_talks():
     assert model.summary()["speakers"] == 1
 
 
-def test_same_correction_fuses_and_teaches_kappa():
+def test_same_correction_joins_two_conditions_and_teaches_kappa_c():
     """One voice in two modes (two rooms, two days: cos 0.6 between the modes, the
-    gap measured on FSDD), seen by the sensor as two voices. Said once to be one:
-    fused at once, kappa absorbs all the cross pairs, and both modes land in it."""
+    gap measured on FSDD), seen as two voices. Said once to be one: the two
+    conditions join one voice, kappa_c (the drift between conditions) learns
+    from every cross pair, and both modes keep landing in that voice."""
     world = World(seed=5)
     model, store = world.model()
     a = world.voices(1)[0]
@@ -86,17 +88,46 @@ def test_same_correction_fuses_and_teaches_kappa():
         for x in world.windows(mu, 10):
             world.feed(model, store, x)
     assert model.summary()["speakers"] == 2
-    kappa = model.kappa
+    kappa_c = model.kappa_c
     model.correct("same", [0, 10])
-    assert model.summary()["speakers"] == 1
-    assert model.kappa < kappa
-    assert model.pairs["count"] == 100
-    # and the next windows of either voice land in the fused speaker
-    fused = model.where[0]
+    assert model.summary()["speakers"] == 1 and model.summary()["conditions"] == 2
+    assert model.kappa_c < kappa_c
+    assert model.links["count"] == 1
+    fused = model.voice_of(0).key
     for mu in (a, b):
         for x in world.windows(mu, 5):
             world.feed(model, store, x)
-            assert model.where[len(store) - 1] == fused
+            assert model.voice_of(len(store) - 1).key == fused
+
+
+def test_conditions_of_one_voice_link_without_being_told():
+    """The fragmentation fix (Q2): a voice heard in two conditions that drift as
+    much as the base says voices drift is ONE voice with two conditions, and the
+    other voice in the room is never folded into it. Over eight worlds (two
+    conditions of one voice, one other voice), the conditions link in most, and
+    two people are never one."""
+    from conftest import Store
+
+    from π_ear.model import fit_weights
+
+    outcomes = []
+    for seed in range(6, 14):
+        world = World(seed=seed, kappa0=40.0)
+        groups = {
+            i: [list(world.windows(vmf(mu, 300.0, 1, world.rng)[0], 5)) for _ in range(4)]
+            for i, mu in enumerate(world.voices(5))
+        }
+        store = Store()
+        model = Model(fit_weights(groups, "drifting"), store)
+        voice = world.voices(1)[0]
+        for mode in vmf(voice, 300.0, 2, world.rng):
+            for x in world.windows(mode, 12):
+                world.feed(model, store, x)
+        for x in world.windows(world.voices(1)[0], 12):
+            world.feed(model, store, x)
+        outcomes.append((model.summary()["speakers"], model.summary()["conditions"]))
+    assert all(voices >= 2 for voices, _ in outcomes), "two people were made one"
+    assert sum(o == (2, 3) for o in outcomes) >= 6, outcomes
 
 
 def test_different_correction_splits_and_does_not_come_back():
@@ -274,3 +305,33 @@ def test_explain_ranks_every_explanation(world):
     assert options[0]["id"] == model.where[0] and options[0]["behind_nats"] == 0
     assert any(o["id"] is None for o in options), "someone new is always an option"
     assert [o["behind_nats"] for o in options] == sorted(o["behind_nats"] for o in options)
+
+
+def test_trust_is_none_until_both_outcomes_are_seen_then_grows_with_the_margin(world):
+    """Q1: a margin in nats becomes P(right). The model does not pretend before it has
+    seen itself both right and wrong; with the base's own replay it knows from day one."""
+    model, _ = world.model()
+    assert model.trust(10.0) is None
+    rng = np.random.default_rng(0)
+    model.calibration = [
+        [m, float(rng.uniform() < 1 - np.exp(-m / 4))] for m in rng.uniform(0, 30, 300)
+    ]
+    low, mid, high = model.trust(0.5), model.trust(5.0), model.trust(25.0)
+    assert low < mid < high and low < 0.5 < high
+
+
+def test_a_wrong_decision_said_once_lowers_the_trust_of_its_margin(world):
+    """A correction shows a confident decision was wrong: decisions with that
+    margin are trusted less from then on."""
+    model, store = world.model()
+    a, b = world.voices(2)
+    for x in np.vstack([world.windows(a, 6), world.windows(b, 6)]):
+        world.feed(model, store, x)
+    model.calibration += [[m, 1.0] for m in np.linspace(1, 40, 20)] + [[0.5, 0.0]]
+    model.trust_weights = None
+    margin = model.margin_of[11]
+    before = model.trust(margin)
+    model.correct("different", [0, 11])  # if they shared a voice, that decision was wrong
+    model.calibration.append([margin, 0.0])
+    model.trust_weights = None
+    assert model.trust(margin) < before

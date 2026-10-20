@@ -16,6 +16,7 @@ import pytest
 from conftest import needs_data
 
 from π_ear import contract, port
+from π_ear.asr import Hypothesis, Word
 from π_ear.ear import Ear, Places, correction, rebuild
 from π_ear.io import read_json, read_jsonl
 from π_ear.public import Scene, fsdd, libri
@@ -51,7 +52,7 @@ def _replay(places: Places) -> Ear:
 
 
 def _speakers(ear: Ear) -> list[str]:
-    return sorted(c.key for c in ear.model.clusters.values() if c.kind == "speaker")
+    return sorted(ear.model.voices)
 
 
 def test_live_with_a_recorder_writing_as_it_goes(tmp_path, two_voices):
@@ -191,7 +192,7 @@ def test_every_line_is_on_the_port_and_a_session_opens_the_record(tmp_path, two_
     ear = _replay(places)
     lines = read_jsonl(places.events)[0]
     assert lines[0]["kind"] == "session" and lines[0]["first_chunk"] == "20261018-000000.raw"
-    assert all(line["port"] == 1 and line["session"] == ear.session for line in lines)
+    assert all(line["port"] == port.PORT and line["session"] == ear.session for line in lines)
     assert list((places.root / "archive").glob("*events.jsonl")), "the v0 record was archived"
     decisions = [e for e in port.read(places.events) if isinstance(e, port.Decision)]
     assert decisions and all(e.margin >= 0 for e in decisions)
@@ -208,26 +209,38 @@ def test_candidates_are_visible_in_the_state(tmp_path, two_voices):
         assert {"id", "evidence", "rows", "waiting_s", "weight"} <= set(c)
 
 
-class SlowScribe:
-    """A transcriber that takes one second: the loop must not wait for it."""
+class Slow:
+    """A recogniser that takes one second: the loop must not wait for it."""
 
-    calls = 0
-
-    def __init__(self, models):
-        pass
-
-    @staticmethod
-    def available(models):
-        return True
+    def __init__(self, words: str, name: str):
+        self.words, self.name, self.calls = words, name, 0
 
     def __call__(self, samples):
-        SlowScribe.calls += 1
+        self.calls += 1
         time.sleep(1.0)
-        return "slow words"
+        n = len(samples) / contract.RATE
+        said = self.words.split()
+        return Hypothesis(
+            self.words,
+            tuple(
+                Word(w, i * n / len(said), (i + 1) * n / len(said), -0.1)
+                for i, w in enumerate(said)
+            ),
+            "en",
+            self.name,
+        )
 
 
-def test_the_decision_loop_never_waits_for_whisper(tmp_path, two_voices, monkeypatch):
-    monkeypatch.setattr("π_ear.ear.Transcriber", SlowScribe)
+def _plug(monkeypatch, fast=None, slow=None):
+    """Recognisers plugged in by the registry's own path, as any other would be."""
+    plugged = {contract.FAST: fast, contract.SLOW: slow}
+    monkeypatch.setattr("π_ear.ear.asr.build", lambda name, models: plugged.get(name))
+    return plugged
+
+
+def test_the_decision_loop_never_waits_for_the_recognisers(tmp_path, two_voices, monkeypatch):
+    fast = Slow("slow words", "fast")
+    _plug(monkeypatch, fast, Slow("slow words", "slow"))
     places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
     _scene(*two_voices[:2]).write(places.audio_dir)
     ear = Ear(places, from_start=True, live=False)
@@ -240,11 +253,20 @@ def test_the_decision_loop_never_waits_for_whisper(tmp_path, two_voices, monkeyp
     assert runs >= 2 and looped < runs * 1.0, "the loop waited for the scribe"
     ear.scribe.drain()
     texts = [e for e in read_jsonl(places.events)[0] if e.get("kind") == "text"]
-    assert len(texts) == runs and texts[0]["text"] == "slow words"
+    # each run: revision 0 from the fast reading, revision 1 once the slow one landed
+    assert sorted(e["revision"] for e in texts) == sorted([0, 1] * runs)
+    assert all(e["text"] == "slow words" for e in texts)
+    final = [e for e in texts if e["revision"] == 1]
+    assert all(w["agreed"] for e in final for w in e["words"])
 
 
-def test_a_run_without_a_recognised_voice_is_not_transcribed(tmp_path, monkeypatch):
-    monkeypatch.setattr("π_ear.ear.Transcriber", SlowScribe)
+def test_a_sound_nobody_owns_is_not_understood_and_asks_nothing(tmp_path, monkeypatch):
+    """A laugh reaches the reader (the ear reads every run that is not wholly a known
+    sound: a new voice's first sentence is a sentence). Two recognisers that write
+    different scraps with low confidence over a run Silero barely calls speech:
+    the reader says it did not understand, and does not ask anyone."""
+    _plug(monkeypatch, Slow("ha", "fast"), Slow("uh huh", "slow"))
+    monkeypatch.setattr(Slow, "__call__", _scrap)
     from π_ear.public import esc50
 
     laugh = esc50(contract.DATA)["laughing"][0]
@@ -252,7 +274,15 @@ def test_a_run_without_a_recognised_voice_is_not_transcribed(tmp_path, monkeypat
     Scene(seed=0).silence(1).add("laugh", laugh).silence(1).write(places.audio_dir)
     ear = Ear(places, from_start=True, live=False)
     ear.run(drain=True)
-    assert ear.counters.get("runs_transcribed", 0) == 0
+    events = read_jsonl(places.events)[0]
+    texts = [e for e in events if e.get("kind") == "text"]
+    assert all(e["text"] == "" and e["doubt"] == "not_understood" for e in texts), texts
+    assert not [e for e in events if e.get("kind") == "question"]
+
+
+def _scrap(self, samples):
+    said = self.words.split()
+    return Hypothesis(self.words, tuple(Word(w, 0.0, 0.2, -2.5) for w in said), None, self.name)
 
 
 def _frozen(model):
@@ -273,7 +303,8 @@ def test_undo_forgets_one_correction_exactly(tmp_path, two_voices):
     ear = _replay(places)
     before = _frozen(ear.model)
     a, b = _speakers(ear)
-    rows = [ear.model.clusters[a].members[0], ear.model.clusters[b].members[0]]
+    first = lambda v: ear.model.clusters[ear.model.voices[v].conditions[0]].members[0]  # noqa: E731
+    rows = [first(a), first(b)]
     correction(places, "same", rows)
     ear.tick()
     assert len(_speakers(ear)) == 1

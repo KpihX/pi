@@ -14,7 +14,7 @@ from pathlib import Path
 
 import π_ear
 
-DECISIONS = [Path(π_ear.__file__).parent / "model.py"]
+DECISIONS = [Path(π_ear.__file__).parent / name for name in ("model.py", "words.py", "source.py")]
 ORDERING = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 
 

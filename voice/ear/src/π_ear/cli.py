@@ -2,8 +2,9 @@
 
 π-ear run        the ear, live, following the recorder's directory
 π-ear ctl        pause | resume | reset | status
-π-ear correct    same | different | not_voice | name   ROWS | --from --to | --speaker
-π-ear undo       one correction, forgotten exactly (the model is replayed without it)
+π-ear correct    same | different | not_voice | name | person | device | text
+π-ear undo       one correction, forgotten exactly (what it taught is replayed without it)
+π-ear questions  what the ear is asking; π-ear answer  answers one
 π-ear why        ROW: what the ear decided for that window, and what it would say now
 π-ear probe      a span of recorded audio, second by second: level, speech probability, decisions
 π-ear snapshot   freeze the state, or --diff the last two
@@ -22,7 +23,7 @@ from pathlib import Path
 import typer
 
 from π_ear import contract, port
-from π_ear.ear import Ear, Places, base_weights_path, correction, load_memory
+from π_ear.ear import Ear, Places, base_weights_path, load_memory
 from π_ear.io import diff_last_two, read_json, write_atomic
 from π_ear.io import snapshot as take_snapshot
 
@@ -116,8 +117,10 @@ def ctl(action: Action, root: str = ROOT):
         )
         typer.echo(f"model    {json.dumps(state['model'])}")
         for s in state["speakers"]:
+            source = s["source"]
             typer.echo(
-                f"  {s['id']:18s} {s['kind']:8s} {s['label'] or '':12s} evidence={s['evidence']:<5d}"
+                f"  {s['id']:18s} {s['label'] or '':12s} {source['is'] or '?':6s} "
+                f"conditions={s['conditions']:<3d} evidence={s['evidence']:<5d}"
                 f" silent_for={s['silent_for_s']}s"
             )
         for c in state.get("candidates", []):
@@ -131,11 +134,14 @@ def ctl(action: Action, root: str = ROOT):
         typer.echo(f"counters {json.dumps(state['counters'])}")
 
 
-class Kind(enum.StrEnum):  # `undo` has its own command
+class Kind(enum.StrEnum):  # `undo` and `answer` have their own commands
     same = "same"
     different = "different"
     not_voice = "not_voice"
     name = "name"
+    person = "person"
+    device = "device"
+    text = "text"
 
 
 def _rows_between(places: Places, start: float, end: float, session: str | None) -> list[int]:
@@ -155,19 +161,21 @@ def correct(
     start: float = typer.Option(None, "--from", help="every row from this stream second..."),
     end: float = typer.Option(None, "--to", help="...to this one (of --session, default latest)"),
     session: str = typer.Option(None, help="the session --from/--to refer to"),
-    speaker: list[str] = typer.Option(None, help="every row of this speaker key (repeatable)"),
+    speaker: list[str] = typer.Option(None, help="every row of this voice (repeatable)"),
     label: str = typer.Option(None, help="for `name`: what to call this voice"),
+    text: str = typer.Option(None, help="for `text`: what was really said"),
     root: str = ROOT,
     memory: str = MEMORY,
 ):
     """Say once what was wrong. The running ear obeys at once and learns from it.
 
     \b
-      π-ear correct same 812 840               these two windows are one voice
-      π-ear correct different 812 901          these two are two voices
-      π-ear correct name --from 163 --to 288 --label vidéo
-      π-ear correct not_voice --speaker KEY    that "speaker" was never a voice
-      π-ear correct name 812 --label KπX       call this voice KπX
+      π-ear correct same 812 840                  these windows are one person
+      π-ear correct different 812 901             two people
+      π-ear correct not_voice --speaker KEY       that "voice" was never a voice
+      π-ear correct name 812 --label KπX          call this voice KπX
+      π-ear correct device --speaker KEY          that voice comes out of a loudspeaker
+      π-ear correct text --from 163 --to 170 --text "le cours de Galois"
     """
     places = _places(root, memory)
     rows = list(rows or [])
@@ -187,14 +195,17 @@ def correct(
     if speaker:
         model, _, _ = load_memory(places)
         for key in speaker:
-            if key not in model.clusters:
-                raise typer.BadParameter(f"no speaker {key} in {places.checkpoint}")
-            rows += model.clusters[key].members
+            voice = model.voices.get(key)
+            if voice is None:
+                raise typer.BadParameter(f"no voice {key} in {places.checkpoint}")
+            rows += [r for c in voice.conditions for r in model.clusters[c].members]
     if not rows:
         raise typer.BadParameter("give rows, --from/--to, or --speaker")
     if kind is Kind.name and not label:
         raise typer.BadParameter("`name` needs --label")
-    line = correction(places, kind.value, sorted(set(rows)), label, **extra)
+    if kind is Kind.text and text is None:
+        raise typer.BadParameter("`text` needs --text")
+    line = port.Inbox(places.memory).correct(kind.value, sorted(set(rows)), label, text, **extra)
     typer.echo(f"written: {json.dumps(line, ensure_ascii=False)}")
 
 
@@ -203,9 +214,35 @@ def undo(
     line: int = typer.Argument(..., help="the correction's line number (`line` in the record)"),
     memory: str = MEMORY,
 ):
-    """Forget one correction. The running ear replays its whole memory without it."""
-    written = correction(_places(memory=memory), "undo", [], line=line)
+    """Forget one correction. The running ear replays what it taught without it."""
+    written = port.Inbox(_places(memory=memory).memory).undo(line)
     typer.echo(f"written: {json.dumps(written)}")
+
+
+@app.command()
+def questions(root: str = ROOT, session: str = typer.Option(None)):
+    """What the ear is asking: names it does not know, readings it could not choose."""
+    places = _places(root)
+    open_ = port.open_questions(places.events, session)
+    if not open_:
+        typer.echo("no open question")
+    for q in open_:
+        options = "  ".join(f"[{i}] {c}" for i, c in enumerate(q.choices))
+        typer.echo(f"{q.id}  {q.about:5s} {q.doubt:14s} rows={q.rows[:6]}  {options}")
+
+
+@app.command()
+def answer(
+    question: str = typer.Argument(..., help="the question's id, as `questions` prints it"),
+    text: str = typer.Argument(None, help="the name, or what was really said"),
+    choice: int = typer.Option(None, help="or the index of one of the question's choices"),
+    memory: str = MEMORY,
+):
+    """Answer a question of the ear. The same call serves a voice through the arbiter."""
+    if text is None and choice is None:
+        raise typer.BadParameter("give the answer's text, or --choice")
+    written = port.Inbox(_places(memory=memory).memory).answer(question, text, choice)
+    typer.echo(f"written: {json.dumps(written, ensure_ascii=False)}")
 
 
 @app.command()
@@ -226,7 +263,8 @@ def why(row: int, root: str = ROOT, memory: str = MEMORY):
         )
         typer.echo(
             f"  then: {then.kind} {then.label or then.speaker or ''}  p={then.p}"
-            f"  margin={then.margin} nats  evidence={then.evidence}"
+            f"  margin={then.margin} nats  trust={then.trust}  evidence={then.evidence}"
+            f"  source={then.source} ({then.source_p})"
         )
     where = model.where.get(row)
     typer.echo(
@@ -248,7 +286,9 @@ def probe(
     start: float = typer.Option(0.0, "--from", help="stream second where the span starts"),
     end: float = typer.Option(None, "--to", help="stream second where it ends"),
     session: str = typer.Option(None, help="map seconds through this session's first chunk"),
-    asr: bool = typer.Option(False, "--asr", help="also transcribe the whole span, ungated"),
+    asr: bool = typer.Option(
+        False, "--asr", help="also read the whole span with both recognisers, ungated"
+    ),
     root: str = ROOT,
 ):
     """Look under the decisions: Silero's own probability, second by second.
@@ -259,7 +299,7 @@ def probe(
     import numpy as np
 
     from π_ear.io import load_raw
-    from π_ear.sense import Transcriber, rms_dbfs, speech_probability
+    from π_ear.sense import rms_dbfs, speech_probability
 
     places = _places(root)
     directory = Path(audio_dir) if audio_dir else contract.CORPUS
@@ -303,8 +343,13 @@ def probe(
         f"  span: speech probability mean {probs.mean():.3f}, max {probs.max():.3f},"
         f" over {len(probs)} frames of 32 ms"
     )
-    if asr and Transcriber.available(contract.MODELS):
-        typer.echo(f"  whisper (ungated): {Transcriber(contract.MODELS)(np.concatenate(audio))!r}")
+    if asr:
+        from π_ear import asr as recognisers
+
+        for name in (contract.FAST, contract.SLOW):
+            heard = recognisers.build(name, contract.MODELS)
+            if heard is not None:
+                typer.echo(f"  {name} (ungated): {heard(np.concatenate(audio)).text!r}")
 
 
 @app.command()

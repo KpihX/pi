@@ -179,11 +179,12 @@ wheels = [
 
 [[package]]
 name = "pi-ear"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "onnxruntime" },
+    { name = "scipy" },
     { name = "sherpa-onnx" },
     { name = "sherpa-onnx-core" },
     { name = "typer" },
@@ -193,13 +194,13 @@ dependencies = [
 dev = [
     { name = "pytest" },
     { name = "ruff" },
-    { name = "scipy" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "onnxruntime", specifier = ">=1.31.0" },
+    { name = "scipy", specifier = ">=1.18.1" },
     { name = "sherpa-onnx", specifier = ">=1.13.8" },
     { name = "sherpa-onnx-core", specifier = ">=1.13.8" },
     { name = "typer", specifier = ">=0.27.3" },
@@ -210,7 +211,6 @@ provides-extras = ["cpu", "xpu", "cuda"]
 dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.17.1" },
-    { name = "scipy", specifier = ">=1.18.1" },
 ]
 
 [[package]]

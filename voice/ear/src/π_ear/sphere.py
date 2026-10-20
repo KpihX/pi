@@ -53,6 +53,13 @@ def kappa_from_rho(d: int, rho: float) -> float:
     return rho * (d - rho * rho) / (1.0 - rho * rho)
 
 
+def rho_of(d: int, kappa: float) -> float:
+    """Mean resultant length A_d(kappa) = I_{d/2}(kappa) / I_{d/2-1}(kappa)."""
+    nu = d / 2.0 - 1.0
+    kappa = max(float(kappa), _TINY)
+    return math.exp(log_bessel_i(nu + 1.0, kappa) - log_bessel_i(nu, kappa))
+
+
 def rho2(sum_norm2: float, count: float, pairs: float) -> float:
     """Unbiased rho^2 from ||sum of n unit vectors||^2: E = n + n(n-1) rho^2."""
     if pairs <= 0:
@@ -112,3 +119,47 @@ def cure_rate(gaps: float, confirmed: float, ages: list[float], forgotten: float
         pi = (confirmed + float(w.sum())) / (confirmed + waiting)
         lam = confirmed / max(gaps + float((w * ages).sum()), _TINY)
     return min(pi, 1.0 - _TINY), lam
+
+
+def fit_choice(examples, dim: int, mean=None, rounds: int = 30):
+    """Bayesian conditional logit: which candidate is right, from labelled choices.
+
+    ``examples`` is a list of (features, index): a matrix with one row per
+    candidate, and the row that was right. The weights are the MAP under a
+    Gaussian prior centred on ``mean`` (the base, or zero), and the prior's
+    precision is not chosen: it is re-estimated from the data by evidence
+    maximisation (MacKay, 1992), so the weights stay where few examples leave
+    them and move where many examples push. ``rounds`` is numerical (Newton
+    steps), not a judgement. Returns (weights, posterior covariance).
+    """
+    mean = np.zeros(dim) if mean is None else np.asarray(mean, dtype=np.float64)
+    w = mean.copy()
+    precision = 1.0
+    eye = np.eye(dim)
+    hessian = eye
+    for _ in range(rounds):
+        grad = -precision * (w - mean)
+        hessian = precision * eye
+        for features, index in examples:
+            scores = features @ w
+            p = np.exp(scores - scores.max())
+            p /= p.sum()
+            expected = p @ features
+            grad += features[index] - expected
+            hessian = hessian + (features.T * p) @ features - np.outer(expected, expected)
+        w = w + np.linalg.pinv(hessian) @ grad  # pinv: a feature no example used stays put
+        covariance = np.linalg.pinv(hessian)
+        used = dim - precision * float(np.trace(covariance))
+        precision = max(used, _TINY) / max(float((w - mean) @ (w - mean)), _TINY)
+    return w, np.linalg.pinv(hessian)
+
+
+def choice_probabilities(features: np.ndarray, w: np.ndarray) -> np.ndarray:
+    scores = features @ w
+    p = np.exp(scores - scores.max())
+    return p / p.sum()
+
+
+def diagonal_gaussian(x: np.ndarray, mean: np.ndarray, var: np.ndarray) -> float:
+    """log N(x; mean, diag(var)), up to the constant shared by every class with this var."""
+    return -0.5 * float(np.sum((x - mean) ** 2 / var))
