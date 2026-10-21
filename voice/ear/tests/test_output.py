@@ -160,6 +160,28 @@ def test_the_room_is_heard_over_what_the_machine_plays(tmp_path, monkeypatch):
     # before the canceller learned, the microphone read the podcast: it says it is a copy
     early = [e for e in _texts(events, "mic") if e["text"] and e["t1"] < spans[0][0]]
     assert early and all(e["echo_of"] for e in early)
+    # second thoughts (revise.py): what the ear says last of each window is what its
+    # model says now; the first windows of a voice, said unknown, were said again
+    _said_last_is_thought_now(ear, events)
+
+
+def _said_last_is_thought_now(ear, events):
+    from π_ear.revise import now_of
+
+    last = {e["row"]: (e["kind"] in ("known", "new"), e["speaker"]) for e in events if "row" in e}
+    revisions = [e for e in events if e.get("kind") == "revision"]
+    assert revisions and {e["why"] for e in revisions} <= {"merged", "corrected", "learned"}
+    for e in revisions:
+        last[e["revises"]] = (e["now"]["kind"] == "known", e["now"]["speaker"])
+    for row, (voiced, speaker) in last.items():
+        event = ear.second.said[row]
+        now = now_of(ear.model, row, ear.store(row), ear._place(event) == ear.model.place)
+        if now is not None:
+            assert (now[0] == "known", now[1]) == (voiced, speaker if voiced else None), row
+    # the turns of every run a revision touched were written again
+    runs = {e["run"] for e in revisions if e["run"]}
+    again = {e["run"] for e in events if e.get("kind") == "turns" and e.get("revision")}
+    assert runs <= again
 
 
 def _voices(events, state, spans):

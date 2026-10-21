@@ -164,6 +164,8 @@ class Scribe:
         self.revisions: list[tuple] = []  # a heap of (priority, order, piece id)
         self.order = itertools.count()
         self.corrections: list[tuple[str, str, int]] = []
+        self.revoiced: set[int] = set()  # rows the ear said again (revise.py), to re-voice
+        self.said_of = None  # row -> its decision as the ear says it now
         self.last_partial: dict[str, str] = {}
         self.retracted: set[str] = set()
         self.done: set[str] = set()  # runs settled to their end: a late `hear` is ignored
@@ -239,6 +241,36 @@ class Scribe:
             self.lock.notify_all()
         return None
 
+    def revoice(self, rows: set[int], said_of) -> None:
+        """The ear said these windows again (revise.py): the pieces they are in may now
+        belong to another voice, and their texts are decided again under it."""
+        with self.lock:
+            self.said_of = said_of
+            self.revoiced |= rows
+            self.lock.notify_all()
+
+    def _revoice(self, rows: set[int]) -> None:
+        with self.lock:
+            keys = list(dict.fromkeys(k for r in sorted(rows) for k in self.of_row.get(r, [])))
+            pieces = [self.pieces[k] for k in keys if k in self.pieces]
+        for piece in pieces:
+            decisions = [d for d in map(self.said_of, piece.rows) if d is not None]
+            share: Counter = Counter()
+            for d in decisions:
+                if d["kind"] in VOICED and d["speaker"]:
+                    share[d["speaker"]] += min(piece.t1, d["t1"]) - max(piece.t0, d["t0"])
+            mass = sum(share.values())
+            voices = {k: round(v / mass, 3) for k, v in share.most_common()} if mass else {}
+            voice = share.most_common(1)[0][0] if share else None
+            if voice == piece.voice and voices == piece.voices:
+                continue
+            piece.voice, piece.voices = voice, voices
+            piece.known = piece.known or any(
+                d["kind"] == "known" and d["speaker"] == voice for d in decisions
+            )
+            if piece.decision:  # read already: decided again, under its voice now
+                self._decide(piece)
+
     def answered(self, voice: str | None) -> None:
         with self.lock:
             self.open_questions.pop(voice, None)
@@ -251,7 +283,14 @@ class Scribe:
                 state.finished = True
                 self.dirty.add(state.id)
             self.lock.notify_all()
-            while self.dirty or self.partials or self.revisions or self.corrections or self.busy:
+            while (
+                self.dirty
+                or self.partials
+                or self.revisions
+                or self.corrections
+                or self.revoiced
+                or self.busy
+            ):
                 self.lock.wait()
 
     def pending(self) -> int:
@@ -286,6 +325,9 @@ class Scribe:
                     job = ("settle", run)
                 elif self.corrections and not self.person_speaking:
                     job = ("correction", self.corrections.pop(0))
+                elif self.revoiced and not self.person_speaking:
+                    job = ("revoice", self.revoiced)
+                    self.revoiced = set()
                 elif self.partials and not (revise and self.alternate):
                     job = ("partial", self.partials.pop())
                     self.alternate = True

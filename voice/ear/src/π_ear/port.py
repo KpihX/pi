@@ -14,7 +14,9 @@ Two directions, both files, both append-only:
     Turns       one run, who spoke when, to the half window
     Partial     the text of a piece still being said (provisional)
     Text        a piece's reading, revised as evidence lands: words, trust, doubt
-    Question    what the ear wants to know: a name, or which reading was said
+    Revision    a window decided again: who the ear says it was now, and why
+    Question    what the ear wants to know: a name, which reading was said, or
+                whether two voices are one
     Correction  one case told to the ear, as it applied it (or why it refused)
 
 Port 3 (2026-10-20, after the first live test): the unit of text is a *piece* of a
@@ -33,6 +35,15 @@ here), remote (a person reached through a device), media (a recording), self (π
 microphone text that repeats what the machine's channel wrote is ``echo_of`` it. No
 field of port 3 changed meaning.
 
+Port 5 (2026-10-21, second thoughts, ``revise.py``): a decision once written can be
+said again. A ``Revision`` names the window (``revises``, its row), what it was said to
+be, what it is now, and why (merged | corrected | learned); a run's ``Turns`` are
+written again with ``revision`` counting how many times (0 at first); its pieces'
+``Text`` are revised under their voice now. A ``Question`` may be about ``same``: are
+these two ``speakers`` one voice, with the model's ``p`` and the ``value`` of an answer
+(the decisions it is expected to change); its answer is ``same`` or ``different``. A
+consumer keeps the latest of each: no field of port 4 changed meaning.
+
 Changing a field's meaning is a new PORT number, never an edit of this one.
 """
 
@@ -45,7 +56,7 @@ from pathlib import Path
 
 from π_ear.io import read_jsonl
 
-PORT = 4
+PORT = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +107,20 @@ class Turns:
     t1: float
     segments: list  # [t0, t1, voice | "unknown" | "noise"]
     channel: str | None
+    revision: int | None  # 0, then once more each time a window of it is revised
+
+
+@dataclass(frozen=True, slots=True)
+class Revision:
+    session: str
+    revises: int  # the row of the window decided again
+    run: str | None  # the run it is in, when closed
+    channel: str | None
+    t0: float
+    t1: float
+    was: dict  # {"kind", "speaker"} as it was said
+    now: dict  # {"kind", "speaker", "label", "scene"} as it is said now
+    why: str  # merged | corrected | learned
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,13 +164,16 @@ class Text:
 class Question:
     session: str
     id: str
-    about: str  # name | text
+    about: str  # name | text | same
     piece: str | None  # the piece it is about (text questions)
     rows: list[int]
     speaker: str | None
     choices: list[str]
     doubt: str
     words: list[str] | None = None  # the words it is unsure of, when it is unsure of words
+    speakers: list[str] | None = None  # same: the two voices it asks about
+    p: float | None = None  # same: the model's P(one voice)
+    value: float | None = None  # same: the decisions an answer is expected to change
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +194,7 @@ KINDS = {
     "partial": Partial,
     "text": Text,
     "question": Question,
+    "revision": Revision,
     "correction": Correction,
 }
 CORRECTIONS = (

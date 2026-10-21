@@ -943,3 +943,58 @@ every microphone text from before the canceller converged is now marked.
 not by "not a loudspeaker": a colleague in a call is asked about, a video is not. A tie (the
 video that never pauses) is a coin, off ½ only by the one pseudo-window of the prior: whether
 to ask then is a matter of the value of the answer, step 3.
+
+### Step 3: second thoughts (`revise.py`)
+
+**Why.** KπX: a human "lives in the present, has a first idea, then a second, and adjusts
+with time". The ear's model of who already changes its mind on its own (two clusters fuse
+when one voice explains them better, a candidate becomes a speaker, a correction moves
+windows), but what it had written stayed written: the first window of every voice said
+`unknown` forever, though a second later the model knew whose it was.
+
+**What it is.** Every window the session published is kept with what was said of it. At
+each silence (a run closes), after a correction, after an undo, the ear asks its model again,
+for each, what it would say now:
+
+* a learned window: where the model has put it now (its cluster's voice);
+* a window never learned from (a shadow, a glimpse, a forgotten candidate): its best
+  explanation under the model as it is, scored **without learning**. Only the clusters that
+  changed since the last time (and "a new voice") are scored again against the one it was
+  given: the others are where they were. Measured on a synthetic stream of six voices, half
+  of the windows unlearned: 3000 windows thought over in about 60 ms, linear in the windows;
+  a two-hour session (some 7200) in a fraction of a second per silence;
+* a window heard in another place than the model is in (the machine's channel while the room
+  speaks) is not scored again: a new voice's prior is centred on the place, and changing
+  place resets what the place knows.
+
+Where the answer changed, a `revision` is published (port 5), with why: `merged` (its voice
+is now part of another), `corrected` (a correction named it), `learned` (more evidence). The
+run's turns are written again (`revision` counts), the pieces it is in are given their voice
+now and their texts decided again under it (that voice's language, its vocabulary), and the
+scene follows the fusions (one voice, one body of evidence). A revision tells the model
+nothing: it is the model's own state, read back, so it cannot feed itself. The invariant,
+tested end to end on the podcast scene: **what the ear says last of every window is what its
+model says now.**
+
+**The question worth asking.** "Are these two voices one?" is worth KπX's attention only if
+the answer is expected to change something. If B (n windows) were said to be A, all of B's
+windows would change hands; the model's own P that B's main condition belongs to A, against
+staying where it is, makes the expected change min(P, 1 - P) n. It is asked when that is at
+least one window's worth (the less likely answer at least 1/n probable), the most valuable
+pair first, one question open at a time, never while a person speaks, never twice for a pair
+(the pairs asked are kept with the memory). The answer is `same` or `different`, which is the
+correction it asked for; anything else is refused, visibly.
+
+**What it measured about itself, honestly.** On voices drawn with CAM++'s measured
+geometry, the model is almost never in that doubt: between "one voice" and "two", its link
+evidence jumps from a fusion (the clusters merge) to tens of nats apart (27 nats with two
+windows of the second voice, 60 with three, `tests/test_revise.py`). So it asks nothing there,
+and should not. Where it will ask is where its evidence really is thin: a voice of few windows
+heard through two very different channels. Whether its nats are as sure as they say (the per
+window margins are calibrated by corrections, Q1; the voice links are not yet) is the open
+question: each answer to a `same` question is exactly the label that would calibrate them.
+
+**Not yet.** A piece whose voice changed is decided again from its readings; it is not
+re-read by the recognisers in its voice's language (its audio is gone once read by both):
+re-reading from the corpus is step 5's. The windows of earlier sessions are not thought over
+again (their record is closed; their voices are, through the model).

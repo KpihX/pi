@@ -59,6 +59,7 @@ from π_ear.io import (
 )
 from π_ear.model import Model, Weights
 from π_ear.port import PORT
+from π_ear.revise import Second, resolve
 from π_ear.scene import KINDS as SCENES
 from π_ear.scene import Scene
 from π_ear.scribe import Scribe, rebuild_reader
@@ -214,6 +215,11 @@ class Ear:
         self.source = self._rebuild_source()
         self.scene = Scene()
         self.scene.load(saved.get("scene", {}))
+        # second thoughts (revise.py): what this session said, again when the model knows better
+        self.second = Second(asked={frozenset(p) for p in saved.get("asked_same", [])})
+        self.closed: dict[str, dict] = {}  # this session's closed runs: their turns, revisable
+        self.run_of: dict[int, str] = {}  # row -> the closed run it is in
+        self.settled = True  # nothing to think again about
         self.reader = Reader(self.model.base.reader)
         if "reader" in saved:
             self.reader.load(saved["reader"])
@@ -258,6 +264,7 @@ class Ear:
                 "model": self.model.to_dict(),
                 "reader": self.reader.to_dict(),
                 "scene": self.scene.to_dict(),
+                "asked_same": [sorted(p) for p in self.second.asked],
             },
         )
 
@@ -361,6 +368,8 @@ class Ear:
             else:
                 break
             worked = True
+        if not self.settled:
+            self.reconsider()
         if self.scribe:
             speaking = any(c.sensor.speaking() for c in self.channels.values())
             self.scribe.set_speaking(speaking, self._person_speaking())
@@ -428,6 +437,7 @@ class Ear:
         for channel in self.channels.values():
             self._handle(channel, *channel.sensor.flush())
         self.scene.settle(max(self.scene.seconds, default=0) + 1)  # nothing more will come
+        self.reconsider()
         if self.scribe:
             self.scribe.drain()
         self.persist()
@@ -473,8 +483,7 @@ class Ear:
         follows = run["last"] if learn else None
         start = channel.sensor.offset + piece.start
         t = round(self.origin + start / contract.RATE, 3)  # when it was said
-        # what the machine plays is heard in a place of its own: its channel is not the room's
-        place = self.session if channel.name == MIC else f"{self.session}#{MACHINE}"
+        place = self._place({"channel": channel.name})
         decision = self.model.observe(row, x, t, learn, follows, place)
         append_jsonl(
             self.places.observations,
@@ -546,6 +555,7 @@ class Ear:
             "scene_p": None if scene is None else round(max(scene.values()), 4),
         }
         run["decisions"].append(event)
+        self.second.keep(row, event)
         self._write(event)
         self.now = event
         self._ask_name(event)
@@ -591,8 +601,15 @@ class Ear:
         if not info or not info["rows"]:
             return
         decisions = info["decisions"]
-        self._turns(channel, run, decisions)
         identifier = self.run_id(run.start, channel)
+        t0 = self.stream_s(run.start, channel)
+        t1 = self.stream_s(run.start + len(run.samples), channel)
+        self.closed[identifier] = {"channel": channel.name, "t0": t0, "t1": t1, "rev": 0}
+        self.closed[identifier]["decisions"] = decisions
+        for d in decisions:
+            self.run_of[d["row"]] = identifier
+        self._turns(identifier)
+        self.settled = False  # a silence: the time for second thoughts
         if all(d["kind"] == "noise" for d in decisions):
             self._bump("runs_of_sounds")
             if self.scribe:
@@ -603,12 +620,13 @@ class Ear:
         self._bump("runs_transcribed")
         self.scribe.finish(identifier, self.stream_s(run.start, channel), run.samples, decisions)
 
-    def _turns(self, channel: Channel, run, decisions: list[dict]) -> None:
+    def _turns(self, identifier: str) -> None:
         """Who spoke when, to the half window (Q4): each half window takes the voice of
-        the more confident of the two windows (learned and shadow) that cover it."""
+        the more confident of the two windows (learned and shadow) that cover it. Again
+        when a window of the run is revised (``revision``: how many times)."""
+        closed = self.closed[identifier]
+        t0, t1, decisions = closed["t0"], closed["t1"], closed["decisions"]
         half = contract.ENCODER_WINDOW_S / 2
-        t0 = self.stream_s(run.start, channel)
-        t1 = self.stream_s(run.start + len(run.samples), channel)
         slots = []
         start = t0
         while start < t1:
@@ -625,11 +643,93 @@ class Ear:
         self._write(
             {
                 "kind": "turns",
-                "run": self.run_id(run.start, channel),
-                "channel": channel.name,
+                "run": identifier,
+                "channel": closed["channel"],
                 "t0": t0,
                 "t1": t1,
                 "segments": slots,
+                "revision": closed["rev"],
+            }
+        )
+
+    # -- second thoughts (revise.py) -----------------------------------------------------
+    def _place(self, event: dict) -> str:
+        """What the machine plays is heard in a place of its own: its channel is not the room's."""
+        return self.session if event["channel"] == MIC else f"{self.session}#{MACHINE}"
+
+    def reconsider(self) -> int:
+        """At a silence: every window this session published, decided again by the model
+        as it is now; what changed is published as a revision, its run's turns again,
+        its pieces' texts again (the scribe). Then the question most worth asking.
+        Returns how many windows changed hands."""
+        self.settled = True
+        changes = self.second.check(
+            self.model, self.store, lambda e: self._place(e) == self.model.place
+        )
+        runs: set[str] = set()
+        for row, was, now in changes:
+            event = self.second.said[row]
+            voice = self.model.voices.get(now["speaker"]) if now["speaker"] else None
+            scene = self.scene_of(now["speaker"]) if now["speaker"] else None
+            event.update(
+                kind=now["kind"],
+                speaker=now["speaker"],
+                label=voice.label if voice else None,
+                scene=None if scene is None else max(scene, key=scene.get),
+                scene_p=None if scene is None else round(max(scene.values()), 4),
+            )
+            self._bump("revisions")
+            self._write(
+                {
+                    "kind": "revision",
+                    "revises": row,  # the window's row (not "row": a decision has that)
+                    "run": self.run_of.get(row),
+                    "channel": event["channel"],
+                    "t0": event["t0"],
+                    "t1": event["t1"],
+                    "was": was,
+                    "now": {k: event[k] for k in ("kind", "speaker", "label", "scene")},
+                    "why": now["why"],
+                }
+            )
+            if row in self.run_of:
+                runs.add(self.run_of[row])
+        # the scene follows the model's fusions: one voice, one body of evidence
+        for key in list(self.scene.voices):
+            into = resolve(key, self.model.absorbed)
+            if into != key and into in self.model.voices:
+                self.scene.absorb(key, into)
+        for identifier in sorted(runs):
+            self.closed[identifier]["rev"] += 1
+            self._turns(identifier)
+        if changes and self.scribe:
+            self.scribe.revoice({row for row, _, _ in changes}, self.second.said.get)
+        self._ask_same()
+        return len(changes)
+
+    def _ask_same(self) -> None:
+        """Ask whether two voices are one, when an answer is expected to change at least
+        one decision (revise.py): one question open at a time, never over a person."""
+        if self.second.open is not None or self._person_speaking():
+            return
+        best = self.second.same_question(self.model, self.person_of)
+        if best is None:
+            return
+        a, b = best["speakers"]
+        self.second.asked.add(frozenset((a, b)))
+        self.second.open = f"{a}={b}#same#{self.session}"
+        self._write(
+            {
+                "kind": "question",
+                "id": self.second.open,
+                "about": "same",
+                "speaker": b,
+                "speakers": [a, b],
+                "rows": best["rows"],
+                "choices": ["same", "different"],
+                "doubt": "same_voice",
+                "p": round(best["p"], 4),
+                "value": round(best["value"], 2),
             }
         )
 
@@ -774,6 +874,8 @@ class Ear:
                 if refused is None:
                     self.applied.append([number, len(self.store), "text"])
             elif kind in WHO:
+                self.second.corrected |= set(rows)
+                self.settled = False  # what the correction moved is said again
                 spectral = SOURCE_OF_SCENE.get(kind, kind)
                 if spectral in ("person", "device"):
                     shape = self.shape_of(rows)
@@ -826,6 +928,15 @@ class Ear:
         )
         if asked is None:
             return "answer", [], line, f"no question {question!r} in this record"
+        if asked["about"] == "same":
+            said = line.get("text")
+            if said is None and line.get("choice") is not None:
+                said = asked["choices"][int(line["choice"])]
+            if said not in ("same", "different"):
+                return "answer", [], line, "an answer to a same question is same or different"
+            if self.second.open == question:
+                self.second.open = None
+            return said, asked["rows"], line, None
         if asked["about"] == "name":
             name = (line.get("label") or line.get("text") or "").strip()
             if not name:
@@ -864,6 +975,7 @@ class Ear:
             self.model = replayed
             self.source = self._rebuild_source()
             self._rebuild_scene_told()
+            self.settled = False  # what it had moved is said again, as the rest now says
         self.applied = kept
         return None
 

@@ -145,6 +145,26 @@ class Scene:
                 self.talk[voice][1] += 1 if others else 0
         self.settled = before
 
+    def absorb(self, old: str, new: str) -> None:
+        """The model found ``old`` and ``new`` to be one voice: its evidence is the other's."""
+        if old == new or old not in self.voices:
+            return
+        was, into = self.voices.pop(old), self.voices[new]
+        for k in ("machine", "mic", "mouth"):
+            into[k] += was[k]
+        into["apps"] += was["apps"]
+        if old in self.talk:
+            gone = self.talk.pop(old)
+            self.talk[new] = [a + b for a, b in zip(self.talk[new], gone, strict=True)]
+        if old in self.told:
+            self.told.setdefault(new, self.told.pop(old))
+        self.device.pop(old, None)  # the spectrum of the union is the ear's to say again
+        for slot in self.seconds.values():
+            for spoke in slot.values():
+                if old in spoke:
+                    spoke.discard(old)
+                    spoke.add(new)
+
     def tell(self, voice: str, kind: str) -> None:
         """A correction: ``voice`` is ``kind``; its applications learn what they play."""
         self.told[voice] = kind

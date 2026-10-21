@@ -122,13 +122,27 @@ through, and correction episodes (a correction trusted the first time).
 {"port":3,"kind":"correction","what":"text","answers":"…:80.6#2#text","line":7,"refused":null}
 ```
 
+Since port 4 every decision, turn and text also says its `channel` (`mic`, `machine`) and its
+`scene` (`room`, `remote`, `media`, `self`); since port 5 a window can be said again
+(`revision`), and the ear may ask whether two voices are one:
+
+```json
+{"port":5,"kind":"revision","revises":17,"run":"…:16.4","was":{"kind":"unknown","speaker":null},
+ "now":{"kind":"known","speaker":"05d9…","label":null,"scene":"room"},"why":"learned"}
+{"port":5,"kind":"turns","run":"…:16.4","segments":[…],"revision":1}
+{"port":5,"kind":"question","id":"1abe…=77d2…#same#…","about":"same","speakers":["1abe…","77d2…"],
+ "rows":[40,61],"choices":["same","different"],"p":0.31,"value":4.3}
+```
+
+The examples above the `port` 5 lines are of port 3: their fields have kept their meaning.
+
 A consumer (the arbiter, the mouth) reads `port.read()` / `port.follow()` and gets typed events;
 it never reads the internals. It speaks back through **`port.Inbox`**, the same three calls a
 terminal uses:
 
 ```python
 inbox = port.Inbox(memory)
-# what: text, same, different, not_voice, name, person or device
+# what: text, same, different, not_voice, name, person, device, room, remote, media, self
 inbox.correct("text", rows, text="send the notes to KπX")
 inbox.answer(question_id, text="Alice")  # a name, or what was said
 inbox.answer(question_id, choice=1)  # or one of the question's choices
