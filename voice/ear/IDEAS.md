@@ -774,3 +774,17 @@ detectors, a voice is told that language (the goal replayed from nothing: Englis
 until another voice or a longer detection says otherwise; a memory keeps its room's
 languages from one session to the next.
 
+
+**Correction 2026-10-21 (KπX): a misreading of the live test, corrected here, append-only.** The
+lines above say the match was "a football broadcast (a laptop microphone, the television across
+the room)" and speak of "a television heard by a laptop". That is wrong. KπX watched the match
+in the browser of this very laptop: the "television" was **the machine's own sound**, played by
+its own speakers and picked up by its own microphone. Two consequences the analysis above missed:
+
+- what the machine plays is not an unknown source to be guessed through the microphone: it is a
+  signal the machine already has, exactly, before it reaches the air (the output's monitor);
+- the acoustic path is the laptop's speakers to the laptop's microphone, the standard case of
+  echo cancellation, not a television across a living room.
+
+Every "device" voice of that session was the machine itself. Nothing measured above changes;
+what it means does (see the proposals that follow this correction).

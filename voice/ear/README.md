@@ -206,6 +206,10 @@ neither reference is the truth. v2.0 is what the ear wrote live.
 | 17 min without a cut | whistle, ads, studio, interview | | .784 / .613, slow pass 0.74 s per s, never behind |
 | almost silence, 3 min | -50 dBFS | | 4 pieces, 80 % of the words written heard by another system |
 
+Correction 2026-10-21 (KπX), append-only: "TV" in this table is a misreading. The match played
+in the browser of this laptop, through its own speakers: the machine's own sound, not a television
+across the room (`IDEAS.md`, end of section v2.1).
+
 Who on the same record: every television voice `device`, KπX `person`; questions only about
 people already known (KπX's name, KπX's doubtful words), 0 to 4 per segment; 0 scribe errors.
 Limits, measured: KπX over the television stays near the recognisers' own oracle (.38: what
