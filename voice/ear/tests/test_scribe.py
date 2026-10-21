@@ -156,9 +156,31 @@ def test_an_answer_undone_is_forgotten(tmp_path, voice, monkeypatch):
     assert not said(_texts(events3)[-1]["text"], "call KπX now")
 
 
+def test_an_answer_that_says_nothing_is_refused_not_guessed(tmp_path, voice, monkeypatch):
+    """An answer with neither a text nor a choice (a mouth that heard nothing back) is
+    refused, and the question stays open; "" is an answer: nothing was said."""
+    _plug(
+        monkeypatch,
+        Says("send the notes to pi x before noon", "fast"),
+        Says("send the notes to pie ex before noon", "slow"),
+    )
+    memory = tmp_path / "memory"
+    ear, events = _day(tmp_path, "day1", voice, memory)
+    asked = next(e for e in events if e.get("kind") == "question" and e["about"] == "text")
+    port.Inbox(memory).answer(asked["id"])
+    ear.run(drain=True)
+    applied = [e for e in read_jsonl(ear.places.events)[0] if e.get("kind") == "correction"]
+    assert applied[-1]["refused"] == "an answer gives a text or a choice"
+    assert [q.id for q in port.open_questions(ear.places.events)] == [asked["id"]]
+    port.Inbox(memory).answer(asked["id"], text="")
+    ear.run(drain=True)
+    applied = [e for e in read_jsonl(ear.places.events)[0] if e.get("kind") == "correction"]
+    assert applied[-1]["refused"] is None and not port.open_questions(ear.places.events)
+
+
 def test_a_text_said_sessions_ago_can_still_be_corrected(tmp_path, voice, monkeypatch):
-    """The scribe keeps every reading in ``runs.jsonl``: a correction aimed at a
-    run of an earlier session finds it there."""
+    """The scribe keeps every reading in ``pieces.jsonl``: a correction aimed at a
+    piece of an earlier session finds it there."""
     _plug(monkeypatch, Says("meet me at the gare de lyon", "fast"))
     memory = tmp_path / "memory"
     _, events = _day(tmp_path, "day1", voice, memory)
@@ -267,6 +289,61 @@ def test_a_long_run_is_cut_under_the_window_and_where_the_voice_changes(tmp_path
     assert {e["speaker"] for e in texts.values()} == {"a", "b"}
     # read slowly together, as much as the window holds, never more
     assert all(n < 12.0 for n, _ in slow.calls) and len(slow.calls) <= len(texts)
+
+
+@pytest.mark.parametrize("trust, cut", [(0.0, False), (None, True), (0.9, True)])
+def test_a_voice_change_is_a_cut_only_if_more_probably_real(tmp_path, voice, trust, cut):
+    """The cut between two voices is gated on the model of who's calibrated trust; a
+    trust of 0 is a trust (a first build read ``trust or 1`` as sure); a window the
+    model could not calibrate (None) keeps its argmax."""
+    fast, slow = Timed("fast"), Timed("slow", window_s=12.0)
+    scribe, written = _scribe(tmp_path, fast, slow)
+    decisions = [{**d, "trust": trust} for d in _decisions(8, ["a", "b"])]
+    scribe.finish("r", 0.0, voice[: 8 * contract.RATE], decisions)
+    scribe.drain()
+    pieces = {e["piece"] for e in written if e.get("kind") == "text"}
+    assert (len(pieces) > 1) == cut, pieces
+
+
+def test_a_piece_lets_go_of_its_audio_once_read_by_both(tmp_path, voice):
+    """Every piece kept its samples for the whole session (460 MB on two hours)."""
+    fast, slow = Timed("fast"), Timed("slow", window_s=12.0)
+    scribe, _ = _scribe(tmp_path, fast, slow)
+    scribe.finish("r", 0.0, voice[: 8 * contract.RATE], _decisions(8, ["a", "b"]))
+    scribe.drain()
+    assert scribe.pieces and all(p.samples is None for p in scribe.pieces.values())
+    alone, _ = _scribe(tmp_path / "alone", Timed("fast"), None)
+    alone.finish("r", 0.0, voice[: 4 * contract.RATE], _decisions(4, ["a"]))
+    alone.drain()
+    assert alone.pieces and all(p.samples is None for p in alone.pieces.values())
+
+
+@pytest.mark.parametrize("kind, asked", [("known", True), ("new", False)])
+def test_a_voice_born_in_the_piece_is_not_asked_about(tmp_path, voice, kind, asked):
+    fast, slow = Says("send the notes to pi x", "fast"), Says("send the notes to pie ex", "slow")
+    scribe, written = _scribe(tmp_path, fast, slow, source=lambda v: ("person", 1.0))
+    decisions = [{**d, "kind": kind} for d in _decisions(4, ["kpihx"])]
+    scribe.finish("r", 0.0, voice[: 4 * contract.RATE], decisions)
+    scribe.drain()
+    assert bool([e for e in written if e.get("kind") == "question"]) == asked
+
+
+def test_a_refit_that_fails_is_an_error_written_not_a_loop(tmp_path, voice):
+    """A first build of the language model raised in its refit; the reader stayed
+    dirty, the scribe refitted again at once, forever, and ``drain`` never returned."""
+    fast, slow = Timed("fast"), Timed("slow", window_s=8.0)
+    scribe, written = _scribe(tmp_path, fast, slow)
+
+    def broken():
+        raise ValueError("a refit that fails")
+
+    scribe.reader.refit = broken
+    scribe.reader.dirty = True
+    scribe.finish("r", 0.0, voice[: 3 * contract.RATE], _decisions(3, ["a"]))
+    scribe.drain()
+    errors = [e for e in written if e.get("kind") == "error"]
+    assert len(errors) == 1 and errors[0]["job"] == "refit"
+    assert [e for e in written if e.get("kind") == "text"]
 
 
 def test_short_pieces_are_read_slowly_together(tmp_path, voice):

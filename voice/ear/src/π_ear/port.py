@@ -14,12 +14,14 @@ Two directions, both files, both append-only:
     Turns       one run, who spoke when, to the half window
     Partial     the text of a piece still being said (provisional)
     Text        a piece's reading, revised as evidence lands: words, trust, doubt
+    Question    what the ear wants to know: a name, or which reading was said
+    Correction  one case told to the ear, as it applied it (or why it refused)
 
 Port 3 (2026-10-20, after the first live test): the unit of text is a *piece* of a
 speech run (cut at Silero's dips, shorter than the slow recogniser's window), named
 ``piece``; ``run`` is the run it is cut from. In port 2 ``run`` named the whole run.
-    Question    what the ear wants to know: a name, or which reading was said
-    Correction  one case told to the ear, as it applied it (or why it refused)
+A scribe job that fails is written as ``"kind": "error"``, outside the port (a
+consumer never needs it; ``ctl status`` counts them).
 
 Changing a field's meaning is a new PORT number, never an edit of this one.
 """

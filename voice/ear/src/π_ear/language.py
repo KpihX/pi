@@ -6,22 +6,29 @@ the runs of a French broadcast, and on most of KπX's own short phrases; Parakee
 cannot be told a language, answered in English on studio talk (2 % of the words on 4 s
 pieces, 19 % on 8 s, 77 % on 32 s). A language is a property of a voice, not of one run.
 
-Three things are learned here, nothing is set:
+What is learned here, nothing set:
 
-* per voice, a Dirichlet over languages: what its slow readings were *detected* in (a
-  reading the recogniser was told the language of proves nothing), each weighted by the
-  probability that a detection that long is right; its prior is the room (one
-  pseudo-reading), itself a
-  Dirichlet over every voice with one pseudo-reading spread over the known languages;
-* how often Whisper's detection is right, as a function of the run's length (short
-  runs fool it): a Bayesian logit on the runs it detected alone, against the language
-  their voice turned out to speak;
-* what words each language is written with (the slow recogniser's words, by the
+* **how often a detection is right**, by the length it heard: a Bayesian logit on the
+  public base (clean speech, right 99 % of the time even at 2 s), then on the stream,
+  each detection judged against the language its voice turned out to speak *without
+  it*; and per voice, how much worse or better than that its own detections are (on
+  KπX's voice in a room over a television, one in three was right where the base says
+  six in seven: the regime is the voice's, not the length's alone);
+* **what a voice speaks**: its detections, each counted by the probability that it is
+  right, over a prior that is the room. A voice speaks like the room as strongly as the
+  voices of this room do: the strength of that prior (a Dirichlet concentration) is
+  estimated on every voice at once (empirical Bayes, under a log-logistic prior of
+  scale one pseudo-reading), never set. A room of French television makes a new voice
+  French before it says anything; a guest speaking English moves it with every
+  reliable reading;
+* **the room**: every voice's counted detections, with one pseudo-reading spread over
+  the languages this ear can write and one more for a language it never wrote;
+* **what words each language is written with** (the slow recogniser's words, by the
   language it wrote them in), to say in which language a reading *is*: a Parakeet
   reading in English for a French voice is a translation, and the reader is told.
 
-The decision has no threshold: the voice's language is given to the recogniser when
-it is more probable than the detection being right at this length.
+The decision has no threshold: the voice's language is given to the recogniser when it
+is more probable than this voice's detection being right at this length.
 
 The law: no numeric literal but 0 and 1 in this module (``tests/test_law.py``).
 """
@@ -32,10 +39,11 @@ import math
 from collections import Counter, defaultdict
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 
 from π_ear.contract import TEXT_GRAM
 from π_ear.lexicon import tokens
-from π_ear.sphere import choice_probabilities, fit_choice
+from π_ear.sphere import fit_logit
 
 OTHER = "?"  # a language this ear has never written
 
@@ -49,29 +57,38 @@ def trigrams(text: str) -> list[str]:
     return out
 
 
+def _logit(p: float) -> float:
+    tiny = np.finfo(float).eps
+    p = min(max(p, tiny), 1 - tiny)
+    return math.log(p) - math.log1p(-p)
+
+
+def _sigmoid(z: float) -> float:
+    return float(np.exp(-np.logaddexp(0, -z)))
+
+
 class Languages:
     def __init__(self):
-        self.voices: dict[str, Counter] = defaultdict(Counter)
         self.words: dict[str, Counter] = defaultdict(Counter)
+        self.known: dict[str, Counter] = defaultdict(Counter)  # languages known spoken
         self.detections: list[tuple[str, str, float]] = []  # (voice, detected, seconds)
         self.base: list[tuple[float, float]] = []  # (seconds, right): the public measurement
-        self.weights: np.ndarray | None = None
+        self.weights: np.ndarray | None = None  # reliability by length (log-odds)
+        self.offsets: dict[str, float] = {}  # per voice, log-odds against that
+        self.counts: dict[str, Counter] = defaultdict(Counter)  # detections, by reliability
+        self.counted: list[float] = []  # what each detection was counted with
+        self.concentration = 1.0  # how strongly a voice speaks like the room, estimated
+        self._room: tuple | None = None
+        self._version = 0  # bumped whenever a count changes
         self.dirty = False
         self._cache: dict[str, tuple[int, Counter]] = {}
 
     # -- learning -----------------------------------------------------------------------
     def heard(
-        self,
-        voice: str | None,
-        language: str | None,
-        text: str,
-        weight: float,
-        detected: bool,
-        seconds: float,
+        self, voice: str | None, language: str | None, text: str, detected: bool, seconds: float
     ) -> None:
         """A slow reading: ``language`` is what the slow recogniser wrote it in,
-        ``detected`` whether it chose that language itself, ``weight`` how much it counts
-        (the probability that a detection this long is right).
+        ``detected`` whether it chose that language itself.
 
         Only a detection is evidence of what a voice speaks. A reading the recogniser
         was *told* to write in a language is in that language by construction: counting
@@ -82,8 +99,12 @@ class Languages:
             return
         self.words[language].update(tokens(text))
         if voice is not None and detected:
-            self.voices[voice][language] += weight
+            right = self.detection_right(seconds, voice)
+            weight = 1 if right is None else right
             self.detections.append((voice, language, seconds))
+            self.counted.append(weight)
+            self.counts[voice][language] += weight
+            self._version += 1
             self.dirty = True
 
     def measured(self, seconds: float, right: bool) -> None:
@@ -92,36 +113,125 @@ class Languages:
         self.dirty = True
 
     def refit(self) -> None:
-        """The detector's reliability by length: the public measurement, then every
-        detection of the stream against the language its voice turned out to speak."""
-        examples = [
-            (np.array([[math.log(seconds), 1], [0, 0]]), 0 if right else 1)
-            for seconds, right in self.base
-        ]
+        """Reliability, counts and concentration, then each detection judged again
+        against its voice without it, until the judgements stop changing (a pass moves
+        only what the previous one moved; at most one pass per detection)."""
+        self.dirty = False  # first: a refit that fails is not retried forever
+        self.weights, self.offsets = self._reliability([]), {}
+        judged = None
+        for _ in range(len(self.detections) + 1):
+            self._recount()
+            self.concentration = self._concentration()
+            again = self._judged()
+            if again == judged:
+                break
+            judged = again
+            self.weights = self._reliability(judged)
+            self.offsets = self._offsets(judged) if self.weights is not None else {}
+
+    def _reliability(self, judged: list[tuple[str, float, bool]]) -> np.ndarray | None:
+        seen = [(seconds, right) for seconds, right in self.base]
+        seen += [(seconds, right) for _, seconds, right in judged]
+        right = np.array([float(r) for _, r in seen])
+        if not seen or right.min() == right.max():
+            return None
+        return fit_logit(np.array([_x(seconds) for seconds, _ in seen]), right)
+
+    def _recount(self) -> None:
+        self.counts, self.counted = defaultdict(Counter), []
+        self._version += 1
         for voice, detected, seconds in self.detections:
-            spoken = self.of_voice(voice)
-            if spoken is None:
+            right = self.detection_right(seconds, voice)
+            weight = 1 if right is None else right
+            self.counts[voice][detected] += weight
+            self.counted.append(weight)
+
+    def _judged(self) -> list[tuple[str, float, bool]]:
+        """Each detection against its voice's most probable language without it: with
+        it, a voice heard once was always detected right, and the short detections that
+        fool Whisper came out reliable (measured: 0.98 where it was 0.02)."""
+        out, total = [], self._total()
+        for (voice, detected, seconds), weight in zip(self.detections, self.counted, strict=True):
+            mine, rest = self._mine(voice), Counter(total)
+            mine[detected] -= weight
+            rest[detected] -= weight  # out of the room too: alone in it, a voice was its room
+            room = self._room_of(rest)
+            if room is None:  # nothing else heard yet: nothing to judge it against
                 continue
-            best = max(spoken, key=spoken.get)
-            examples.append(
-                (np.array([[math.log(seconds), 1], [0, 0]]), 0 if detected == best else 1)
-            )
-        outcomes = {y for _, y in examples}
-        self.weights = (
-            fit_choice(examples, len(examples[0][0][0]))[0] if {0, 1} <= outcomes else None
-        )
-        self.dirty = False
+            spoken = self.of_voice(voice, mine, room)
+            if spoken is not None:
+                out.append((voice, seconds, detected == max(spoken, key=spoken.get)))
+        return out
+
+    def _offsets(self, judged: list[tuple[str, float, bool]]) -> dict[str, float]:
+        """Per voice, the log-odds by which its detections are more or less often right
+        than their lengths predict: its own record, with the prediction as one more
+        detection (a voice with no record keeps the reliability of its lengths)."""
+        record: dict[str, list[tuple[float, bool]]] = defaultdict(list)
+        for voice, seconds, right in judged:
+            record[voice].append((self.detection_right(seconds), right))
+        out = {}
+        for voice, seen in record.items():
+            predicted = float(np.mean([p for p, _ in seen]))
+            observed = (sum(right for _, right in seen) + predicted) / (len(seen) + 1)
+            out[voice] = _logit(observed) - _logit(predicted)
+        return out
+
+    def _concentration(self) -> float:
+        """How strongly a voice speaks like the room: the Dirichlet concentration under
+        which every voice's counted detections are most probable (Dirichlet-multinomial),
+        with a log-logistic prior of scale one pseudo-reading (the scale the room's own
+        prior has). Voices that all speak the room's language make it large, a room of
+        many languages small."""
+        room = self.room()
+        voices = [self._mine(v) for v in set(self.counts) | set(self.known)]
+        voices = [c for c in voices if sum(c.values())]
+        if room is None or not voices:
+            return self.concentration
+
+        def minus_log_posterior(t: float) -> float:
+            a = math.exp(t)
+            out = t - (1 + 1) * math.log1p(a)  # the standard logistic, on log a
+            for counts in voices:
+                out += math.lgamma(a) - math.lgamma(a + sum(counts.values()))
+                for language, n in counts.items():
+                    share = a * room.get(language, room[OTHER])
+                    out += math.lgamma(n + share) - math.lgamma(share)
+            return -out
+
+        return math.exp(minimize_scalar(minus_log_posterior).x)
 
     # -- using --------------------------------------------------------------------------
+    def _mine(self, voice: str | None) -> Counter:
+        mine = Counter(self.counts.get(voice or "", Counter()))
+        mine.update(self.known.get(voice or "", Counter()))
+        return mine
+
     def room(self) -> dict[str, float] | None:
         """P(a reading of a voice never heard is in each language, or in another one
-        (``OTHER``)): a Dirichlet over what every voice was detected speaking, its prior
-        one pseudo-reading spread over the languages this ear can write and one more for
-        a language it cannot yet. One English detection made the first build 100 % sure
-        the room spoke English (measured live); it is not, now, and it learns."""
+        (``OTHER``)): every voice's counted detections, with one pseudo-reading spread
+        over the languages this ear can write and one more for a language it cannot yet.
+        One English detection made the first build 100 % sure the room spoke English
+        (measured live); it is not, now, and it learns."""
+        key = (
+            self._version,
+            tuple(sorted(self.words)),
+            sum(map(sum, map(Counter.values, self.known.values()))),
+        )
+        if self._room is not None and self._room[0] == key:
+            return self._room[1]
+        room = self._room_of(self._total())
+        self._room = (key, room)
+        return room
+
+    def _total(self) -> Counter:
         total = Counter()
-        for counts in self.voices.values():
+        for counts in (*self.counts.values(), *self.known.values()):
             total.update(counts)
+        return total
+
+    def _room_of(self, total: Counter) -> dict[str, float] | None:
+        total = Counter({k: max(n, 0) for k, n in total.items() if max(n, 0)})  # no residue
         if not total:
             return None
         known = (set(self.words) | set(total)) - {OTHER}
@@ -131,27 +241,32 @@ class Languages:
         room[OTHER] = share / mass
         return room
 
-    def of_voice(self, voice: str | None) -> dict[str, float] | None:
-        """P(the next reading of this voice is in each language): Dirichlet predictive,
-        the room as its prior (one pseudo-reading)."""
-        room = self.room()
+    def of_voice(
+        self, voice: str | None, mine: Counter | None = None, room: dict | None = None
+    ) -> dict[str, float] | None:
+        """P(the next reading of this voice is in each language): Dirichlet predictive
+        over its counted detections, the room as its mean, as concentrated as the voices
+        of this room show; ``mine`` and ``room``: other counts, to judge without one."""
+        room = self.room() if room is None else room
         if room is None:
             return None
-        mine = self.voices.get(voice or "", Counter())
-        mass = sum(mine.values()) + 1
-        return {k: (mine.get(k, 0) + room.get(k, 0)) / mass for k in set(room) | set(mine)}
+        mine = self._mine(voice) if mine is None else mine
+        a = self.concentration
+        mass = sum(mine.values()) + a
+        return {k: (mine.get(k, 0) + a * p) / mass for k, p in room.items()}
 
-    def detection_right(self, seconds: float) -> float | None:
+    def detection_right(self, seconds: float, voice: str | None = None) -> float | None:
+        """P(a detection is right) at this length, for this voice's detections."""
         if self.weights is None:
             return None
-        x = np.array([[math.log(seconds), 1], [0, 0]])
-        return float(choice_probabilities(x, self.weights)[0])
+        z = float(_x(seconds) @ self.weights) + self.offsets.get(voice or "", 0)
+        return _sigmoid(z)
 
     def choose(self, voice: str | None, seconds: float) -> str | None:
         """The language to give the recogniser, or None to let it detect: the voice's
-        most probable language, when it is a better bet than the detection at this length.
-        Before anything is known of the detector, it is left to detect."""
-        spoken, right = self.of_voice(voice), self.detection_right(seconds)
+        most probable language, when it is a better bet than its detection at this
+        length. Before anything is known of the detector, it is left to detect."""
+        spoken, right = self.of_voice(voice), self.detection_right(seconds, voice)
         if spoken is None or right is None:
             return None
         best = max((k for k in spoken if k != OTHER), key=spoken.get)
@@ -226,17 +341,24 @@ class Languages:
     # -- persistence ----------------------------------------------------------------------
     def to_dict(self) -> dict:
         return {
-            "voices": {k: dict(v) for k, v in self.voices.items()},
             "words": {k: dict(v) for k, v in self.words.items()},
+            "known": {k: dict(v) for k, v in self.known.items()},
             "detections": [list(d) for d in self.detections],
             "base": [list(b) for b in self.base],
         }
 
     def load(self, raw: dict) -> None:
-        self.voices = defaultdict(
-            Counter, {k: Counter(v) for k, v in raw.get("voices", {}).items()}
-        )
+        """Everything is refitted from what was heard (the first build of v2.1 also
+        saved counts, ``voices``, and a weight per detection: recounted, not trusted)."""
         self.words = defaultdict(Counter, {k: Counter(v) for k, v in raw.get("words", {}).items()})
-        self.detections = [tuple(d) for d in raw.get("detections", [])]
+        self.known = defaultdict(Counter, {k: Counter(v) for k, v in raw.get("known", {}).items()})
+        self.detections = [
+            (voice, detected, seconds) for voice, detected, seconds, *_ in raw.get("detections", [])
+        ]
         self.base = [tuple(b) for b in raw.get("base", [])]
         self.refit()
+
+
+def _x(seconds: float) -> np.ndarray:
+    """A detection's features: the log of its length, and a bias."""
+    return np.array([math.log(seconds), 1])

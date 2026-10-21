@@ -11,7 +11,7 @@ from π_ear.asr import Hypothesis, Word
 from π_ear.language import Languages
 from π_ear.lexicon import Memory, align, edits, similarity, tokens
 from π_ear.scribe import rebuild_reader
-from π_ear.words import FEATURES, NONE, Context, Heard, Reader, _fit, fit_reader
+from π_ear.words import FEATURES, NONE, Context, Heard, Reader, Reading, _fit, fit_reader, repeated
 
 EN = [
     "the meeting moved to thursday because nobody found the projector",
@@ -84,7 +84,7 @@ def french_reader(base) -> Reader:
     """A reader that has heard voice v1 speak French, as a live stream would."""
     reader = Reader(base)
     for text in FR:
-        reader.languages.heard("v1", "fr", text, 1.0, True, 4.0)
+        reader.languages.heard("v1", "fr", text, True, 4.0)
     return reader
 
 
@@ -215,6 +215,18 @@ def test_the_reader_round_trips_and_rebuilds_from_what_it_was_taught(base, tmp_p
         assert other.read(heard, again, context)["text"] == "call kpihx now"
     forgotten = rebuild_reader(tmp_path, base, undone={1})
     assert forgotten.read(heard, again, context)["text"] != "call kpihx now"
+    # what the stream taught without a correction is not forgotten with it
+    reader.languages.heard("v1", "fr", FR[0], True, 9.0)
+    reader.agree(hyp("call the team", -0.1, "fast"), hyp("call the team", None, "slow"), "v1")
+    reader.heard("le match le match le match le match")
+    kept = rebuild_reader(tmp_path, base, undone={1}, current=reader)
+    assert kept.read(heard, again, context)["text"] != "call kpihx now"
+    assert kept.languages.detections == reader.languages.detections
+    reader.languages.refit()
+    assert kept.languages.of_voice("v1") == reader.languages.of_voice("v1")
+    assert kept.repeats == reader.repeats
+    assert kept.memory.known("v1", ["team"]) == 1 and kept.memory.known("v1", ["kpihx"]) == 0
+    assert kept.memory.lexicon["v1"]["call"] == 1  # confirmed once, taught once: one left
 
 
 def test_weights_saved_under_another_feature_list_are_kept_by_name():
@@ -267,10 +279,10 @@ def test_a_voice_language_starts_where_the_room_is_and_follows_what_the_voice_sa
     languages = Languages()
     assert languages.of_voice("v1") is None and languages.choose("v1", 3.0) is None
     for text in FR:
-        languages.heard("tv", "fr", text, 1.0, True, 5.0)
+        languages.heard("tv", "fr", text, True, 5.0)
     assert max(languages.of_voice("new").items(), key=lambda kv: kv[1])[0] == "fr"
     for text in EN * 3:
-        languages.heard("guest", "en", text, 1.0, True, 5.0)
+        languages.heard("guest", "en", text, True, 5.0)
     spoken = languages.of_voice("guest")
     assert spoken["en"] > spoken["fr"]
 
@@ -285,7 +297,7 @@ def test_the_language_is_given_only_when_it_is_more_probable_than_detection_bein
         seconds = float(rng.uniform(0.5, 20))
         right = rng.uniform() < seconds / (seconds + 2)
         languages.heard(
-            "v1", "fr" if right else str(rng.choice(["ru", "pt", "zh"])), FR[0], 1.0, True, seconds
+            "v1", "fr" if right else str(rng.choice(["ru", "pt", "zh"])), FR[0], True, seconds
         )
     languages.refit()
     assert languages.detection_right(1.0) < languages.detection_right(15.0)
@@ -294,12 +306,27 @@ def test_the_language_is_given_only_when_it_is_more_probable_than_detection_bein
     assert (languages.choose("v1", 60.0) is None) == (languages.detection_right(60.0) >= spoken)
 
 
+def test_a_detection_is_judged_without_itself():
+    """A room of French television; each guest is heard once, on a short phrase, and
+    Whisper names another language every time. Judged against the voice's language
+    *including* that detection, each was right (the voice spoke only it), and short
+    detections came out reliable: they are judged against the voice without them."""
+    languages = Languages()
+    for _ in range(20):
+        languages.heard("tv", "fr", FR[0], True, 20.0)
+    for i, language in enumerate(["ru", "pt", "zh", "ja", "tr"] * 4):
+        languages.heard(f"guest{i}", language, FR[1], True, 1.0)
+    languages.refit()
+    assert languages.detection_right(1.0) < 1 - languages.detection_right(1.0)
+    assert languages.detection_right(20.0) > languages.detection_right(1.0)
+
+
 def test_the_language_of_a_text_is_read_from_the_words_written_in_it():
     languages = Languages()
     for text in FR:
-        languages.heard(None, "fr", text, 1.0, False, 3.0)
+        languages.heard(None, "fr", text, False, 3.0)
     for text in EN:
-        languages.heard(None, "en", text, 1.0, False, 3.0)
+        languages.heard(None, "en", text, False, 3.0)
     assert languages.of_text("le rapport avant la fin")["fr"] > 0.9
     assert languages.of_text("the report before the end")["en"] > 0.9
     assert languages.of_text("") is None
@@ -307,28 +334,105 @@ def test_the_language_of_a_text_is_read_from_the_words_written_in_it():
 
 def test_languages_round_trip():
     languages = Languages()
-    languages.heard("v1", "fr", FR[0], 0.8, True, 2.0)
+    languages.heard("v1", "fr", FR[0], True, 2.0)
     again = Languages()
     again.load(languages.to_dict())
+    languages.refit()
     assert again.of_voice("v1") == languages.of_voice("v1")
+    assert again.detections == languages.detections
+    # v2.1's first build saved a weight per detection and its counts: recounted
+    old = {**languages.to_dict(), "detections": [["v1", "fr", 2.0, 0.8]], "voices": {"v1": {}}}
+    again.load(old)
+    assert again.detections == [("v1", "fr", 2.0)] and again.of_voice("v1")["fr"] > 0
     assert again.of_text(FR[1]) == languages.of_text(FR[1])
 
 
 def test_a_language_told_is_no_evidence_of_the_language_spoken():
     """Measured on the live corpus: one short phrase of KπX misdetected as English, then
-    every reading forced into English counted as English, and his voice was locked
+    every reading forced into English counted as English, and the voice was locked
     there. A told reading teaches words, never what a voice speaks."""
     languages = Languages()
     for _ in range(30):
         languages.measured(1.5, False)
         languages.measured(12.0, True)
-    languages.heard("kpihx", "en", "i'm so happy to have you", 1.0, True, 1.5)
+    languages.heard("kpihx", "en", "i'm so happy to have you", True, 1.5)
     for _ in range(20):
-        languages.heard("kpihx", "en", "and function in english", 1.0, False, 1.5)
+        languages.heard("kpihx", "en", "and function in english", False, 1.5)
     for _ in range(6):
-        languages.heard("kpihx", "fr", "je sais pas comment expliquer", 1.0, True, 1.5)
+        languages.heard("kpihx", "fr", "je sais pas comment expliquer", True, 1.5)
     languages.refit()
-    assert languages.voices["kpihx"]["en"] == 1.0
+    assert sum(d[:2] == ("kpihx", "en") for d in languages.detections) == 1
     spoken = languages.of_voice("kpihx")
     assert spoken["fr"] > spoken["en"]
     assert languages.choose("kpihx", 1.5) == "fr"  # detection at 1.5 s is the worse bet here
+
+
+def test_a_reading_that_loops_is_not_speech(base):
+    """Measured on the live replay: Whisper's loop "la Céline de la Céline de..." was
+    accepted. Speech almost never repeats a word trigram, a loop any share of them;
+    both are learned, unmixed, from what the recognisers write."""
+    reader = Reader(base)
+    for text in FR * 3 + [" ".join(["on y va"] * 6)]:
+        reader.heard(text)
+    loop = " ".join(["la céline de"] * 8)
+    normal = "le premier tour de la céline"
+    context = Context(None, TV, TV, 2.4)
+    fast, slow = hyp(normal, -0.3, "fast"), hyp(loop, None, "slow")
+    decided = reader.read(fast, slow, context)
+    assert decided["text"] != loop, decided["readings"]  # the loop is never written
+    readings, _ = reader.matrix(fast, slow, context)
+    terms = dict(zip([r.text for r in readings], reader.repetition_terms(readings), strict=False))
+    assert -0.1 < terms[normal] <= 0 and terms[loop] < -10
+
+
+PLAYER = (
+    "Non, c'est vrai que chaque jour, avant chaque match, le coach donne la corderie. C'est à"
+    " ce moment-là où il m'a dit que j'avais débuté le match. Comme j'ai toujours fait,"
+    " j'essaie toujours de donner mon maximum sur le terrain. Des fois, c'est vrai que tu as"
+    " des meilleures soirées que d'autres, mais en tout cas, cette envie de tout donner sur le"
+    " terrain, je n'ai jamais perdu ça."
+)
+
+
+def test_long_speech_that_repeats_itself_naturally_is_not_a_loop(base):
+    """Measured on the live replay: a player's 67-trigram answer repeats "c'est vrai que"
+    and "sur le terrain"; scored as Poisson against its mode with the base's rate (short
+    sentences: 0.0014), it paid 5.4 nats and lost to "I did not understand". Against a
+    loop, before the stream taught anything, it costs a fraction of a nat."""
+    reader = Reader(base)
+    assert repeated(PLAYER) == (2, 67)
+    readings = [Reading(PLAYER, {"slow"}), Reading(" ".join(["la céline de"] * 8), {"slow"})]
+    natural, loop, _ = reader.repetition_terms(readings)
+    assert natural > -0.5 and loop < -10
+
+
+def test_a_voice_misdetected_in_its_regime_is_told_the_language_of_the_room():
+    """The live replay, reduced: the television's voices detected French on long groups,
+    KπX's short phrases over it detected French 6 times in 18 and Portuguese, English,
+    Chinese, Russian, Polish or Turkish otherwise. Counted as spoken, those made KπX
+    35 % French and Whisper was never told (the base says detection at 2 s is right 6
+    times in 7: on clean speech). Learned per voice, KπX's detections are right one
+    time in three, the room's voices speak its language, and French is given; the
+    television keeps detecting; a guest who really speaks English is heard so."""
+    languages = Languages()
+    for _ in range(45):
+        languages.measured(2.0, True)  # the base: clean speech
+    languages.measured(2.0, False)
+    for voice in ("tv1", "tv2", "tv3"):
+        for _ in range(8):
+            languages.heard(voice, "fr", FR[0], True, 25.0)
+    for language in ["fr"] * 6 + ["pt", "pt", "pt", "en", "en", "en", "zh", "zh", "ru", "ru"]:
+        languages.heard("kpihx", language, FR[1], True, 2.0)
+    languages.heard("kpihx", "pl", FR[1], True, 1.5)
+    languages.heard("kpihx", "tr", FR[1], True, 4.0)
+    languages.refit()
+    assert languages.detection_right(2.0, "kpihx") < languages.detection_right(2.0, "tv1")
+    assert languages.choose("kpihx", 2.0) == "fr"
+    assert languages.choose("tv1", 25.0) is None
+    assert max(languages.of_voice("never-heard"), key=languages.of_voice("never-heard").get) == "fr"
+    for _ in range(12):
+        languages.heard("guest", "en", EN[0], True, 25.0)
+    languages.refit()
+    spoken = languages.of_voice("guest")
+    assert max(spoken, key=spoken.get) == "en"
+    assert languages.choose("guest", 2.0) in ("en", None)

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -140,6 +141,7 @@ class Sherpa:
         self.language = language
         self.setting = setting  # config -> the object and attribute(s) that hold the language
         self.current = language or ""
+        self.lock = threading.Lock()  # one model, shared: its language is set per call
 
     def _set(self, language: str) -> None:
         if self.setting is None or language == self.current:
@@ -151,6 +153,10 @@ class Sherpa:
         self.current = language
 
     def __call__(self, samples: np.ndarray, language: str | None = None) -> Hypothesis:
+        with self.lock:
+            return self._read(samples, language)
+
+    def _read(self, samples: np.ndarray, language: str | None) -> Hypothesis:
         self._set(language or self.language or "")
         stream = self.recognizer.create_stream()
         stream.accept_waveform(contract.RATE, samples)
@@ -257,11 +263,23 @@ def available(name: str, models: Path) -> bool:
     return name in REGISTRY and (models / REGISTRY[name][0]).exists()
 
 
+_LOADED: dict[tuple[str, str], Recognizer] = {}
+_LOADING = threading.Lock()
+
+
 def build(name: str, models: Path) -> Recognizer | None:
-    """A recogniser by registry name or ``module:factory``; None if absent or ``none``."""
+    """A recogniser by registry name or ``module:factory``; None if absent or ``none``.
+
+    One instance per model and process: Whisper turbo is a gigabyte, and every ear that
+    loaded its own (tests, a reset) ran this container out of memory (measured)."""
     if not available(name, models):
         return None
-    if ":" in name:
-        module, factory = name.split(":", 1)
-        return getattr(importlib.import_module(module), factory)(models)
-    return REGISTRY[name][1](models)
+    with _LOADING:
+        key = (name, str(models))
+        if key not in _LOADED:
+            if ":" in name:
+                module, factory = name.split(":", 1)
+                _LOADED[key] = getattr(importlib.import_module(module), factory)(models)
+            else:
+                _LOADED[key] = REGISTRY[name][1](models)
+        return _LOADED[key]

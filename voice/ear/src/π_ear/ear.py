@@ -448,7 +448,7 @@ class Ear:
 
         Measured live (2026-10-20): a memory written before v2 had 1449 rows and no
         spectra; v2 appended spectra from row 1449 on, at index 0, so every source
-        decision of that session read another window's spectrum (KπX himself came out
+        decision of that session read another window's spectrum (KπX came out
         a device), and the voices heard after the last spectral row had none
         (``source_p``: NaN). Both files only ever grow together since v2, so the rows
         without a spectrum are the oldest ones: they are put back in front, as unseen
@@ -593,21 +593,21 @@ class Ear:
         if asked is None:
             return "answer", [], line, f"no question {question!r} in this record"
         if asked["about"] == "name":
-            return (
-                "name",
-                asked["rows"],
-                {**line, "label": line.get("label") or line.get("text")},
-                None,
-            )
+            name = (line.get("label") or line.get("text") or "").strip()
+            if not name:
+                return "answer", [], line, "an answer to a name question names someone"
+            return "name", asked["rows"], {**line, "label": name}, None
         text = line.get("text")
         if text is None and line.get("choice") is not None:
             choices = asked["choices"]
             if not 0 <= int(line["choice"]) < len(choices):
                 return "answer", [], line, f"choice {line['choice']} of {len(choices)}"
             text = choices[int(line["choice"])]
+        if text is None:  # "" is an answer: nothing was said
+            return "answer", [], line, "an answer gives a text or a choice"
         if self.scribe:
             self.scribe.answered(asked.get("speaker"))
-        return "text", asked["rows"], {**line, "text": text, "piece": asked["piece"]}, None
+        return "text", asked["rows"], {**line, "text": text, "piece": asked.get("piece")}, None
 
     def _undo(self, target: int) -> str | None:
         """Forget one correction exactly: rebuild what it taught by replaying the rest."""
@@ -617,7 +617,9 @@ class Ear:
         kept = [a for a in self.applied if a[0] != target]
         self.undone.add(target)
         if entry[2] == "text":
-            self.reader = rebuild_reader(self.places.memory, self.model.base.reader, self.undone)
+            self.reader = rebuild_reader(
+                self.places.memory, self.model.base.reader, self.undone, self.reader
+            )
             if self.scribe:
                 self.scribe.reader = self.reader
         else:

@@ -657,6 +657,71 @@ the wrong audio); a scribe job that failed killed its thread and the ear waited 
 (errors are written to the record now, and the scribe goes on); a late `hear` re-opening
 a finished run.
 
+**Loops are not speech.** Whisper's hallucination loop ("la Céline de la Céline de la
+Céline...") was accepted on KπX's segment. A probability again, not a weight: the term added
+to a reading's score is log P(it is speech, not a loop | it repeats k of its m word
+trigrams), speech repeating Poisson(q m), a loop any share uniformly, q and the share of
+loops learned without one label by EM on everything the recognisers wrote (the base's public
+readings, then the stream's), the base's truths held as speech. 90 % of 2405 live readings
+repeat nothing, the loops 30-80 %.
+
+Three designs failed on the replay first, each measured. The pace (words per second): the
+loops ran at 2.5-5.6, inside speech's own 0.6-4.4. A cost per repeated trigram: a 100-word
+studio reading with three natural repeats paid 20 nats and lost to a short translation
+(studio 0.78 -> 0.55). Poisson(q m) against its most probable count, q learned on accepted
+readings: the base's short sentences made q 0.0014, and a player's 67-trigram answer
+repeating "c'est vrai que" and "sur le terrain" paid 5.4 nats and lost to "I did not
+understand" (player 0.75 -> 0.57); learning q from what the reader accepted could also teach
+it that loops are speech, the way the first language model locked itself. Against a loop,
+that answer's two repeats cost a few hundredths of a nat, a loop of thirteen in twenty
+forty.
+
+**Language, a second time: the voice's regime.** The replay of KπX's segment never told
+Whisper "fr" for KπX (59 pieces of 60 left to detect): detection at 2 s was measured right 6
+times in 7 on the base (clean speech), and KπX's detections, 6 French in 18 and the rest
+Portuguese, English, Chinese, Russian, Polish, Turkish, were counted as languages spoken, so
+the voice was 35 % French. Told French, the same pieces read "C'est toujours comme ça, j'ai
+toujours jamais vu..." where detection read "Eee" in Turkish: recall 0.318 -> 0.377 against
+Whisper-fr, 0.475 -> 0.480 against Parakeet (the neutral one). Now each detection is judged
+against its voice without it (a voice heard once was always "right": 0.98 where the truth
+was 0.02), each voice learns how much worse or better its own detections are than their
+length predicts (KπX over the television: one in three at 2 s), its detections count by
+that, and a voice speaks like the room as strongly as the voices of the room do (a Dirichlet
+concentration estimated on all of them at once, 21 on this record). On the replay's own
+detections: KπX French at 0.71 against a detection right at 0.30, so French is given; the
+commentators keep detecting (0.99).
+
+Three more things the replay showed before that held. The language model was refitted only
+when the scribe was idle, and a television never lets it be: the regime of KπX's voice was
+never learned in time (it is refitted after every detection now; a vectorised logit and a
+cached room keep it at 0.06 s for 2000 detections, where the first version took 1.6 s). A
+detection was judged without itself in its voice but not in the room: at the start of a
+session, KπX alone in it, the room was KπX, and the first misdetection (Chinese) confirmed
+itself; three pieces were told Chinese, until 352 s. And the base had measured the detector
+at 2-4 s only: the slope of reliability in length was free, and three detections of one
+voice turned it over (longer came out less reliable). The base now measures it up to the
+window, one voice's sentences then every voice's of a language one after another. Replayed,
+KπX's voice is told French from its first French detection on.
+
+Questions are asked only about a voice the model knew before the piece: on the goal and the
+crowd, KπX's shouts made voices of one window each (16 dB over the floor, a person's
+spectrum: rightly people), and each was asked what it had said. A voice of one window may be
+nobody; a real one comes back.
+
+**Zero trust, the review.** Every module read again, line by line, each finding with a test
+that fails without its fix: a voice change was gated on `trust or 1` (a calibrated trust of
+0 read as 1); the audio of every piece was kept for the whole session (460 MB on two hours);
+undoing a text correction rebuilt the reader from the base and forgot every voice's language
+and every word both recognisers had confirmed; an answer with neither a text nor a choice
+crashed the scribe two calls later (refused now, the question stays open; "" is an answer:
+nothing was said); a refit that raised left the reader dirty and the scribe refitted again
+at once, forever, and the ear waited on it (an error is written once now); the replay starts
+from a memory that already heard the segment (said in `live.py`: who is easier on the replay
+than it was live).
+
+**One model per process.** The full suite ran this container out of memory: every ear a
+test built loaded its own Whisper turbo (a gigabyte). Recognisers are loaded once per
+process and shared, behind a lock (their language is set per call).
+
 ### The replay, segment by segment (word recall, vs Whisper-fr / vs Parakeet)
 
-(see the table at the end of this section, filled from `make test-live` and the lab runs)

@@ -84,7 +84,12 @@ class Recording:
         return directory
 
     def memory(self, directory: Path) -> Path:
-        """A copy of the memory the ear had at the end of the session."""
+        """A copy of the memory the ear had at the end of the session.
+
+        It already heard every segment once: the voices of a replay are known from the
+        very windows replayed, and *who* is easier than it was live. Of *what* it holds
+        little: no correction, and a lexicon of 230 words confirmed by both recognisers
+        over two hours (v2.0 confirmed a word only when two readings agreed whole)."""
         source = self.root / "report" / "memory"
         if directory.exists():
             shutil.rmtree(directory)
@@ -109,4 +114,7 @@ def recall(reference: list[str], written: list[str]) -> float:
 
 
 def words_between(blocks: list[dict], start: float, end: float) -> list[str]:
+    """The words of the blocks that start inside [start, end): a block straddling the
+    end counts whole, one straddling the start not at all (the same for every run
+    compared, so a bias of the reference, not of a run)."""
     return [w for b in blocks if start <= b["t"] < end for w in tokens(b["text"])]

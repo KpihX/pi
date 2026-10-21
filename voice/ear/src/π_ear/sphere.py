@@ -154,6 +154,25 @@ def fit_choice(examples, dim: int, mean=None, rounds: int = 30):
     return w, np.linalg.pinv(hessian)
 
 
+def fit_logit(x: np.ndarray, right: np.ndarray, rounds: int = 30) -> np.ndarray:
+    """``fit_choice`` for two candidates, one of them all zeros, vectorised: P(right) =
+    sigmoid(x w), the same MAP under a Gaussian prior centred on zero whose precision is
+    re-estimated by evidence maximisation. Thousands of examples in milliseconds (the
+    language model refits after every detection)."""
+    x, right = np.asarray(x, dtype=np.float64), np.asarray(right, dtype=np.float64)
+    dim = x.shape[1]
+    w, precision, eye = np.zeros(dim), 1.0, np.eye(dim)
+    hessian = eye
+    for _ in range(rounds):
+        p = 1.0 / (1.0 + np.exp(-(x @ w)))
+        grad = x.T @ (right - p) - precision * w
+        hessian = precision * eye + (x.T * (p * (1.0 - p))) @ x
+        w = w + np.linalg.pinv(hessian) @ grad
+        used = dim - precision * float(np.trace(np.linalg.pinv(hessian)))
+        precision = max(used, _TINY) / max(float(w @ w), _TINY)
+    return w
+
+
 def choice_probabilities(features: np.ndarray, w: np.ndarray) -> np.ndarray:
     scores = features @ w
     p = np.exp(scores - scores.max())

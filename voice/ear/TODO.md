@@ -325,3 +325,22 @@ designs that failed are in `IDEAS.md`, section "v2".
    video's voices; if not, `make correct C="device --speaker KEY"`, once.
 4. The same session in another room, the next day: if a voice comes back under a new key,
    one `same`, and it should not happen again in that room.
+
+---
+
+## Done 2026-10-21: v2.1, the first live test answered (KπX: "va tout retravailler")
+
+The two hours of PSG - Barça KπX recorded are now a live recording on this machine
+(`~/.cache/π/data/live/2026-10-20-psg-barca/`, never committed), its manifest
+`tests/live/2026-10-20-psg-barca.json`, replayed by `make test-live`. Everything it showed is
+in `IDEAS.md`, section "v2.1", with what each fix measured on the replay.
+
+**Owed by KπX, live:**
+
+1. Keep the corpus of the next session too (`make corpus`, then copy `~/.cache/π/corpus`):
+   the start of a session, where KπX's voice is faint, was outside the last hour this time.
+2. The same setting again (a match, a film): `ctl status` now prints the scribe's own state
+   (pieces, how far behind the slow pass is, its speed, this place's levels); the questions
+   should be few, about KπX's own words only.
+3. Answer one (`make questions`, `make answer`): KπX's voice's language and words then stay.
+4. If KπX's voice comes out a device, `make correct C="person --speaker b54d13…"`, once.

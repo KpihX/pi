@@ -42,7 +42,9 @@ Every decision is written with its doubt. A ``question`` is written when it is w
 someone's attention: the reader could not choose (``ambiguous``), understood only bits
 (``partial``), or nothing of a known voice, or holds a word more probably wrong than
 right (the question names those words), *and* the voice is a person (a commentator on
-television is nobody to ask), and that voice has no question still open.
+television is nobody to ask), known before the piece (a voice born of one window may be
+nobody: on the replay of a goal, KπX's shouts made three such voices, each asked about;
+a real one comes back), and that voice has no question still open.
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ import numpy as np
 from π_ear import asr, contract
 from π_ear.asr import Hypothesis, Word
 from π_ear.io import append_jsonl, read_jsonl, utc_now
+from π_ear.lexicon import tokens
 from π_ear.sense import Silero
 from π_ear.words import NONE, Context, Heard, Reader, mean_logp
 
@@ -79,6 +82,7 @@ class Piece:
     voices: dict[str, float] = field(default_factory=dict)  # share of the piece's time
     voice: str | None = None
     mixed: bool = False
+    known: bool = False  # its voice was known before it: not a voice born in this piece
     fast: Hypothesis | None = None
     slow: Hypothesis | None = None
     language: str | None = None  # what the slow recogniser was told, if anything
@@ -240,13 +244,17 @@ class Scribe:
                 self.lock.wait()
 
     def pending(self) -> int:
-        return len(self.revisions) + len(self.corrections) + len(self.dirty) + len(self.partials)
+        with self.lock:
+            return (
+                len(self.revisions) + len(self.corrections) + len(self.dirty) + len(self.partials)
+            )
 
     def behind_s(self) -> float:
         """Seconds of audio waiting for the slow recogniser."""
-        return sum(
-            self.pieces[k].t1 - self.pieces[k].t0 for _, _, keys in self.revisions for k in keys
-        )
+        with self.lock:
+            return sum(
+                self.pieces[k].t1 - self.pieces[k].t0 for _, _, keys in self.revisions for k in keys
+            )
 
     # -- the thread --------------------------------------------------------------------
     def _next(self):
@@ -343,8 +351,9 @@ class Scribe:
     def _turn_cuts(self, state: Open, probs, decisions, total: int) -> list[int]:
         """Where the voice changes inside the open part: between the middles of two
         consecutive learned windows given to two different voices, at Silero's deepest
-        dip, when the change is more probably real than not. A piece is one voice's phrase, so its text is that voice's (an interview's
-        question and answer, measured live in one run, become two pieces)."""
+        dip, when the change is more probably real than not. A piece is one voice's
+        phrase, so its text is that voice's (an interview's question and answer,
+        measured live in one run, become two pieces)."""
         frames = contract.RATE / self.frame
         voiced = sorted(
             (d for d in decisions if d["learned"] and d["kind"] in VOICED and d["speaker"]),
@@ -357,7 +366,9 @@ class Scribe:
             # a change is a cut only if it is more probably real than not, by the model of
             # who's own calibrated trust (Q1): on fast match commentary, cuts between two
             # unsure windows made fragments nobody could read (measured on the replay)
-            both = (a.get("trust") or 1) * (b.get("trust") or 1)
+            # (a window the model could not calibrate, trust None, keeps its argmax; a
+            # trust of 0 is a trust, not a missing one: a first build read it as 1)
+            both = np.prod([1 if d.get("trust") is None else d["trust"] for d in (a, b)])
             if both < 1 - both:
                 continue
             lo = int(((a["t0"] + a["t1"]) / 2 - state.start) * frames)
@@ -401,10 +412,12 @@ class Scribe:
             voice=share.most_common(1)[0][0] if share else None,
             mixed=any(d["kind"] in ("noise", "unknown") for d in covering if d["learned"]),
         )
+        piece.known = any(d["kind"] == "known" and d["speaker"] == piece.voice for d in covering)
         if piece.voice is not None and piece.speech is not None:
             self.regime["sum"] += piece.speech
             self.regime["count"] += 1
         piece.fast = asr.read(self.fast, samples)
+        self.reader.heard(piece.fast.text)
         if piece.voice is not None and any(w.logp is not None for w in piece.fast.words):
             self.regime["logp"] += mean_logp(piece.fast)
             self.regime["read"] += 1
@@ -415,6 +428,8 @@ class Scribe:
         self._decide(piece)
         if self.slow is not None:
             self._group(state, piece)
+        else:
+            piece.samples = None  # nothing will read it again
 
     def _partial(self, run: str) -> None:
         with self.lock:
@@ -478,15 +493,18 @@ class Scribe:
         heard = asr.read(self.slow, audio, told or "")
         self.pace["spent"] += time.monotonic() - started
         self.pace["audio"] += seconds
+        self.reader.heard(heard.text)
         languages = self.reader.languages
-        # a detection is evidence before the decision, weighted by how often a detection
-        # this long is right: on the first group already, Parakeet's English for a French
-        # player is a translation (measured live, cold start). A told reading only
-        # teaches what its language is written with.
-        right = languages.detection_right(seconds) if told is None else None
-        languages.heard(
-            voice, heard.language or told, heard.text, right or 1, told is None, seconds
-        )
+        # a detection is evidence before the decision, counted by how often this voice's
+        # detections this long are right: on the first group already, Parakeet's English
+        # for a French player is a translation (measured live, cold start). A told
+        # reading only teaches what its language is written with.
+        languages.heard(voice, heard.language or told, heard.text, told is None, seconds)
+        if languages.dirty:
+            # now, not when the scribe is idle: the television never lets it be, and on
+            # the replay of KπX's segment the voice's regime was never learned in time
+            # (59 groups of 60 left to detect); it costs a tenth of what Whisper does
+            languages.refit()
         for piece in pieces:
             lo, hi = piece.t0 - start, piece.t1 - start
             mine = [w for w in heard.words if lo <= (w.t0 + w.t1) / 2 < hi]
@@ -498,6 +516,7 @@ class Scribe:
             piece.language, piece.separated = told, separated
             self._decide(piece)
             self.reader.agree(piece.fast, piece.slow, piece.voice)
+            piece.samples = None  # read by both: a two-hour session kept 460 MB of them
 
     def _correction(self, job) -> None:
         key, truth, line = job
@@ -523,7 +542,10 @@ class Scribe:
         self._decide(piece)
 
     def _refit(self, _) -> None:
-        self.reader.refit()
+        try:
+            self.reader.refit()
+        finally:  # a refit that fails is written as an error, never retried in a loop
+            self.reader.dirty = self.reader.languages.dirty = False
 
     # -- the decision, written ------------------------------------------------------------
     def _context(self, piece: Piece) -> Context:
@@ -674,6 +696,7 @@ class Scribe:
                 or piece.asked
                 or not worth
                 or source != "person"
+                or not piece.known  # a voice of one window may be nobody: if real, it returns
                 or piece.voice in self.open_questions
             ):
                 return
@@ -712,10 +735,28 @@ class Scribe:
         }
 
 
-def rebuild_reader(memory: Path, base: dict, undone: set[int]) -> Reader:
-    """The reader again, from its base: every kept text correction, in order, then a refit."""
+def rebuild_reader(
+    memory: Path, base: dict, undone: set[int], current: Reader | None = None
+) -> Reader:
+    """The reader again, from its base: every kept text correction, in order, then a refit.
+
+    What the stream taught without a correction survives (``current``): the languages
+    of its voices, how its readings repeat, the words both recognisers confirmed. A first
+    build rebuilt from the base alone, and one undo made every voice's language and
+    every confirmed word forgotten."""
+    taught = read_jsonl(memory / "taught.jsonl")[0]
     reader = Reader(base)
-    for line in read_jsonl(memory / "taught.jsonl")[0]:
+    if current is not None:
+        reader.languages.load(current.languages.to_dict())
+        reader.repeats = Counter(current.repeats)
+        lexicon = current.memory.to_dict()["lexicon"]
+        reader.memory.load({"lexicon": lexicon})
+        for line in taught:  # the corrections' own words, replayed below if kept
+            words = reader.memory.lexicon[line["voice"] or ""]
+            words.subtract(Counter(tokens(line["truth"])))
+            for word in [w for w, n in words.items() if n <= 0]:
+                del words[word]
+    for line in taught:
         if line["line"] in undone:
             continue
         reader.learn(

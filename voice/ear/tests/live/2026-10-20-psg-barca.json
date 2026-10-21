@@ -1,19 +1,104 @@
 {
-  "name": "2026-10-20-psg-barca",
-  "about": "PSG - Barça on a television, heard by a laptop microphone, KπX in the room. Ear v2, session 20261020-191308 (7906 s). The corpus is the session's last hour.",
-  "chunks": 3600,
-  "offset_s": 4306.0,
-  "offset_check": "CAM++ on the corpus reproduces the stored embedding rows with cos 1.00000 at this offset",
-  "segments": [
-    {"name": "match", "start": 0, "end": 554, "what": "second half: commentator and consultant", "hard": "a television through a laptop microphone, -40 dBFS, crowd under it", "expect": {"person": false, "language": "fr"}},
-    {"name": "quiet", "start": 554, "end": 734, "what": "almost silence (-50 dBFS)", "hard": "nothing may be invented", "expect": {"invent": false}},
-    {"name": "crowd", "start": 734, "end": 1094, "what": "commentary under a loud crowd", "hard": "Silero's mean on real speech 0.1-0.4", "expect": {"language": "fr"}},
-    {"name": "kpihx", "start": 1034, "end": 1544, "what": "KπX in the room, over the television", "hard": "the person who matters: short phrases, -25..-35 dBFS, overlapping the TV, Whisper detected Russian, Portuguese, Chinese", "expect": {"person": true, "language": "fr"}},
-    {"name": "goal", "start": 1514, "end": 1544, "what": "a goal: crowd, commentator and KπX at once", "hard": "three sources overlapping", "expect": {}},
-    {"name": "whistle", "start": 1904, "end": 2054, "what": "final whistle, then ads (FedEx, Canal+ promotion)", "hard": "new voices, music, a sponsor voice already heard 65 min earlier", "expect": {"person": false}},
-    {"name": "studio", "start": 2054, "end": 2774, "what": "studio: host and consultants", "hard": "talk without a pause (no silence for the slow pass); Parakeet answered in English; runs of 70 s", "expect": {"person": false, "language": "fr", "pieces_under_s": 30}},
-    {"name": "interview", "start": 2222, "end": 2270, "what": "an interview inside the studio", "hard": "another voice inside a run", "expect": {}},
-    {"name": "player", "start": 2798, "end": 2924, "what": "a player interviewed: question and answer in one run", "hard": "two voices, one run", "expect": {"voices_in_a_piece": 2}},
-    {"name": "other", "start": 3164, "end": 3554, "what": "another programme, low level (-52 dBFS)", "hard": "quiet speech of no known voice", "expect": {"person": false}}
-  ]
+ "name": "2026-10-20-psg-barca",
+ "about": "PSG - Barça on a television, heard by a laptop microphone, KπX in the room. Ear v2, session 20261020-191308 (7906 s). The corpus is the session's last hour.",
+ "chunks": 3600,
+ "offset_s": 4306.0,
+ "offset_check": "CAM++ on the corpus reproduces the stored embedding rows with cos 1.00000 at this offset",
+ "segments": [
+  {
+   "name": "match",
+   "start": 0,
+   "end": 554,
+   "what": "second half: commentator and consultant",
+   "hard": "a television through a laptop microphone, -40 dBFS, crowd under it",
+   "expect": {
+    "language": "fr"
+   }
+  },
+  {
+   "name": "quiet",
+   "start": 554,
+   "end": 734,
+   "what": "almost silence (-50 dBFS), faint speech the other systems still heard",
+   "hard": "what is written must be what was said: nothing invented",
+   "expect": {
+    "invent": false
+   }
+  },
+  {
+   "name": "crowd",
+   "start": 734,
+   "end": 1094,
+   "what": "commentary under a loud crowd",
+   "hard": "Silero's mean on real speech 0.1-0.4",
+   "expect": {
+    "language": "fr"
+   }
+  },
+  {
+   "name": "kpihx",
+   "start": 1034,
+   "end": 1544,
+   "what": "KπX in the room, over the television",
+   "hard": "the person who matters: short phrases, -25..-35 dBFS, overlapping the TV, Whisper detected Russian, Portuguese, Chinese",
+   "expect": {
+    "person": true,
+    "language": "fr"
+   }
+  },
+  {
+   "name": "goal",
+   "start": 1514,
+   "end": 1544,
+   "what": "a goal: crowd, commentator and KπX at once",
+   "hard": "three sources overlapping",
+   "expect": {}
+  },
+  {
+   "name": "whistle",
+   "start": 1904,
+   "end": 2054,
+   "what": "final whistle, then ads (FedEx, Canal+ promotion)",
+   "hard": "new voices, music, a sponsor voice already heard 65 min earlier",
+   "expect": {}
+  },
+  {
+   "name": "studio",
+   "start": 2054,
+   "end": 2774,
+   "what": "studio: host and consultants",
+   "hard": "talk without a pause (no silence for the slow pass); Parakeet answered in English; runs of 70 s",
+   "expect": {
+    "language": "fr",
+    "pieces_under_s": 30
+   }
+  },
+  {
+   "name": "interview",
+   "start": 2222,
+   "end": 2270,
+   "what": "an interview inside the studio",
+   "hard": "another voice inside a run",
+   "expect": {}
+  },
+  {
+   "name": "player",
+   "start": 2798,
+   "end": 2924,
+   "what": "a player interviewed: question and answer in one run",
+   "hard": "two voices, one run",
+   "expect": {
+    "voices_in_a_piece": 2
+   }
+  },
+  {
+   "name": "other",
+   "start": 3164,
+   "end": 3554,
+   "what": "another programme, low level (-52 dBFS)",
+   "hard": "quiet speech of no known voice",
+   "expect": {}
+  }
+ ],
+ "notes": "KπX speaks in the room during the whole match: 'person' is expected only where it was checked by ear of text (kpihx), never assumed absent."
 }

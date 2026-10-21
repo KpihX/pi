@@ -397,6 +397,31 @@ def base_reader(data: Path, models: Path, rng) -> dict:
         context = Context(voice, s, means[name], len(x) / contract.RATE, confidence[name])
         heard.append(Heard(f, g, truth, context, language))
     out = fit_reader(heard)
+    # how often the slow recogniser's language detection is right, at every length it
+    # reads, not only a sentence's: one voice's sentences, then every voice's of a
+    # language, one after another, doubling until its window is full, in each regime. Measured at 2-4 s alone, the slope of
+    # reliability in length was free, and three detections of one voice on the live
+    # replay turned it over (longer came out less reliable).
+    window = asr.window_s(slow) if slow else None
+    if slow is not None and window:
+        by_voice: dict[tuple, list] = {}
+        for name, x, _, voice, language in pieces:
+            if language:
+                by_voice.setdefault((name, voice, language), []).append(x)
+                # and every voice of a language in turn, to reach the window's length
+                by_voice.setdefault((name, "", language), []).append(x)
+        for (_, _, language), clips in sorted(by_voice.items()):
+            k = 2
+            while k <= len(clips):
+                x = np.concatenate(clips[:k])
+                if len(x) / contract.RATE >= window:
+                    break
+                detected = heard_by(contract.SLOW, slow, x).language
+                if detected:
+                    out["languages"]["base"].append(
+                        [len(x) / contract.RATE, float(detected == language)]
+                    )
+                k *= 2
     out["regime"] = means["clean"]
     out["confidence"] = confidence["clean"]
     out["regimes"] = {"speech": means, "confidence": confidence}

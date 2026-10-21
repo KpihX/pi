@@ -69,6 +69,18 @@ def written_recall(segment, texts) -> dict[str, float]:
     }
 
 
+def precision(segment, texts) -> float:
+    """The share of the words written that either other system also heard, in order."""
+    written = [w for e in texts for w in tokens(e["text"])]
+    if not written:
+        return 1.0
+    heard = [
+        recall(written, words_between(REC.listening(system), segment.start, segment.end))
+        for system in ("turbo-fr", "parakeet")
+    ]
+    return max(heard)
+
+
 def check(segment, ear, events, texts) -> None:
     expect = segment.expect
     assert not [e for e in events if e.get("kind") == "error"], "a job of the scribe failed"
@@ -82,7 +94,7 @@ def check(segment, ear, events, texts) -> None:
     window = asr.window_s(asr.build(contract.SLOW, contract.MODELS))
     assert all(e["t1"] - e["t0"] < window for e in texts), "a piece longer than Whisper reads"
     if expect.get("invent") is False:
-        assert sum(len(tokens(e["text"])) for e in texts) <= len(texts), texts
+        assert precision(segment, texts) >= 0.5, texts
 
 
 @pytest.mark.parametrize("name", ["match", "kpihx", "studio", "player"])
@@ -96,10 +108,10 @@ def test_a_live_segment_is_read_at_least_as_well_as_live(tmp_path, name):
         assert now[system] >= then - 0.01, (system, now, LIVE_V20[name])
 
 
-def test_kpihx_in_the_room_is_himself_a_person_and_the_television_devices(tmp_path):
+def test_kpihx_in_the_room_is_a_person_and_the_television_devices(tmp_path):
     """The voice the ear learned on 2026-10-19 (``b54d13``) is found again, as a person;
     every voice of the broadcast is a device (live, every source decision of this
-    session read another window's spectrum, and he came out a device)."""
+    session read another window's spectrum, and KπX came out a device)."""
     segment, ear, events, texts = replay(tmp_path, "kpihx")
     voices = collections.Counter(
         e["speaker"] for e in events if e.get("kind") in ("known", "new") and e["learned"]
