@@ -774,3 +774,365 @@ detectors, a voice is told that language (the goal replayed from nothing: Englis
 until another voice or a longer detection says otherwise; a memory keeps its room's
 languages from one session to the next.
 
+
+**Correction 2026-10-21 (KπX): a misreading of the live test, corrected here, append-only.** The
+lines above say the match was "a football broadcast (a laptop microphone, the television across
+the room)" and speak of "a television heard by a laptop". That is wrong. KπX watched the match
+in the browser of this very laptop: the "television" was **the machine's own sound**, played by
+its own speakers and picked up by its own microphone. Two consequences the analysis above missed:
+
+- what the machine plays is not an unknown source to be guessed through the microphone: it is a
+  signal the machine already has, exactly, before it reaches the air (the output's monitor);
+- the acoustic path is the laptop's speakers to the laptop's microphone, the standard case of
+  echo cancellation, not a television across a living room.
+
+Every "device" voice of that session was the machine itself. Nothing measured above changes;
+what it means does (see the proposals that follow this correction).
+
+---
+
+## v2.2 (2026-10-21): an ambient ear (KπX: "un système humain, ambiant, jamais confiné")
+
+KπX's correction, kept here because it is the brief of everything below: the ear is not for one
+voice. KπX alone, with friends or classmates, in a meeting with a trusted group, with voices
+coming out of the phone or the PC, with a video playing: it must understand the scene the way
+a person who is there does, and assume no scenario. And two answers: the machine's own output
+may be captured, by configuration (`PI_EAR_OUTPUT`, on by default; off, the microphone alone is
+the ear); what it played is kept, optimised (text and metadata, no audio past the corpus bound).
+
+### Step 1: two streams, one ear
+
+**Why.** What the machine plays exists, exactly, before it reaches the air: its output's
+monitor. A person in the room does not have that; the ear does, so it should not guess
+through the microphone what it can read directly.
+
+**What it is.** `make rec-out` records the monitor beside the microphone (same chunks, same
+names: one clock) and `π-ear apps` writes which applications play, each second
+(`apps.jsonl`, from the sound server). The ear has two channels (`ear.Channel`): the
+microphone and the machine. Each has its own sensor, runs and floor; both feed **one** model
+of who, the machine's windows in a place of their own. Every decision, turn and text says its
+`channel`; the machine's say which `apps` played them (port 4).
+
+**Taking the machine out of the microphone (`echo.py`), measured before it was built**
+(lab `aec_domain`, `aec_compare`: a simulated laptop, its small speakers and the room, French
+sentences said over LibriSpeech it plays):
+
+| canceller | echo removed | the person's words read (Parakeet), person as loud as the machine |
+|---|---|---|
+| none | 0 dB | almost none |
+| WebRTC AEC3 | 20-25 dB | **none**: its residual suppressor gates the near end in double talk |
+| Speex MDF, linear only | about 16 dB | **three quarters** |
+
+AEC3 is built for telephony, where silencing the near end while the far end speaks is a
+feature; for an ear that must hear people while the machine plays, it is the failure itself.
+MDF estimates its own step from the stream (Valin 2007), so nothing is set. Its limit is
+physical and measured: a small driver pushed into its nonlinearity leaves what no linear
+filter models (a scene drawn with a harsher driver: 9-11 dB removed, the person still unread).
+
+**The offset between the two recorders is learned**, never assumed: they start at different
+moments, so the streams are apart by up to a chunk plus the output's latency, more than any
+filter tail. GCC-PHAT on each stretch of played sound finds it (to the sample on four lags
+from 0 to 900 ms, plus the speaker's and room's own few milliseconds); the most frequent
+estimate since the last hole in the stream is used; until there is one, nothing is subtracted.
+
+**Two bugs found by building it, each with its test.** The two streams arrive one chunk at a
+time live but all at once in a replay: the machine's chunks were pushed first and the bounded
+reference had dropped the start when the microphone needed it. The streams are now merged by
+their seconds (a machine chunk goes first while it is not further ahead than an offset can
+reach). And a microphone chunk waiting for the machine's could see its file pruned before the
+corpus copied it: the corpus copies at the read now.
+
+**The canceller's doubt, two numbers** (the third law): `echo` on every microphone decision,
+the share of its energy that went with the machine; `left` per chunk, how much of what remains
+the machine still explains (the coherence of the cleaned microphone with the reference). Where
+the canceller failed, `left` is high, and the state says so.
+
+**What it does to a scene** (`tests/test_output.py`: a podcast in English played by the
+laptop, a person speaking French in the room, partly over it):
+
+| | the person over the machine | the person after it |
+|---|---|---|
+| output off | the sentence is lost: the microphone writes the podcast in its place | read |
+| output on | "Je voudrais qu'on reprenne le chapitre 3 demain matin." | read, unchanged |
+
+And the podcast itself is read from the machine, clean, attributed to the browser. Until the
+offset is learned (the first stretch of played sound) the microphone still writes the podcast
+heard through the air: the machine, heard twice. That is step 2's first fact to use.
+
+**Degrading visibly.** Output on but its recorder not running: the microphone is never held
+back (a microphone chunk waits at most for the next one, and not at all when no machine chunk
+ever came), and `ctl status` says `DEGRADED: no chunk of the machine's sound yet`.
+
+### Step 2: where a voice comes from, the scene (`scene.py`)
+
+**Why.** "Person or device" was the wrong question for an ambient ear. A person who is there
+tells four kinds of voice apart, because they answer them differently: someone **in the room**
+(listen, answer), someone **reached through a device** (a meeting, a call: a person too),
+something **recorded** (a video, a podcast: context, nobody to ask), and **π itself** (never
+someone else). Each voice gets P(room, remote, media, self), on every decision (`scene`,
+`scene_p`), every text, and in `ctl status`.
+
+**What is a fact, and what is learned.** Nothing is written by hand; three things are facts:
+
+* *through this machine*: a voice on the machine's channel was played by it. Its microphone
+  windows count for the room only by the share of their energy the canceller did not explain
+  (`1 - echo`). A Beta with one pseudo-window each way: P(machine) = (M + 1) / (M + room + 2).
+* *through another loudspeaker* (a phone, a television): the voice's long-term spectrum, the
+  existing `source.py` model, as evidence.
+* *π itself*: the machine windows π's mouth played (`contract.MOUTH_APP`): the sound server
+  names the application.
+
+**Remote or media: the turns.** Among the voices that come out of a device, the one thing that
+separates a call from a video, whatever the application, is that **a conversation waits for
+the room, a recording does not**. So the ear counts, over the seconds it heard: k1 of the n1
+seconds the voice spoke had the room speaking too; k2 of the n2 seconds without it. Two
+accounts of these four counts, with no parameter:
+
+* *media*: the room speaks at one rate whatever the voice does, p1 = p2 ~ U(0, 1);
+* *conversation*: the room speaks less over the voice than in its silences, p1 ~ U(0, 1),
+  p2 ~ U(p1, 1) (so p1 has the same prior in both, and only the comparison counts).
+
+The log of their ratio (the Bayes factor, one integral, `conversation_evidence`) is added to
+the application's prior log-odds. Its intuition, on the timelines of `tests/test_scene.py`:
+
+| what the counts show | evidence (nats) | then P(remote), P(media) |
+|---|---|---|
+| a meeting: 4 s each, the room answers in the voice's silences only | +41.8 | 0.99, 0.00 |
+| a video with pauses, the room talks whenever it wants (40 % of seconds) | -1.4 | 0.19, 0.80 |
+| a video that never pauses: no silence of it to compare with | **0, exactly** | 0.50, 0.50 |
+| a voice that pauses, and nobody ever takes the turn | -4.1 | 0.02, 0.98 |
+
+The third row is the third law at work: with nothing to compare, the evidence is not small,
+it is none, and the two stay as likely. The fourth: a conversation would have the room speak
+in the voice's silences; a voice nobody ever answers is better told as a recording.
+
+**The first form, refused by its own test.** p1 was compared with a plug-in rate for the room,
+½ before the voice had ever been silent: a video that never paused, talked over by the room
+40 % of the time, came out a conversation (40 % < 50 %). The plug-in was a number set by hand
+in disguise; the two-hypothesis form has none.
+
+**Who spoke in the room, for the turns.** Not one window's echo share: a person talking over a
+loud video is half the machine's energy, and still the room speaking (the end-to-end scene
+lost the person's seconds that way). A voice of the microphone speaks in the room unless it is
+shown to come out of a device, by its windows (this machine) or its spectrum (another
+loudspeaker: the video heard through the air, which first counted as the room answering).
+And a window marks every second it covers, not only its middle (half the seconds were lost).
+
+**What an application plays** is learned from KπX's corrections (`room`, `remote`, `media`,
+`self` on the port): told once that a voice of `Meet` is a person, the next voice out of `Meet`
+starts as one, before any turn; another application learns nothing from it. Before any
+correction, an application is as likely a call as a video: no list of names.
+
+**End to end** (`tests/test_output.py`, synthetic scenes, the whole ear, one run each):
+
+| scene | the device's voice | the room's person |
+|---|---|---|
+| the browser plays a podcast, the person speaks partly over it | media 0.69, remote 0.11 | room |
+| a call: a voice out of `Meet` asks, the person answers, five times | remote 0.70 | room 0.81 |
+
+The remaining mass of the device's voice (room 0.2-0.29) is the microphone's copies of it from
+before the canceller learned the offset: real evidence the cluster mixes, honestly kept.
+
+**The machine heard twice, now said.** A microphone piece whose words are found, in order and
+more than not, in what the machine's channel wrote at that time is marked `echo_of` those
+pieces, never asked about; and since the microphone's recogniser can be first, a machine
+reading that arrives later revises the microphone pieces it explains. In the podcast scene,
+every microphone text from before the canceller converged is now marked.
+
+**What it changes.** Questions and the slow pass's priority go by "a person" (room or remote),
+not by "not a loudspeaker": a colleague in a call is asked about, a video is not. A tie (the
+video that never pauses) is a coin, off ½ only by the one pseudo-window of the prior: whether
+to ask then is a matter of the value of the answer, step 3.
+
+### Step 3: second thoughts (`revise.py`)
+
+**Why.** KπX: a human "lives in the present, has a first idea, then a second, and adjusts
+with time". The ear's model of who already changes its mind on its own (two clusters fuse
+when one voice explains them better, a candidate becomes a speaker, a correction moves
+windows), but what it had written stayed written: the first window of every voice said
+`unknown` forever, though a second later the model knew whose it was.
+
+**What it is.** Every window the session published is kept with what was said of it. At
+each silence (a run closes), after a correction, after an undo, the ear asks its model again,
+for each, what it would say now:
+
+* a learned window: where the model has put it now (its cluster's voice);
+* a window never learned from (a shadow, a glimpse, a forgotten candidate): its best
+  explanation under the model as it is, scored **without learning**. Only the clusters that
+  changed since the last time (and "a new voice") are scored again against the one it was
+  given: the others are where they were. Measured on a synthetic stream of six voices, half
+  of the windows unlearned: 3000 windows thought over in about 60 ms, linear in the windows;
+  a two-hour session (some 7200) in a fraction of a second per silence;
+* a window heard in another place than the model is in (the machine's channel while the room
+  speaks) is not scored again: a new voice's prior is centred on the place, and changing
+  place resets what the place knows.
+
+Where the answer changed, a `revision` is published (port 5), with why: `merged` (its voice
+is now part of another), `corrected` (a correction named it), `learned` (more evidence). The
+run's turns are written again (`revision` counts), the pieces it is in are given their voice
+now and their texts decided again under it (that voice's language, its vocabulary), and the
+scene follows the fusions (one voice, one body of evidence). A revision tells the model
+nothing: it is the model's own state, read back, so it cannot feed itself. The invariant,
+tested end to end on the podcast scene: **what the ear says last of every window is what its
+model says now.**
+
+**The question worth asking.** "Are these two voices one?" is worth KπX's attention only if
+the answer is expected to change something. If B (n windows) were said to be A, all of B's
+windows would change hands; the model's own P that B's main condition belongs to A, against
+staying where it is, makes the expected change min(P, 1 - P) n. It is asked when that is at
+least one window's worth (the less likely answer at least 1/n probable), the most valuable
+pair first, one question open at a time, never while a person speaks, never twice for a pair
+(the pairs asked are kept with the memory). The answer is `same` or `different`, which is the
+correction it asked for; anything else is refused, visibly.
+
+**What it measured about itself, honestly.** On voices drawn with CAM++'s measured
+geometry, the model is almost never in that doubt: between "one voice" and "two", its link
+evidence jumps from a fusion (the clusters merge) to tens of nats apart (27 nats with two
+windows of the second voice, 60 with three, `tests/test_revise.py`). So it asks nothing there,
+and should not. Where it will ask is where its evidence really is thin: a voice of few windows
+heard through two very different channels. Whether its nats are as sure as they say (the per
+window margins are calibrated by corrections, Q1; the voice links are not yet) is the open
+question: each answer to a `same` question is exactly the label that would calibrate them.
+
+**Not yet.** A piece whose voice changed is decided again from its readings; it is not
+re-read by the recognisers in its voice's language (its audio is gone once read by both):
+re-reading from the corpus is step 5's. The windows of earlier sessions are not thought over
+again (their record is closed; their voices are, through the model).
+
+### Step 4: two voices at once (`overlap.py`)
+
+**Why.** At a table, in a meeting, people talk over each other all the time. CAM++ turns a
+window into the direction of *a* voice; two voices at once give a direction between theirs.
+Decided, it is the louder one at best. Learned, it drags a voice towards the other, and the
+merge invariant can then fuse two people into one.
+
+**How much it costs the ear, measured first** (lab `ov_e2e`: four Piper voices, two French
+and two English, sixty turns in one simulated room, half of the turns cut into the previous
+one by 0.4-1.2 s; truth of who spoke when by Silero on each clean voice):
+
+| scene | voices found (truth: 4) | purity of the windows of one voice |
+|---|---|---|
+| nobody cuts in | 3 to 6 | 0.70 to 0.78 |
+| half of the turns cut in | 2 to 3 | 0.48 to 0.56 |
+
+Half of all windows then hold two voices, and the ear learned from 33 to 34 of them per scene.
+
+**The sensor.** pyannote segmentation-3.0 (Plaquet & Bredin 2023), the sherpa-onnx int8
+export: ten seconds in, the posterior of nobody / one of three local speakers / two of them
+at once for each 17 ms frame (frames seen by several passes: their mean); one pass per second
+of speech at most, given the speech run the window is in, the frames kept between windows. Cost, measured: 2 minutes of conversation heard
+in 8.4 s instead of 5.2 s on one thread, under 3 % of real time.
+
+**What it decides, nothing more.** A window *more a mix than one voice* (more of its
+speech heard as two voices at once than as one voice alone, by the segmenter's expected
+frames of each) is decided (who is the louder?) and never learned, like a shadow; every
+decision says its `overlap`, that share (port 5).
+
+**The rule, chosen by two measurements that pull apart.** The first rule called a window a
+mix when its most probably overlapped *frame* was more probably overlapped than not. On the
+scenes above it helped:
+
+| scene | windows learned although mixed | clean windows lost | voices found | purity |
+|---|---|---|---|---|
+| 1 | 34 -> 29 | 10 | 3 -> 3 | 0.48 -> 0.53 |
+| 2 | 33 -> 19 | 3 | 2 -> **4** | 0.56 -> 0.58 |
+| 3 | 34 -> 16 | 0 | 2 -> 2 | 0.53 -> 0.58 |
+
+But in one of the twelve rooms where nobody speaks over anybody (`tests/test_real.py`, room
+3), it called twelve windows of FSDD's voices mixes, single frames of their telephone-band
+digits heard as two voices, and one of them came out three voices. A call's voice is
+telephone-band too: a gate that splits callers is worse than none. The share rule keeps room
+3 whole; on the scenes above it catches only the long overlaps (4 to 6 windows), and purity
+stays as without it (0.46 against 0.48 on scene 1, equal on the others). On real speech (the
+pyannote sample, its RTTM) the share is 0.14 on average where two people speak at once and
+0.03 where one does, and no clean window is a mix; its overlaps last a third of a window at
+most, so none is either (`tests/test_overlap.py`). The gate kept is the safe one: it never
+learns a window that is more a mix than a voice, and short overlaps are learned as the
+louder voice. A segmenter that tells telephone-band speech from two voices is what the
+first rule needs.
+
+**The context it is given, a bug found by the podcast scene.** The segmenter first heard the
+ten seconds before each window, whatever they were. After the machine's podcast, those ten
+seconds reached back over a stretch the echo canceller had worked on, and the person who
+spoke alone after it came out a mix (0.62 to 0.90; on the raw microphone 0.03): never
+learned, the person's room evidence fell and the scene called them media. The segmenter is
+now given the speech run the window is in, no more (the decision concerns that run, and its
+local speakers are a run's); the person is a person of the room again.
+
+**A calibration, tried and refused by its measurement.** The segmenter's posteriors carry the
+prior of the meetings it was trained on. The first build re-learned them: the base measured
+what its score looks like on one-voice and two-voice windows (mixes of the base's own voices
+through simulated places), and the stream learned how often its windows are mixes, by EM.
+Measured, the score separates the two with an AUC of 0.66 to 0.72 only
+(`public.measure_overlap`), and with evidence that weak the stream's estimate ran away: on two
+scenes of three it reached "every window is a mix", and the ear learned nothing at all. Weak
+evidence is used as what it is: the segmenter's own word, at its own prior. (FSDD's digits,
+recorded at 8 kHz, were first in the base's mixes: a 1.4 s overlap of a digit over a
+LibriSpeech voice scored as one voice; the base reader's Piper voices replaced them.)
+
+**Not yet: fragments.** Even with nobody cutting in, four people came out as three to six
+voices: synthetic voices of one engine, in one room, are close, and the model fuses or splits
+them by its own evidence. The repairs that exist are the merge invariant (fusion when one
+voice explains two clusters better), the revisions (step 3: what a fusion changes is said
+again) and the "same?" question when the model is in doubt. A segmenter's local speakers are
+another, independent sensor of "same voice" within ten seconds; using them as evidence for
+continuity needs their reliability measured first, and on this base it would be measured on
+the same weak separation. Left open, with these numbers.
+
+### Step 5: what was said, in the voice's language, and the room measured by itself
+
+**Why.** The live test's two failures of *what*: the fast recogniser (Parakeet v3, which
+cannot be told a language) wrote English or nothing for French television, and Whisper's own
+language detection on KπX's short phrases was wrong more often than right. Four things were
+tried; two are in, two were refused by their measurement.
+
+**1. A voice's language over all it said (`lid.py`), in.** Lab `slid`, the live recording,
+Whisper base's language identification on the speech of a segment cut in stretches:
+
+| voice | 4 s stretches right | 8 s | 30 s |
+|---|---|---|---|
+| KπX, over the television | 27 of 40 (0.68) | 21 of 24 (0.88) | 6 of 6 |
+| the player interviewed | 29 of 30 | 15 of 15 | 4 of 4 |
+| the studio | 39 of 40 | 40 of 40 | 22 of 22 |
+
+So each voice's own pieces (pieces of one voice only) are pooled until they fill Whisper's
+30 s window, and detected once: 0.6 to 0.85 s of two threads per 30 s of the voice
+(measured while other jobs shared the machine), about 2 to 3 % of its time. It is one
+more detector of `language.py` (`pooled`), its reliability measured on the base like the
+others' (`public.measure_pooled`: the base reader's voices, three regimes, 2 to 16 s; 60
+detections, all right, so with Laplace's two pseudo-detections it starts near-reliable), then
+judged on the stream against what its voice turned out to speak. Whisper turbo's export does
+not serve language identification (128 mel bands: every call came back empty).
+
+**2. A fast recogniser told the language, a slot, off.** Once a voice's language is a better
+bet than detecting it (the rule the slow recogniser already follows), a recogniser that can be
+told it reads the piece (`PI_EAR_FAST_TOLD`; its fast text is then not counted as a detection
+of its language: it says what it was told). Measured on the live recording (lab `fast_bench`,
+the share of Whisper-turbo-told-French's words found):
+
+| segment | Parakeet v3 | Canary 180m told French | Canary told English |
+|---|---|---|---|
+| the player | 0.12 | **0.52** | 0.05 |
+| the interview | 0.16 | 0.03 | 0.03 |
+| KπX | 0.29 | 0.16 | 0.03 |
+
+Canary 180m wins once and loses twice: it often writes nothing (sherpa-onnx's own warning,
+its first token is end of text, issue #3919). The larger multilingual models (Canary 1B v2,
+Qwen3-ASR) were not found among sherpa-onnx's published archives. The slot is there,
+tested, and off.
+
+**3. A reading fused word by word, refused.** Taking, where the two recognisers disagree,
+the word the word model trusts more (lab `fuse_bench`: Piper test voices, French and
+English, a room and a loudspeaker, 356 words): fast alone 9.0 % of words wrong, slow alone
+11.0 %, fused 10.7 %, the better of the two per sentence 6.2 %. The word model was fitted to
+say how much a word of the chosen reading deserves trust, not to choose between two words; it
+does not know enough to, and the fused reading is not added.
+
+**4. The room, measured by the stream (`scribe._measure`), in.** Step 2 already marks a
+microphone piece that heard what the machine played through the air (`echo_of`). The
+machine's own channel read that same sound clean: once the microphone piece is read, the
+stretch of the machine's words it heard is its truth. Each recogniser's recall of it is
+summed into `room_recall` (`ctl status`: how each reads, *in this room*, what a loudspeaker
+plays here), a `measure` is published (port 5), and the reader learns the piece as it would a
+correction (kept in `taught.jsonl`, never undone by an undo since no correction made it).
+Truth from the stream, nobody asked: law one. Tested end to end on the podcast scene.

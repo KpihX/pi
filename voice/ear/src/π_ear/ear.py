@@ -1,11 +1,22 @@
 """The ear server: one loop, live, with its memory on disk. Who, and what.
 
-    chunks -> Sensor (VAD, CAM++, spectrum) -> Model (who: voice, condition, doubt)
-                                             -> Source (person or device)
+    mic chunks ----> Echo (the machine taken out) --+
+    machine chunks (what this machine plays) -------+-> a Channel each: Sensor (VAD,
+                                                       CAM++, spectrum) -> Model (who:
+                                                       voice, condition, doubt) ->
+                                                       Source (person or device)
            -> Scribe thread (what: fast reading while it is said, slow revision
               in the silences, the reader's decision and its named doubt)
     record  <- decisions, turns, partial and revised texts, questions, corrections
     inbox   -> corrections and answers, from a person, a command or a voice
+
+Two channels, one model of who: the microphone hears the room; the machine's own
+output (``contract.OUTPUT``, ``make rec-out``) is what this machine plays, exactly,
+before it reaches the air. It is read as a channel of its own (its voices are the
+machine's, by construction, with the application that played them, ``device.py``)
+and taken out of the microphone (``echo.py``), so the room is heard over it. With
+the output off, or its recorder not running, the microphone alone is the ear, as
+before.
 
 Two places on disk, on purpose:
 
@@ -31,28 +42,60 @@ from pathlib import Path
 
 import numpy as np
 
-from π_ear import asr, contract
+from π_ear import asr, contract, echo, lid, overlap
+from π_ear.device import Apps
 from π_ear.io import (
     Corpus,
     EmbeddingStore,
     Tailer,
     append_jsonl,
     archive,
+    chunk_index,
     read_json,
     read_jsonl,
     stamp,
     utc_now,
     write_atomic,
 )
+from π_ear.lid import Pooled
 from π_ear.model import Model, Weights
+from π_ear.overlap import Overlap
 from π_ear.port import PORT
+from π_ear.revise import Second, resolve
+from π_ear.scene import KINDS as SCENES
+from π_ear.scene import Scene
 from π_ear.scribe import Scribe, rebuild_reader
 from π_ear.sense import BANDS, Sensor, Separator, rms_dbfs, spectrum
 from π_ear.source import Source
 from π_ear.words import Reader
 
 VOICED = ("known", "new")
-WHO = ("same", "different", "not_voice", "name", "person", "device")
+WHO = ("same", "different", "not_voice", "name", "person", "device", *SCENES)
+# what a scene correction also says of the voice's spectrum (source.py)
+SOURCE_OF_SCENE = {"room": "person", "remote": "device", "media": "device", "self": "device"}
+MIC, MACHINE = "mic", "machine"
+
+
+@dataclass
+class Channel:
+    """One stream the ear hears: the microphone (the room), or what the machine plays.
+    Each has its sensor, its speech runs and its floor; both feed one model of who."""
+
+    name: str
+    tailer: Tailer
+    sensor: Sensor
+    corpus: Corpus
+    runs: dict = field(default_factory=dict)
+    floor: dict = field(default_factory=lambda: {"power": 0.0, "chunks": 0})
+    first: int | None = None  # the second of its first chunk, on the shared clock
+    last: int | None = None  # the second of its last chunk
+    overlap: Overlap | None = None  # two voices at once (overlap.py), if its sensor is there
+
+    def floor_dbfs(self) -> float | None:
+        if not self.floor["chunks"]:
+            return None
+        power = max(self.floor["power"] / self.floor["chunks"], 1e-24)
+        return round(10 * math.log10(power), 1)
 
 
 @dataclass(slots=True)
@@ -61,6 +104,7 @@ class Places:
     memory: Path = contract.MEMORY
     models: Path = contract.MODELS
     audio: Path | None = None
+    output: Path | None = None  # the machine's own sound; None: root/out
     corpus: Path | None = contract.CORPUS
     corpus_max_chunks: int = contract.CORPUS_MAX_CHUNKS
     weights: Path = field(default_factory=lambda: base_weights_path(contract.ENCODER))
@@ -71,6 +115,12 @@ class Places:
     @property
     def audio_dir(self) -> Path:
         return Path(self.audio) if self.audio else self.root / "audio"
+
+    @property
+    def output_dir(self) -> Path:
+        return Path(self.output) if self.output else self.root / "out"
+
+    apps = property(lambda self: self.root / "apps.jsonl")
 
     state = property(lambda self: self.root / "state.json")
     events = property(lambda self: self.root / "events.jsonl")
@@ -84,7 +134,7 @@ class Places:
     corrections = property(lambda self: self.memory / "corrections.jsonl")
 
     def ensure(self) -> None:
-        for path in (self.root, self.audio_dir, self.memory):
+        for path in (self.root, self.audio_dir, self.output_dir, self.memory):
             path.mkdir(parents=True, exist_ok=True)
 
     def learned(self) -> tuple[Path, ...]:
@@ -121,13 +171,14 @@ class Ear:
         self.places = places
         self.live = live
         self.lock = threading.RLock()
-        self.sensor = Sensor(places.models)
         self.want_text = asr is not False
-        self.corpus = Corpus(places.corpus if live else None, places.corpus_max_chunks)
+        self.output = contract.OUTPUT == "on"
         self.session = stamp()
         self.started = time.monotonic()
         self.origin = time.time()  # the wall time of stream second 0 of this session
         self.paused = False
+        self.draining = False
+        self.origin_second: int | None = None  # the chunk second stream time 0 is
         self.now: dict = {}
         self.echo = None
         self._load(from_start)
@@ -136,6 +187,7 @@ class Ear:
         # oldest voice keeps its name" would pick the wrong one.
         self.origin = max(self.origin, self.model.now)
         self._retire_foreign_record()
+        self.started = time.monotonic()  # the ear's clock starts when it is ready to hear
 
     # -- memory ------------------------------------------------------------------
     def _load(self, from_start: bool) -> None:
@@ -152,18 +204,28 @@ class Ear:
         self.counters = saved.get("counters", {})
         self._align_spectra()
         self.seen: dict[str, str] = saved.get("seen", {})  # voice -> the session it was first heard
+        self.channels = {MIC: self._channel(MIC, self.places.audio_dir, from_start)}
+        if self.output:
+            self.channels[MACHINE] = self._channel(MACHINE, self.places.output_dir, from_start)
+        self.canceller = echo.Echo() if self.output and echo.available() else None
+        self.apps = Apps(self.places.apps)
+        self.waiting: list = []  # microphone chunks waiting for the machine's (echo.covers)
+        self.machine_waiting: list = []  # the machine's chunks, merged in by their second
+        self.share: list[
+            tuple[int, np.ndarray]
+        ] = []  # (first sample, the machine's share per frame)
         self.asked: set[str] = set()
         self.source = self._rebuild_source()
+        self.scene = Scene()
+        self.scene.load(saved.get("scene", {}))
+        # second thoughts (revise.py): what this session said, again when the model knows better
+        self.second = Second(asked={frozenset(p) for p in saved.get("asked_same", [])})
+        self.closed: dict[str, dict] = {}  # this session's closed runs: their turns, revisable
+        self.run_of: dict[int, str] = {}  # row -> the closed run it is in
+        self.settled = True  # nothing to think again about
         self.reader = Reader(self.model.base.reader)
         if "reader" in saved:
             self.reader.load(saved["reader"])
-        self.tailer = Tailer(
-            self.places.audio_dir,
-            contract.chunk_bytes() if self.live else 0,
-            from_start=from_start,
-        )
-        self.runs: dict[int, dict] = {}
-        self.floor = {"power": 0.0, "chunks": 0}
         self.opened = False
         self.scribe = None
         if self.want_text:
@@ -185,6 +247,12 @@ class Ear:
                     self.places.models,
                     source_of=self.source_of,
                     floor_s=self.sensor.min_speech_s,
+                    person_of=self.person_of,
+                    scene_of=self.scene_of,
+                    told=asr.build(contract.FAST_TOLD, self.places.models),
+                    pooled=Pooled(self.places.models)
+                    if lid.available(self.places.models)
+                    else None,
                 )
 
     def _save(self) -> None:
@@ -202,6 +270,8 @@ class Ear:
                 "weights": self.model.base.source,
                 "model": self.model.to_dict(),
                 "reader": self.reader.to_dict(),
+                "scene": self.scene.to_dict(),
+                "asked_same": [sorted(p) for p in self.second.asked],
             },
         )
 
@@ -253,28 +323,129 @@ class Ear:
             time.sleep(contract.IDLE_SLEEP_S)
         self.persist()
 
+    def _channel(self, name: str, directory: Path, from_start: bool) -> Channel:
+        corpus = None
+        if self.live and self.places.corpus is not None:
+            corpus = self.places.corpus if name == MIC else self.places.corpus / "out"
+        return Channel(
+            name,
+            Tailer(directory, contract.chunk_bytes() if self.live else 0, from_start=from_start),
+            Sensor(self.places.models),
+            Corpus(corpus, self.places.corpus_max_chunks),
+            overlap=Overlap(self.places.models) if overlap.available(self.places.models) else None,
+        )
+
+    # the microphone channel, under the names the rest of the ear (and its tests) know
+    mic = property(lambda self: self.channels[MIC])
+    sensor = property(lambda self: self.mic.sensor)
+    tailer = property(lambda self: self.mic.tailer)
+    runs = property(lambda self: self.mic.runs)
+    corpus = property(lambda self: self.mic.corpus)
+
     def tick(self) -> bool:
         worked = self._apply_corrections()
-        for chunk in self.tailer.poll():
+        machine = self.channels.get(MACHINE)
+        for channel, queue in ((self.mic, self.waiting), (machine, self.machine_waiting)):
+            if channel is None:
+                continue
+            for chunk in channel.tailer.poll():
+                channel.corpus.keep(chunk)  # now: a waiting chunk's file may be pruned
+                queue.append(chunk)
+        # The two streams, merged in the order of their seconds: the machine's chunk k
+        # goes first while it is not further ahead of the microphone than an offset
+        # can reach, so that the canceller holds the machine's sound each microphone
+        # chunk may hear, however the chunks arrive (one by one live, all at once in a
+        # replay).
+        reach = int(np.ceil(contract.ECHO_MOST_LAG_S / contract.CHUNK_S))
+        while self.waiting or self.machine_waiting:
+            head = chunk_index(self.waiting[0].name) if self.waiting else None
+            if self.machine_waiting and (
+                head is None or chunk_index(self.machine_waiting[0].name) <= head + reach
+            ):
+                chunk = self.machine_waiting.pop(0)
+                if self.canceller is not None:
+                    self.canceller.push_ref(chunk_index(chunk.name), chunk.samples)
+                self._feed(machine, chunk, chunk.samples)
+            elif self.waiting and self._mic_ready(self.waiting[0]):
+                chunk = self.waiting.pop(0)
+                samples = chunk.samples
+                if self.canceller is not None and machine is not None and machine.tailer.seen:
+                    samples, share = self.canceller.cancel(chunk_index(chunk.name), samples)
+                    self._remember_share(chunk, share)
+                self._feed(self.mic, chunk, samples)
+            else:
+                break
             worked = True
-            self._open(chunk.name)
-            self.corpus.keep(chunk)
-            self._bump("chunks")
-            pieces, runs = self.sensor.feed(chunk.samples)
-            if not pieces and not runs and not self.sensor.speaking():
-                self.floor["power"] += float(np.mean(np.square(chunk.samples)))
-                self.floor["chunks"] += 1
-            self._handle(pieces, runs)
-            self._hear()
+        if not self.settled:
+            self.reconsider()
         if self.scribe:
-            self.scribe.set_speaking(self.sensor.speaking(), self._person_speaking())
+            speaking = any(c.sensor.speaking() for c in self.channels.values())
+            self.scribe.set_speaking(speaking, self._person_speaking())
         if worked and self.live:
-            self.tailer.prune()
+            for channel in self.channels.values():
+                channel.tailer.prune()
         return worked
 
+    def _mic_ready(self, chunk) -> bool:
+        """A microphone chunk is read once the machine's sound it may hear is there,
+        or once the next microphone chunk exists (the machine's recorder is late, or
+        stopped: never more than a chunk of delay), or when the stream is frozen."""
+        machine = self.channels.get(MACHINE)
+        if self.canceller is None or machine is None or not machine.tailer.seen:
+            return True
+        return (
+            self.canceller.covers(chunk_index(chunk.name)) or len(self.waiting) > 1 or self.draining
+        )
+
+    def _feed(self, channel: Channel, chunk, samples: np.ndarray) -> None:
+        self._open(chunk.name)
+        self._bump("chunks" if channel.name == MIC else "machine_chunks")
+        second = chunk_index(chunk.name)
+        if channel.first is None:
+            channel.first = second
+            channel.sensor.offset = self._sample_of(second)
+        elif channel.last is not None and second > channel.last + 1:
+            # a hole in this stream (its recorder stopped, then resumed): its clock
+            # keeps the hole, so its times stay the other channel's times
+            gap = second - channel.last - 1
+            silence = np.zeros(gap * contract.RATE * contract.CHUNK_S, dtype=np.float32)
+            self._handle(channel, *channel.sensor.feed(silence))
+        channel.last = second
+        pieces, runs = channel.sensor.feed(samples)
+        if not pieces and not runs and not channel.sensor.speaking():
+            channel.floor["power"] += float(np.mean(np.square(samples)))
+            channel.floor["chunks"] += 1
+        self._handle(channel, pieces, runs)
+        self._hear(channel)
+
+    def _sample_of(self, second: int) -> int:
+        """The stream sample a chunk second starts at: the first second heard is 0."""
+        if self.origin_second is None:
+            self.origin_second = second
+        return (second - self.origin_second) * contract.RATE * contract.CHUNK_S
+
+    def _remember_share(self, chunk, share: np.ndarray) -> None:
+        self.share.append((self._sample_of(chunk_index(chunk.name)), share))
+        del self.share[: max(0, len(self.share) - contract.SHARE_KEEP_CHUNKS)]
+
+    def machine_share(self, a: int, b: int) -> float | None:
+        """The machine's share of the microphone's energy over stream samples [a, b)."""
+        values = []
+        for first, share in self.share:
+            lo = max(0, (a - first) // contract.ECHO_FRAME)
+            hi = min(len(share), -(-(b - first) // contract.ECHO_FRAME))
+            if hi > lo:
+                values.append(share[lo:hi])
+        return float(np.mean(np.concatenate(values))) if values else None
+
     def finish(self) -> None:
-        """End of a frozen stream: close the run in progress, wait for its text."""
-        self._handle(*self.sensor.flush())
+        """End of a frozen stream: close the runs in progress, wait for their text."""
+        self.draining = True
+        self.tick()
+        for channel in self.channels.values():
+            self._handle(channel, *channel.sensor.flush())
+        self.scene.settle(max(self.scene.seconds, default=0) + 1)  # nothing more will come
+        self.reconsider()
         if self.scribe:
             self.scribe.drain()
         self.persist()
@@ -282,29 +453,31 @@ class Ear:
     def clock(self) -> float:
         return time.monotonic() - self.started
 
-    def stream_s(self, sample: int) -> float:
-        return round(sample / contract.RATE, 3)
+    def stream_s(self, sample: int, channel: Channel | None = None) -> float:
+        """Stream seconds on the shared clock: a channel's sample, past its offset."""
+        offset = (channel or self.mic).sensor.offset
+        return round((offset + sample) / contract.RATE, 3)
 
-    def floor_dbfs(self) -> float | None:
-        if not self.floor["chunks"]:
-            return None
-        return round(10 * math.log10(max(self.floor["power"] / self.floor["chunks"], 1e-24)), 1)
+    def floor_dbfs(self, channel: Channel | None = None) -> float | None:
+        return (channel or self.mic).floor_dbfs()
 
-    def run_id(self, start: int) -> str:
-        return f"{self.session}:{self.stream_s(start)}"
+    def run_id(self, start: int, channel: Channel | None = None) -> str:
+        channel = channel or self.mic
+        mark = "" if channel.name == MIC else "m"
+        return f"{self.session}:{mark}{self.stream_s(start, channel)}"
 
     # -- one observation --------------------------------------------------------------
-    def _handle(self, pieces, runs) -> None:
+    def _handle(self, channel: Channel, pieces, runs) -> None:
         for piece in pieces:
-            self._observe(piece)
+            self._observe(channel, piece)
         for run in runs:
-            self._close(run)
+            self._close(channel, run)
 
-    def _observe(self, piece) -> None:
-        run = self.runs.setdefault(
+    def _observe(self, channel: Channel, piece) -> None:
+        run = channel.runs.setdefault(
             piece.run, {"rows": [], "learned": [], "decisions": [], "last": None}
         )
-        vec = self.sensor.embed(piece.samples)
+        vec = channel.sensor.embed(piece.samples)
         if not np.all(np.isfinite(vec)):
             # Measured 2026-10-19: run tails of 6 to 22 ms, shorter than one fbank
             # frame, came out of CAM++ as NaN and wrote "p": NaN into the record. A
@@ -314,13 +487,26 @@ class Ear:
         row = self.store.append(vec)
         x = self.store(row)  # the stored float32 vector: what a replay will see, bit for bit
         self.spectra.append(spectrum(piece.samples))
-        learn = piece.full and not piece.shadow
+        # two voices at once: decided (who is the louder?), never learned as one voice
+        mixed = (
+            channel.overlap.of(
+                channel.sensor._slice, piece.start, piece.start + len(piece.samples), piece.run
+            )
+            if channel.overlap is not None
+            else None
+        )
+        two = mixed is not None and 1 - mixed < mixed
+        learn = piece.full and not piece.shadow and not two
+        if two:
+            self._bump("overlapped")
         follows = run["last"] if learn else None
-        t = round(self.origin + piece.start / contract.RATE, 3)  # when it was said
-        decision = self.model.observe(row, x, t, learn, follows, self.session)
+        start = channel.sensor.offset + piece.start
+        t = round(self.origin + start / contract.RATE, 3)  # when it was said
+        place = self._place({"channel": channel.name})
+        decision = self.model.observe(row, x, t, learn, follows, place)
         append_jsonl(
             self.places.observations,
-            {"row": row, "t": t, "learn": learn, "follows": follows, "place": self.session},
+            {"row": row, "t": t, "learn": learn, "follows": follows, "place": place},
         )
         if learn:
             run["last"] = row
@@ -328,16 +514,41 @@ class Ear:
         run["rows"].append(row)
         self._bump(decision["kind"] if not piece.shadow else "shadow")
         level = round(rms_dbfs(piece.samples), 1)
-        floor = self.floor_dbfs()
+        floor = channel.floor_dbfs()
         source, source_p = (
             self.source_of(decision["speaker"]) if decision["kind"] in VOICED else (None, None)
         )
+        share = (
+            self.machine_share(start, start + len(piece.samples)) if channel.name == MIC else None
+        )
+        apps = None
+        if channel.name == MACHINE:
+            first = self.origin_second + start // contract.RATE
+            apps = self.apps.during(first, first + len(piece.samples) // contract.RATE)
+        scene = None
+        if decision["kind"] in VOICED and decision["speaker"]:
+            # the seconds the window covers the most of: shadows too, every second has a voice
+            first = round(start / contract.RATE)
+            last = max(round((start + len(piece.samples)) / contract.RATE), first + 1)
+            device = None if source is None else (source_p if source == "device" else 1 - source_p)
+            self.scene.heard(
+                decision["speaker"],
+                channel.name,
+                range(first, last),
+                share,
+                apps,
+                learned=learn,
+                device=device,
+            )
+            self.scene.settle(first - self._turn_horizon())
+            scene = self.scene_of(decision["speaker"])
         event = {
             "row": row,
-            "t0": self.stream_s(piece.start),
-            "t1": self.stream_s(piece.start + len(piece.samples)),
-            "decided_at": self.stream_s(self.sensor.fed),
+            "t0": self.stream_s(piece.start, channel),
+            "t1": self.stream_s(piece.start + len(piece.samples), channel),
+            "decided_at": self.stream_s(channel.sensor.fed, channel),
             "utc": utc_now(),
+            "channel": channel.name,
             "kind": decision["kind"],
             "speaker": decision["speaker"],
             "condition": decision["condition"],
@@ -354,55 +565,71 @@ class Ear:
             "evidence": decision["evidence"],
             "learned": learn,
             "shadow": piece.shadow,
-            "run": self.stream_s(piece.run),
+            "run": self.stream_s(piece.run, channel),
             "rms_dbfs": level,
             "rel_db": None if floor is None else round(level - floor, 1),
+            "echo": None if share is None else round(share, 4),
+            "overlap": None if mixed is None else round(mixed, 4),
+            "apps": apps,
+            "scene": None if scene is None else max(scene, key=scene.get),
+            "scene_p": None if scene is None else round(max(scene.values()), 4),
         }
         run["decisions"].append(event)
+        self.second.keep(row, event)
         self._write(event)
         self.now = event
         self._ask_name(event)
         if self.echo and not piece.shadow:
             who = event["label"] or event["speaker"] or "-"
             self.echo(
-                f"[{event['t0']:8.2f}-{event['t1']:8.2f}] {event['kind']:8s} {who:18s} "
-                f"p={event['p']:.3f} margin={event['margin']:<8.1f} n={event['evidence']:<4d} "
-                f"row={row}"
+                f"[{event['t0']:8.2f}-{event['t1']:8.2f}] {channel.name[:3]} {event['kind']:8s} "
+                f"{who:18s} p={event['p']:.3f} margin={event['margin']:<8.1f} "
+                f"n={event['evidence']:<4d} row={row}"
                 + ("" if piece.full else "  (glimpse)")
                 + (f"  {source}" if source == "device" else "")
+                + (f"  {', '.join(apps)}" if apps else "")
             )
 
-    def _hear(self) -> None:
+    def _hear(self, channel: Channel) -> None:
         """The run in progress, handed to the scribe: it cuts and reads it as it grows."""
         if self.scribe is None:
             return
-        current = self.sensor.run_audio()
+        current = channel.sensor.run_audio()
         if current is None:
             return
         start, samples = current
-        decisions = self.runs.get(start, {}).get("decisions", [])
-        self.scribe.hear(self.run_id(start), self.stream_s(start), samples, decisions)
+        decisions = channel.runs.get(start, {}).get("decisions", [])
+        self.scribe.hear(
+            self.run_id(start, channel), self.stream_s(start, channel), samples, decisions
+        )
 
     def _person_speaking(self) -> bool:
-        """Is the voice of the run in progress a person (the scribe keeps free for them)?"""
-        current = self.sensor.run_audio()
+        """Is the voice of the room's run in progress a person (the scribe keeps free for them)?"""
+        current = self.mic.sensor.run_audio()
         if current is None:
             return False
-        decisions = self.runs.get(current[0], {}).get("decisions", [])
+        decisions = self.mic.runs.get(current[0], {}).get("decisions", [])
         voiced = [d["speaker"] for d in decisions if d["kind"] in VOICED]
-        return bool(voiced) and self.source_of(voiced[-1])[0] == "person"
+        return bool(voiced) and bool(self.person_of(voiced[-1]))
 
-    def _close(self, run) -> None:
+    def _close(self, channel: Channel, run) -> None:
         """A speech run ended: its turns, then its text, unless every window of it was
         a known sound. A voice not yet known is still read (its first sentence is
         a sentence); whether anything was said is the reader's to say, and it can
         say "I did not understand" (the empty reading, learned on ESC-50 sounds)."""
-        info = self.runs.pop(run.start, None)
+        info = channel.runs.pop(run.start, None)
         if not info or not info["rows"]:
             return
         decisions = info["decisions"]
-        self._turns(run, decisions)
-        identifier = self.run_id(run.start)
+        identifier = self.run_id(run.start, channel)
+        t0 = self.stream_s(run.start, channel)
+        t1 = self.stream_s(run.start + len(run.samples), channel)
+        self.closed[identifier] = {"channel": channel.name, "t0": t0, "t1": t1, "rev": 0}
+        self.closed[identifier]["decisions"] = decisions
+        for d in decisions:
+            self.run_of[d["row"]] = identifier
+        self._turns(identifier)
+        self.settled = False  # a silence: the time for second thoughts
         if all(d["kind"] == "noise" for d in decisions):
             self._bump("runs_of_sounds")
             if self.scribe:
@@ -411,14 +638,15 @@ class Ear:
         if self.scribe is None:
             return
         self._bump("runs_transcribed")
-        self.scribe.finish(identifier, self.stream_s(run.start), run.samples, decisions)
+        self.scribe.finish(identifier, self.stream_s(run.start, channel), run.samples, decisions)
 
-    def _turns(self, run, decisions: list[dict]) -> None:
+    def _turns(self, identifier: str) -> None:
         """Who spoke when, to the half window (Q4): each half window takes the voice of
-        the more confident of the two windows (learned and shadow) that cover it."""
+        the more confident of the two windows (learned and shadow) that cover it. Again
+        when a window of the run is revised (``revision``: how many times)."""
+        closed = self.closed[identifier]
+        t0, t1, decisions = closed["t0"], closed["t1"], closed["decisions"]
         half = contract.ENCODER_WINDOW_S / 2
-        t0 = self.stream_s(run.start)
-        t1 = self.stream_s(run.start + len(run.samples))
         slots = []
         start = t0
         while start < t1:
@@ -433,7 +661,96 @@ class Ear:
                     slots.append([round(start, 3), round(end, 3), who])
             start = end
         self._write(
-            {"kind": "turns", "run": self.run_id(run.start), "t0": t0, "t1": t1, "segments": slots}
+            {
+                "kind": "turns",
+                "run": identifier,
+                "channel": closed["channel"],
+                "t0": t0,
+                "t1": t1,
+                "segments": slots,
+                "revision": closed["rev"],
+            }
+        )
+
+    # -- second thoughts (revise.py) -----------------------------------------------------
+    def _place(self, event: dict) -> str:
+        """What the machine plays is heard in a place of its own: its channel is not the room's."""
+        return self.session if event["channel"] == MIC else f"{self.session}#{MACHINE}"
+
+    def reconsider(self) -> int:
+        """At a silence: every window this session published, decided again by the model
+        as it is now; what changed is published as a revision, its run's turns again,
+        its pieces' texts again (the scribe). Then the question most worth asking.
+        Returns how many windows changed hands."""
+        self.settled = True
+        changes = self.second.check(
+            self.model, self.store, lambda e: self._place(e) == self.model.place
+        )
+        runs: set[str] = set()
+        for row, was, now in changes:
+            event = self.second.said[row]
+            voice = self.model.voices.get(now["speaker"]) if now["speaker"] else None
+            scene = self.scene_of(now["speaker"]) if now["speaker"] else None
+            event.update(
+                kind=now["kind"],
+                speaker=now["speaker"],
+                label=voice.label if voice else None,
+                scene=None if scene is None else max(scene, key=scene.get),
+                scene_p=None if scene is None else round(max(scene.values()), 4),
+            )
+            self._bump("revisions")
+            self._write(
+                {
+                    "kind": "revision",
+                    "revises": row,  # the window's row (not "row": a decision has that)
+                    "run": self.run_of.get(row),
+                    "channel": event["channel"],
+                    "t0": event["t0"],
+                    "t1": event["t1"],
+                    "was": was,
+                    "now": {k: event[k] for k in ("kind", "speaker", "label", "scene")},
+                    "why": now["why"],
+                }
+            )
+            if row in self.run_of:
+                runs.add(self.run_of[row])
+        # the scene follows the model's fusions: one voice, one body of evidence
+        for key in list(self.scene.voices):
+            into = resolve(key, self.model.absorbed)
+            if into != key and into in self.model.voices:
+                self.scene.absorb(key, into)
+        for identifier in sorted(runs):
+            self.closed[identifier]["rev"] += 1
+            self._turns(identifier)
+        if changes and self.scribe:
+            self.scribe.revoice({row for row, _, _ in changes}, self.second.said.get)
+        self._ask_same()
+        return len(changes)
+
+    def _ask_same(self) -> None:
+        """Ask whether two voices are one, when an answer is expected to change at least
+        one decision (revise.py): one question open at a time, never over a person."""
+        if self.second.open is not None or self._person_speaking():
+            return
+        best = self.second.same_question(self.model, self.person_of)
+        if best is None:
+            return
+        a, b = best["speakers"]
+        self.second.asked.add(frozenset((a, b)))
+        self.second.open = f"{a}={b}#same#{self.session}"
+        self._write(
+            {
+                "kind": "question",
+                "id": self.second.open,
+                "about": "same",
+                "speaker": b,
+                "speakers": [a, b],
+                "rows": best["rows"],
+                "choices": ["same", "different"],
+                "doubt": "same_voice",
+                "p": round(best["p"], 4),
+                "value": round(best["value"], 2),
+            }
         )
 
     # -- where a voice comes from (Q3) ---------------------------------------------------
@@ -484,11 +801,44 @@ class Ear:
         shape = self.shape_of(self.voice_rows(key))
         return self.source.decide(shape) if shape is not None else (None, None)
 
+    def scene_of(self, key: str | None) -> dict[str, float] | None:
+        """P(room, remote, media, self) for a voice (scene.py), its spectrum as evidence."""
+        name, p = self.source_of(key)
+        device = None if name is None else (p if name == "device" else 1 - p)
+        return self.scene.of(key, device)
+
+    def person_of(self, key: str | None) -> bool | None:
+        """Is the voice more probably a person (here, or reached through a device)?"""
+        p = self.scene_of(key)
+        if p is None:
+            return None
+        people = p["room"] + p["remote"]
+        return people > 1 - people
+
+    @staticmethod
+    def _turn_horizon() -> int:
+        """Seconds after which no window can still join a second: a window and an offset."""
+        return int(math.ceil(contract.ENCODER_WINDOW_S + contract.ECHO_MOST_LAG_S))
+
+    def _rebuild_scene_told(self) -> None:
+        """What corrections said of where voices come from, replayed (after an undo)."""
+        self.scene.told.clear()
+        self.scene.app_told.clear()
+        lines, _ = read_jsonl(self.places.corrections)
+        for number, line in enumerate(lines, 1):
+            if line["kind"] in SCENES and number not in self.undone:
+                for key in self._voices_of(line.get("rows", [])):
+                    self.scene.tell(key, line["kind"])
+
+    def _voices_of(self, rows) -> list[str]:
+        return list(dict.fromkeys(v.key for v in (self.model.voice_of(int(r)) for r in rows) if v))
+
     def _rebuild_source(self) -> Source:
         source = Source(self.model.base.spectra)
         lines, _ = read_jsonl(self.places.corrections)
         for number, line in enumerate(lines, 1):
-            if line["kind"] in ("person", "device") and number not in self.undone:
+            spectral = SOURCE_OF_SCENE.get(line["kind"], line["kind"])
+            if spectral in ("person", "device") and number not in self.undone:
                 shape = self.shape_of(line.get("rows", []))
                 if shape is not None:
                     source.add(line["kind"], shape)
@@ -504,7 +854,7 @@ class Ear:
         voice = self.model.voices.get(key)
         if first == self.session or voice is None or voice.label or key in self.asked:
             return
-        if self.source_of(key)[0] != "person":  # a voice on television is nobody to ask
+        if not self.person_of(key):  # a recording, or π itself, is nobody to ask
             return
         self.asked.add(key)
         self._write(
@@ -544,11 +894,17 @@ class Ear:
                 if refused is None:
                     self.applied.append([number, len(self.store), "text"])
             elif kind in WHO:
-                if kind in ("person", "device"):
+                self.second.corrected |= set(rows)
+                self.settled = False  # what the correction moved is said again
+                spectral = SOURCE_OF_SCENE.get(kind, kind)
+                if spectral in ("person", "device"):
                     shape = self.shape_of(rows)
                     if shape is not None:
-                        self.source.add(kind, shape)
-                self.model.correct(kind, rows, line.get("label"))
+                        self.source.add(spectral, shape)
+                if kind in SCENES:
+                    for key in self._voices_of(rows):
+                        self.scene.tell(key, kind)
+                self.model.correct(spectral, rows, line.get("label"))
                 self.applied.append(
                     [number, len(self.store), kind, {"rows": rows, "label": line.get("label")}]
                 )
@@ -592,6 +948,15 @@ class Ear:
         )
         if asked is None:
             return "answer", [], line, f"no question {question!r} in this record"
+        if asked["about"] == "same":
+            said = line.get("text")
+            if said is None and line.get("choice") is not None:
+                said = asked["choices"][int(line["choice"])]
+            if said not in ("same", "different"):
+                return "answer", [], line, "an answer to a same question is same or different"
+            if self.second.open == question:
+                self.second.open = None
+            return said, asked["rows"], line, None
         if asked["about"] == "name":
             name = (line.get("label") or line.get("text") or "").strip()
             if not name:
@@ -629,6 +994,8 @@ class Ear:
                 return "this memory predates observations.jsonl: it cannot be replayed exactly"
             self.model = replayed
             self.source = self._rebuild_source()
+            self._rebuild_scene_told()
+            self.settled = False  # what it had moved is said again, as the rest now says
         self.applied = kept
         return None
 
@@ -671,6 +1038,7 @@ class Ear:
                 "last_chunk": self.tailer.cursor,
                 "floor_dbfs": self.floor_dbfs(),
             },
+            "output": self._output_state(),
             "corpus": self.corpus.stats(),
             "now": self.now,
             "model": {
@@ -681,6 +1049,7 @@ class Ear:
                     "id": v.key,
                     "label": v.label,
                     "source": dict(zip(("is", "p"), self.source_of(v.key), strict=True)),
+                    "scene": {k: round(p, 4) for k, p in (self.scene_of(v.key) or {}).items()},
                     "conditions": len(v.conditions),
                     "evidence": len(self.voice_rows(v.key)),
                     "first_seen_unix": v.first_seen or None,
@@ -719,6 +1088,26 @@ class Ear:
             "counters": self.counters,
         }
 
+    def _output_state(self) -> dict:
+        """What the ear knows of the machine's own sound, and why it may not be using it."""
+        machine = self.channels.get(MACHINE)
+        if machine is None:
+            return {"on": False}
+        state = {
+            "on": True,
+            "dir": str(self.places.output_dir),
+            "chunks_seen": machine.tailer.seen,
+            "last_chunk": machine.tailer.cursor,
+            "waiting_mic_chunks": len(self.waiting),
+        }
+        if not machine.tailer.seen:
+            state["degraded"] = "no chunk of the machine's sound yet: is `make rec-out` running?"
+        if self.canceller is None:
+            state["degraded"] = "no echo canceller (pyaec): the machine is read, not cancelled"
+        else:
+            state["echo"] = self.canceller.stats()
+        return state
+
     def _reset(self) -> None:
         """Forget everything learned: archived, never deleted."""
         if self.scribe:
@@ -730,7 +1119,6 @@ class Ear:
             *self.places.learned(),
         )
         self.places.reset.unlink(missing_ok=True)
-        self.sensor = Sensor(self.places.models)
         self._load(from_start=True)
 
 
@@ -748,10 +1136,12 @@ def rebuild(places: Places, applied: list[list]) -> Model | None:
 
     def apply(entry):
         if len(entry) > 3:  # as it was applied: an answer is the correction it resolved to
-            model.correct(entry[2], [int(r) for r in entry[3]["rows"]], entry[3]["label"])
+            kind = SOURCE_OF_SCENE.get(entry[2], entry[2])
+            model.correct(kind, [int(r) for r in entry[3]["rows"]], entry[3]["label"])
             return
         line = lines[entry[0] - 1]
-        model.correct(line["kind"], [int(r) for r in line["rows"]], line.get("label"))
+        kind = SOURCE_OF_SCENE.get(line["kind"], line["kind"])
+        model.correct(kind, [int(r) for r in line["rows"]], line.get("label"))
 
     for obs in observations:
         while pending and pending[0][1] <= obs["row"]:

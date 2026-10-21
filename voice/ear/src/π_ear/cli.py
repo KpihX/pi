@@ -1,6 +1,7 @@
 """The command line. Thin on purpose.
 
 π-ear run        the ear, live, following the recorder's directory
+π-ear apps       what the machine's applications play, second by second (beside `make rec-out`)
 π-ear ctl        pause | resume | reset | status
 π-ear correct    same | different | not_voice | name | person | device | text
 π-ear undo       one correction, forgotten exactly (what it taught is replayed without it)
@@ -63,6 +64,16 @@ def run(
     except KeyboardInterrupt:
         ear.persist()
         typer.echo("\nstopped, memory saved")
+
+
+@app.command()
+def apps(root: str = ROOT, seconds: float = typer.Option(None, help="stop after (default: never)")):
+    """Write, once a second, which applications play sound (``apps.jsonl``)."""
+    from π_ear.device import follow
+
+    places = _places(root)
+    places.ensure()
+    follow(places.apps, seconds=seconds)
 
 
 @app.command()
@@ -131,6 +142,15 @@ def ctl(action: Action, root: str = ROOT):
         typer.echo(
             f"floor    {state['audio'].get('floor_dbfs')} dBFS (this session's non-speech level)"
         )
+        output = state.get("output", {})
+        if output.get("on"):
+            line = f"output   machine chunks={output['chunks_seen']}"
+            if "echo" in output:
+                e = output["echo"]
+                line += f"  offset={e['lag_s']}s (agreed {e['agree']} times)  left={e['left']}"
+            typer.echo(line + (f"  DEGRADED: {output['degraded']}" if "degraded" in output else ""))
+        else:
+            typer.echo("output   off (the microphone alone: PI_EAR_OUTPUT=on to hear the machine)")
         reader = state.get("reader", {})
         if reader.get("fast"):
             typer.echo(
@@ -157,6 +177,10 @@ class Kind(enum.StrEnum):  # `undo` and `answer` have their own commands
     name = "name"
     person = "person"
     device = "device"
+    room = "room"
+    remote = "remote"
+    media = "media"
+    self = "self"
     text = "text"
 
 
@@ -191,6 +215,8 @@ def correct(
       π-ear correct not_voice --speaker KEY       that "voice" was never a voice
       π-ear correct name 812 --label KπX          call this voice KπX
       π-ear correct device --speaker KEY          that voice comes out of a loudspeaker
+      π-ear correct remote --speaker KEY          a person reached through a call
+      π-ear correct media --speaker KEY           a recording (a video, the radio)
       π-ear correct text --from 163 --to 170 --text "le cours de Galois"
     """
     places = _places(root, memory)

@@ -76,6 +76,18 @@ def load_raw(path: Path) -> np.ndarray:
     return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 
 
+def chunk_index(name: str) -> int:
+    """A chunk's second on the clock the recorders share: arecord names its chunks
+    ``%Y%m%d-%H%M%S``, so two recorders started apart still name one second alike.
+    A name that is not a time (a test's ``20261018-000042``) counts its digits."""
+    stem = Path(name).stem
+    try:
+        return int(datetime.strptime(stem, "%Y%m%d-%H%M%S").timestamp())
+    except ValueError:
+        digits = "".join(c for c in stem if c.isdigit())
+        return int(digits[-6:]) if digits else 0
+
+
 @dataclass(slots=True)
 class Chunk:
     name: str

@@ -434,6 +434,7 @@ def base_reader(data: Path, models: Path, rng) -> dict:
                         ]
                     )
                 k *= 2
+    out["languages"]["base"] += measure_pooled(models, np.random.default_rng(6))
     out["regime"] = means["clean"]
     out["confidence"] = confidence["clean"]
     out["regimes"] = {"speech": means, "confidence": confidence}
@@ -516,6 +517,13 @@ def synth(
     return out
 
 
+def chunk_name(index: int) -> str:
+    """The name arecord gives the chunk ``index`` seconds after 2026-10-18 00:00:00."""
+    from datetime import datetime, timedelta
+
+    return (datetime(2026, 10, 18) + timedelta(seconds=index)).strftime("%Y%m%d-%H%M%S.raw")
+
+
 @dataclass
 class Scene:
     """A simulated room: turns of speech and sounds over a noise floor, with its truth."""
@@ -554,9 +562,7 @@ class Scene:
         pcm = (np.clip(np.concatenate(self.audio), -1, 1) * 32767).astype("<i2")
         step = contract.RATE * contract.CHUNK_S
         for index, start in enumerate(range(0, len(pcm), step)):
-            (directory / f"20261018-{index:06d}.raw").write_bytes(
-                pcm[start : start + step].tobytes()
-            )
+            (directory / chunk_name(index)).write_bytes(pcm[start : start + step].tobytes())
         return directory
 
     def label_at(self, t0: float, t1: float) -> str:
@@ -635,3 +641,132 @@ def room(data: Path, seed: int, sounds: dict | None = None, varied: bool = True)
             scene.add(f"noise:{category}", x, gain_db=rng.uniform(-12, 0) if varied else -6.0)
             scene.silence(rng.uniform(0.3, 1.5))
     return scene, set(utterances)
+
+
+OVERLAP_VOICES = [100, 300, 600]  # the base reader's English voices, never a test's
+
+
+def measure_overlap(data: Path, models: Path, rng, scenes: int = 32) -> dict:
+    """How well the segmenter tells a window of two voices from a window of one, measured on
+    the base's own voices (``overlap.py``; it is not used by the ear, it says how much its
+    word is worth).
+
+    Each scene: one base voice speaks (a LibriSpeech base recording, or a Piper voice of the
+    base reader reading its sentences), a
+    second cuts in at a random moment for a random stretch, both through one simulated
+    place. Who spoke when is Silero's word on each clean voice. The mix is heard by the
+    segmenter as the ear hears it (ten seconds at most, frames kept), and every encoder
+    window (stepping a second) gets its score, the largest log-odds of P(overlap) among
+    its frames; it is a mix if both voices spoke at once in it for at least what one frame
+    of the segmenter sees. Returned: the mean and spread of the score per class, and the
+    AUC (the chance that a mix scores above a window of one voice) on one scene in four.
+    """
+    from π_ear.overlap import Segmenter, log_odds
+
+    segment = Segmenter(models)
+    tests = models / "sherpa-onnx-whisper-tiny" / "test_wavs"
+    voices = {
+        "libri1089": load(tests / "0.wav"),
+        "libri1221": load(tests / "1.wav"),
+        # the base reader's Piper voices (FSDD's digits, recorded at 8 kHz, were heard by
+        # the segmenter as hardly speech: measured, a 1.4 s overlap of a digit over a
+        # LibriSpeech voice scored as one voice)
+        **{
+            f"piper{k}": np.concatenate(clips)
+            for k, clips in synth(models, OVERLAP_VOICES, EN_BASE).items()
+        },
+    }
+    names = sorted(voices)
+    window = int(contract.ENCODER_WINDOW_S * contract.RATE)
+    scores: list[tuple[float, bool, int]] = []
+    for k in range(scenes):
+        a, b = rng.choice(len(names), 2, replace=False)
+        n = min(len(voices[names[a]]), segment.size)
+        x = voices[names[a]][:n]
+        y = voices[names[b]]
+        y = y[: rng.integers(contract.RATE // (1 + 1), max(len(y) // (1 + 1), contract.RATE))]
+        cut = int(rng.integers(0, max(n - len(y), 1)))
+        other = np.zeros(n, np.float32)
+        other[cut : cut + len(y)] = y[: n - cut]
+        here = place(rng)
+        mix = here(x) + here(other) * 10 ** (rng.uniform(-6, 6) / 20)
+        (first, block), (second, _) = (_speaking(models, v) for v in (x, other))
+        together = first[: len(second)] & second[: len(first)]  # both speaking, per frame
+        centres, raw = segment(mix.astype(np.float32))
+        z = log_odds(raw)
+        for start in range(0, n - window + 1, contract.RATE):
+            inside = (centres >= start) & (centres < start + window)
+            if not inside.any():
+                continue
+            # a mix: both spoke at once for at least what one frame of the sensor sees
+            both = bool(together[start // block : (start + window) // block].sum() * block)
+            both = (
+                both
+                and segment.field
+                <= together[start // block : (start + window) // block].sum() * block
+            )
+            scores.append((float(z[inside].max()), both, k))
+    held = np.array([s[2] for s in scores]) % 4 == 3
+    z = np.array([s[0] for s in scores])
+    mixed = np.array([s[1] for s in scores])
+    laws = {
+        name: {"mean": float(z[~held & want].mean()), "sd": float(z[~held & want].std())}
+        for name, want in (("one", ~mixed), ("two", mixed))
+    }
+    one, two = z[held & ~mixed], z[held & mixed]
+    auc = float(np.mean(two[:, None] > one[None, :])) if len(one) and len(two) else None
+    return {
+        **laws,
+        "windows": int((~held).sum()),
+        "mixed": int((~held & mixed).sum()),
+        "auc": auc,
+        "source": f"{contract.SEGMENTATION}; {scenes} two-voice scenes of the base voices "
+        f"({', '.join(names)}) through simulated places, truth by Silero on each clean voice",
+    }
+
+
+def _speaking(models: Path, x: np.ndarray) -> tuple[np.ndarray, int]:
+    """Silero's yes/no per frame at its published operating point, and its frame (samples)."""
+    import sherpa_onnx
+
+    from π_ear.sense import Silero
+
+    silero = Silero(models)
+    p = silero.feed(x.astype(np.float32))
+    return np.asarray(p) > sherpa_onnx.VadModelConfig().silero_vad.threshold, silero.block
+
+
+def measure_pooled(models: Path, rng) -> list[list]:
+    """How often the pooled detector (``lid.py``) is right, by the length it hears: the
+    base reader's voices, each in three regimes (clean, a room, a loudspeaker in a room),
+    one voice's sentences put one after another, doubling until Whisper's window is full.
+    Returns [seconds, right, "pooled"] per detection (the language base's own rows)."""
+    from π_ear import asr, lid
+
+    if not lid.available(models):
+        return []
+    detect = lid.identifier(models)
+    window = asr.WINDOW_S["whisper-base"]
+    rows = []
+    for language, sentences, speakers in (
+        ("en", EN_BASE, [100, 300, 600]),
+        ("fr", FR_BASE, [0, 1]),
+    ):
+        for clips in synth(models, speakers, sentences, language=language).values():
+            for regime in ("clean", "room", "tv"):
+                heard = [
+                    x
+                    if regime == "clean"
+                    else condition(x if regime == "room" else loudspeaker(x, rng), rng)
+                    for x in clips
+                ]
+                sizes, k = [], 1
+                while k < len(heard):
+                    sizes.append(k)
+                    k *= 1 + 1
+                for k in [*sizes, len(heard)]:  # and all it said
+                    x = np.concatenate(heard[:k])[: int(window * contract.RATE)]
+                    found = detect(x)
+                    if found:
+                        rows.append([len(x) / contract.RATE, float(found == language), lid.POOLED])
+    return rows

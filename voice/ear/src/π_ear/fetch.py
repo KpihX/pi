@@ -2,7 +2,9 @@
 
 Models (sherpa-onnx releases on GitHub, ~1.5 GB downloaded, ~1.3 GB kept):
 
-* Silero VAD and CAM++ (the sensors of *who*);
+* Silero VAD and CAM++ (the sensors of *who*), pyannote segmentation-3.0 (two voices
+  at once, ``overlap.py``), Whisper base (a voice's language over its pooled speech,
+  ``lid.py``);
 * Parakeet TDT 0.6b v3 (25 languages) and Whisper turbo (99 languages): the
   fast and the slow reader of *what* (``asr.py``); Whisper tiny is kept for the
   LibriSpeech test files of its archive;
@@ -53,6 +55,19 @@ ARCHIVES = {
     **(
         {contract.SEPARATOR: f"{RELEASES}/source-separation-models/{contract.SEPARATOR}.tar.bz2"}
         if contract.SEPARATOR != "none"
+        else {}
+    ),
+    **(
+        {contract.LID: f"{RELEASES}/asr-models/{contract.LID}.tar.bz2"}
+        if contract.LID != "none"
+        else {}
+    ),
+    **(
+        {
+            contract.SEGMENTATION: f"{RELEASES}/speaker-segmentation-models/"
+            f"{contract.SEGMENTATION}.tar.bz2"
+        }
+        if contract.SEGMENTATION != "none"
         else {}
     ),
     "vits-piper-en_US-libritts_r-medium": f"{RELEASES}/tts-models/vits-piper-en_US-libritts_r-medium.tar.bz2",

@@ -217,6 +217,47 @@ def test_a_voice_heard_again_unnamed_is_asked_for_its_name_once(tmp_path, voice,
     assert {e["label"] for e in events3 if e.get("kind") == "known"} == {"Alice"}
 
 
+def test_a_same_question_is_answered_by_a_same_or_a_different(tmp_path, voice, monkeypatch):
+    """Step 3: "are these two voices one?" is answered "same" or "different", and the
+    answer is the correction it asked for; the pair is never asked again (it is kept
+    with the memory), and an answer that is neither is refused, visibly."""
+    from π_ear.io import append_jsonl
+
+    _plug(monkeypatch, None)
+    ear, events = _day(tmp_path, "day1", voice)
+    rows = [e["row"] for e in events if "row" in e and e["learned"] and e["speaker"]]
+    asked = {
+        "port": port.PORT,
+        "session": ear.session,
+        "kind": "question",
+        "id": f"a=b#same#{ear.session}",
+        "about": "same",
+        "speaker": "b",
+        "speakers": ["a", "b"],
+        "rows": [rows[0], rows[-1]],
+        "choices": ["same", "different"],
+        "doubt": "same_voice",
+        "p": 0.4,
+        "value": 2.4,
+    }
+    append_jsonl(ear.places.events, asked)
+    ear.second.open, ear.second.asked = asked["id"], {frozenset("ab")}
+    inbox = port.Inbox(ear.places.memory)
+    inbox.answer(asked["id"], text="perhaps")
+    inbox.answer(asked["id"], choice=1)
+    ear.run(drain=True)
+    applied = [e for e in read_jsonl(ear.places.events)[0] if e.get("kind") == "correction"]
+    assert applied[-2]["refused"] and "same or different" in applied[-2]["refused"]
+    assert applied[-1]["what"] == "different" and applied[-1]["refused"] is None
+    assert ear.second.open is None
+    assert ear.model.voice_of(rows[0]) is None or ear.model.voice_of(rows[0]) != (
+        ear.model.voice_of(rows[-1])
+    )
+    ear.persist()
+    again = Ear(ear.places, from_start=False, live=False, asr=False)
+    assert again.second.asked == {frozenset("ab")}
+
+
 # -- the scribe alone: pieces, groups, priorities ------------------------------------------
 
 
@@ -423,3 +464,43 @@ def test_revisions_go_on_while_a_television_talks_without_a_pause(tmp_path, voic
     scribe.finish("long", 4.0, long, _decisions(40, ["tv"], 4.0))
     scribe.set_speaking(False)
     scribe.drain()
+
+
+def test_the_fast_reader_is_told_the_language_once_it_is_a_better_bet():
+    """Step 5: a fast recogniser that can be told the language reads a voice whose
+    language is known better than detecting it; another voice, or a language the model
+    does not know, goes to the fast one, as before."""
+    from types import SimpleNamespace
+
+    from π_ear import asr
+    from π_ear.scribe import Scribe
+
+    heard = []
+
+    def recogniser(name, takes):
+        def read(samples, language=None):
+            heard.append((name, language))
+            return Hypothesis(name, (), language, name)
+
+        if not takes:
+            return lambda samples: read(samples)
+        read.name = name
+        return read
+
+    told = recogniser("canary-180m", True)
+    told.name = "canary-180m"
+    languages = {"kpihx": "fr", "guest": None, "far": "ja"}
+    me = SimpleNamespace(
+        told=told,
+        fast=recogniser("parakeet-v3", False),
+        reader=SimpleNamespace(
+            languages=SimpleNamespace(choose=lambda voice, seconds: languages.get(voice))
+        ),
+    )
+    audio = np.zeros(contract.RATE, np.float32)
+    assert Scribe._read_fast(me, "kpihx", audio)[1] is True
+    assert Scribe._read_fast(me, "guest", audio)[1] is False
+    assert Scribe._read_fast(me, "far", audio)[1] is False  # Canary knows no Japanese
+    assert Scribe._read_fast(me, None, audio)[1] is False
+    assert heard == [("canary-180m", "fr"), ("parakeet-v3", None)] * 1 + [("parakeet-v3", None)] * 2
+    assert "fr" in asr.TELLS["canary-180m"]

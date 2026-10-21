@@ -545,9 +545,15 @@ class Model:
         return stay / (stay + switch) if stay and switch else None
 
     def scores(
-        self, x: np.ndarray, kinds: tuple[str, ...], previous: str | None = None
+        self,
+        x: np.ndarray,
+        kinds: tuple[str, ...],
+        previous: str | None = None,
+        among: set | None = None,
     ) -> dict[str | None, float]:
-        """Log posterior of every explanation of ``x``, up to one constant. None is "new"."""
+        """Log posterior of every explanation of ``x``, up to one constant. None is "new".
+        ``among``: only these explanations are scored (the same constant: the weights
+        are those of all)."""
         weights: dict[str | None, float] = {
             key: c.n * self.survival(c) for key, c in self.clusters.items() if c.kind in kinds
         }
@@ -562,6 +568,7 @@ class Model:
         return {
             key: math.log(w) + self.predictive(self.clusters[key].total if key else zero, x)
             for key, w in weights.items()
+            if among is None or key in among
         }
 
     def observe(

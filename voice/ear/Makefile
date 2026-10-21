@@ -11,6 +11,8 @@ JQ := $(shell command -v jq 2>/dev/null || echo jq)
 #   2. make fetch     the models (Silero, CAM++, Parakeet v3, Whisper turbo, Piper
 #                     voices) and the public test corpora: ~2.4 GB once, ~/.cache/π
 #   3. make rec       PANE 1: the recorder, endless 1 s chunks. NEVER stopped.
+#   3b. make rec-out  PANE 4: what this machine plays, beside it (PI_EAR_OUTPUT=on,
+#                     the default; PI_EAR_OUTPUT=off listens to the microphone alone)
 #   4. make run       PANE 2: the ear. One line per decision, state live on disk.
 #   5. make watch     PANE 3: the state moving.
 #
@@ -29,6 +31,9 @@ CORPUS_DIR ?= $(HOME)/.cache/π/corpus
 STATE := $(ROOT)/state.json
 EVENTS := $(ROOT)/events.jsonl
 AUDIO := $(ROOT)/audio
+OUT := $(ROOT)/out
+# what the machine plays: its default output's monitor, through the sound server
+OUTPUT_SOURCE ?= @DEFAULT_MONITOR@
 
 DEVICE ?= plughw:0,6
 RATE := 16000
@@ -38,7 +43,7 @@ CHUNK_S := 1
 RUN_FLAGS ?=
 EAR := $(UV) run π-ear
 
-.PHONY: help sync fetch base check test test-live test-fast rec run watch events state status \
+.PHONY: help sync fetch base check test test-live test-fast rec rec-out run watch events state status \
 	pause resume reset snapshot diff correct undo questions answer why probe corpus replay-corpus clean
 
 help:  ## Show the setup order and every target
@@ -75,6 +80,12 @@ rec:  ## [setup 3, PANE 1] Recorder: endless 1 s raw chunks. NEVER stopped.
 	@mkdir -p $(AUDIO)
 	arecord -D $(DEVICE) -f S16_LE -r $(RATE) -c $(CHANNELS) -t raw \
 	  --use-strftime --max-file-time $(CHUNK_S) $(AUDIO)/%Y%m%d-%H%M%S.raw
+
+rec-out:  ## [setup 3b, PANE 4] The machine's own sound and which apps play it, beside the mic
+	@mkdir -p $(OUT)
+	@$(EAR) apps --root $(ROOT) & APPS=$$!; trap "kill $$APPS" EXIT; \
+	PULSE_SOURCE=$(OUTPUT_SOURCE) arecord -D pulse -f S16_LE -r $(RATE) -c $(CHANNELS) -t raw \
+	  --use-strftime --max-file-time $(CHUNK_S) $(OUT)/%Y%m%d-%H%M%S.raw
 
 run:  ## [setup 4, PANE 2] The ear: follows the chunks, keeps the state live
 	@$(EAR) run --root $(ROOT) --memory $(MEMORY) --corpus-dir $(CORPUS_DIR) $(RUN_FLAGS)

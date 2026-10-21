@@ -244,6 +244,8 @@ REGISTRY: dict[str, tuple[str, Callable[[Path], Recognizer]]] = {
     "whisper-base": ("sherpa-onnx-whisper-base", _whisper("base")),
     "canary-180m": ("sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8", _canary),
 }
+# The languages a model can be told (its source language): Canary's four.
+TELLS = {"canary-180m": ("en", "es", "de", "fr")}
 # The longest audio a model reads whole: Whisper's encoder sees 30 s, and sherpa-onnx
 # drops the rest ("we process only the first 30 seconds"; measured live: a 70.9 s run
 # came back with the words of its first 30 s). The scribe cuts pieces strictly shorter.

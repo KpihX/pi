@@ -8,6 +8,15 @@ mouth and heard back by the ear: the inbox does not care). v2.1 is v2 after its 
 (two hours of a football broadcast heard by a laptop, KπX in the room): what it got wrong, and
 how each fix was measured on the replay of that session, is in `IDEAS.md`, section "v2.1".
 
+v2.2 is the **ambient** ear (`IDEAS.md`, "v2.2"): alone, with friends, in a call, with a video
+playing, it understands the scene as a person there would. Five steps, each measured: the
+machine's own sound as a second channel, taken out of the microphone (`echo.py`, `device.py`);
+where each voice comes from, room, remote, media or π itself (`scene.py`); second thoughts,
+decisions said again when the model knows better, and questions asked only when an answer
+should change something (`revise.py`); two voices at once never learned as one
+(`overlap.py`); each voice's language over all it said, and the room measured by the stream
+itself (`lid.py`, `scribe.py`).
+
 ```
       [microphone]
            |
@@ -16,8 +25,10 @@ how each fix was measured on the replay of that session, is in `IDEAS.md`, secti
    <the audio directory>        the whole transport between the two servers
            |
    SERVER B: the ear
-     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live, + shadow windows offset by 1 s)
-     Model    who: windows -> conditions -> voices, in a place; person or device
+     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live, + shadow windows offset by 1 s);
+              pyannote segmentation (two voices at once?), on each channel
+     Model    who: windows -> conditions -> voices, in a place; room, remote, media or self;
+              thought over at every silence (revisions)
      Scribe   what, on its own thread: runs cut into pieces (a voice's phrase, under Whisper's
               window), Parakeet v3 at once, Whisper turbo on groups of pieces with context,
               a learned reader choosing between them, each voice's language, what KπX taught
@@ -37,7 +48,7 @@ how each fix was measured on the replay of that session, is in `IDEAS.md`, secti
 1. **100 % stream.** No setup phase, no calibration phase: the first window is decided like the
    thousandth.
 2. **Nothing tuned, everything learned.** `tests/test_law.py` parses `model.py`, `words.py`,
-   `source.py` and `language.py` and fails on any numeric literal but 0 and 1, and on any comparison with a
+   `source.py`, `language.py`, `scene.py` and `revise.py` and fails on any numeric literal but 0 and 1, and on any comparison with a
    constant. The numbers live in `weights/base-*.json`, measured by `π-ear base` on public
    recordings no test uses, then moved by the stream and by corrections.
 3. **Every model knows when it does not know.** Who: `unknown`, `margin` (nats), `trust` (a
@@ -122,13 +133,27 @@ through, and correction episodes (a correction trusted the first time).
 {"port":3,"kind":"correction","what":"text","answers":"…:80.6#2#text","line":7,"refused":null}
 ```
 
+Since port 4 every decision, turn and text also says its `channel` (`mic`, `machine`) and its
+`scene` (`room`, `remote`, `media`, `self`); since port 5 a window can be said again
+(`revision`), and the ear may ask whether two voices are one:
+
+```json
+{"port":5,"kind":"revision","revises":17,"run":"…:16.4","was":{"kind":"unknown","speaker":null},
+ "now":{"kind":"known","speaker":"05d9…","label":null,"scene":"room"},"why":"learned"}
+{"port":5,"kind":"turns","run":"…:16.4","segments":[…],"revision":1}
+{"port":5,"kind":"question","id":"1abe…=77d2…#same#…","about":"same","speakers":["1abe…","77d2…"],
+ "rows":[40,61],"choices":["same","different"],"p":0.31,"value":4.3}
+```
+
+The examples above the `port` 5 lines are of port 3: their fields have kept their meaning.
+
 A consumer (the arbiter, the mouth) reads `port.read()` / `port.follow()` and gets typed events;
 it never reads the internals. It speaks back through **`port.Inbox`**, the same three calls a
 terminal uses:
 
 ```python
 inbox = port.Inbox(memory)
-# what: text, same, different, not_voice, name, person or device
+# what: text, same, different, not_voice, name, person, device, room, remote, media, self
 inbox.correct("text", rows, text="send the notes to KπX")
 inbox.answer(question_id, text="Alice")  # a name, or what was said
 inbox.answer(question_id, choice=1)  # or one of the question's choices
@@ -167,7 +192,15 @@ make fetch    # 2. models + public corpora into ~/.cache/π (~2.4 GB downloaded 
 make rec      # pane 1: the recorder. Start once, never stop.
 make run      # pane 2: the ear. One line per decision and per text.
 make watch    # pane 3: the state moving on disk.
+make rec-out  # pane 4: what this machine plays, and which application plays it.
 ```
+
+**The machine's own sound** (`PI_EAR_OUTPUT=on`, the default). What this machine plays is
+recorded beside the microphone from its output's monitor (`PI_EAR_OUTPUT_SOURCE`, default
+`@DEFAULT_MONITOR@`, through `pipewire-pulse`), read as a channel of its own (its voices are the
+machine's, with the application that played them), and taken out of the microphone (`echo.py`),
+so the room is heard over a video, a call or music. `PI_EAR_OUTPUT=off`: the microphone alone,
+as before. Without `make rec-out`, the ear behaves as off and `make status` says so.
 
 Then `make status`, `make events`, `make questions`, `make answer Q=… A="…"`,
 `make correct C="text 812 --text '…'"`, `make undo N=3`, `make why ROW=812`,
@@ -205,6 +238,10 @@ neither reference is the truth. v2.0 is what the ear wrote live.
 | a player interviewed, 2 min | question and answer in one run | .013 / .016 | **.752** / .144 |
 | 17 min without a cut | whistle, ads, studio, interview | | .784 / .613, slow pass 0.74 s per s, never behind |
 | almost silence, 3 min | -50 dBFS | | 4 pieces, 80 % of the words written heard by another system |
+
+Correction 2026-10-21 (KπX), append-only: "TV" in this table is a misreading. The match played
+in the browser of this laptop, through its own speakers: the machine's own sound, not a television
+across the room (`IDEAS.md`, end of section v2.1).
 
 Who on the same record: every television voice `device`, KπX `person`; questions only about
 people already known (KπX's name, KπX's doubtful words), 0 to 4 per segment; 0 scribe errors.

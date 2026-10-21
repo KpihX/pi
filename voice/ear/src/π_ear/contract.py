@@ -35,6 +35,9 @@ DEVICE = os.environ.get("PI_EAR_DEVICE", "plughw:0,6")
 ENCODER = os.environ.get("PI_EAR_ENCODER", "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 ENCODER_WINDOW_S = 2.0
 VAD_MODEL = "silero_vad.onnx"
+# Two voices at once (overlap.py): pyannote segmentation-3.0, int8, as sherpa-onnx exports
+# it. "none": every window is taken for one voice, as before step 4.
+SEGMENTATION = os.environ.get("PI_EAR_SEGMENTATION", "sherpa-onnx-pyannote-segmentation-3-0")
 # What was said (asr.py): international by default, measured 2026-10-20 (IDEAS.md,
 # "v2, the what"). FAST hears first and is re-run on the speech in progress, so the
 # text appears while it is said; SLOW hears again in the silences. Any registry name,
@@ -42,12 +45,41 @@ VAD_MODEL = "silero_vad.onnx"
 FAST = os.environ.get("PI_EAR_FAST", "parakeet-v3")
 SLOW = os.environ.get("PI_EAR_SLOW", "whisper-turbo")
 LANGUAGE = os.environ.get("PI_EAR_LANGUAGE", "")  # empty: the recognisers detect it
+# Which language a voice speaks, over all it said (lid.py): Whisper base's language
+# identification on a voice's pooled speech, once it fills Whisper's window. "none": off.
+LID = os.environ.get("PI_EAR_LID", "sherpa-onnx-whisper-base")
+# A fast recogniser that is told the voice's language once it is known (scribe.py). Off:
+# measured 2026-10-21 on the live recording, Canary 180m told French read 0.52 of the
+# reference's words where Parakeet read 0.12 on one segment, but 0.03 against 0.16 and
+# 0.16 against 0.29 on two others (empty readings: sherpa-onnx issue #3919). The slot
+# stays for a model that does better: any registry name that `asr.TELLS` knows.
+FAST_TOLD = os.environ.get("PI_EAR_FAST_TOLD", "none")
 # Voice out of music before the slow reading (Q6). Off: measured 2026-10-20, the
 # sherpa-onnx Spleeter int8 stems came out 130 times louder than their input and
 # uncorrelated with the voice (WER 3 % -> 18 % at 0 dB music), while Parakeet and
 # Whisper turbo read through the music on their own (3 % and 5 % at 0 dB). The
 # slot stays: "sherpa-onnx-spleeter-2stems-int8", or any separator that works.
 SEPARATOR = os.environ.get("PI_EAR_SEPARATOR", "none")
+# The machine's own sound (echo.py): "on" captures what this machine plays, next to
+# the microphone (`make rec-out`), reads it as its own channel and cancels it out of
+# the microphone; "off" listens to the microphone alone. A choice of consent and of
+# transport, never a judgement: the ear works either way.
+OUTPUT = os.environ.get("PI_EAR_OUTPUT", "on")
+OUTPUT_SOURCE = os.environ.get("PI_EAR_OUTPUT_SOURCE", "@DEFAULT_MONITOR@")
+# The name the mouth gives its own playback stream: what π itself says is known to be π.
+MOUTH_APP = "π-mouth"
+# Speex MDF's frame (10 ms) and filter tail: the laptop's speaker-to-microphone path
+# with the room's reverberation, measured to fit in 256 ms (lab aec_compare, 2026-10-21).
+ECHO_FRAME = 160
+ECHO_TAIL_S = 0.256
+# The offset between the two recorders: up to a chunk (they start at different
+# moments) plus the output's latency. The stretch it is estimated on: long enough to
+# hold that lag and several syllables of what the machine played.
+ECHO_MOST_LAG_S = 1.5
+ECHO_ESTIMATE_S = 8.0
+ECHO_KEEP_CHUNKS = 8  # reference chunks kept in memory (a resource bound)
+SHARE_KEEP_CHUNKS = 120  # the machine's share per frame, kept for the windows still to decide
+SPEECH_BAND_HZ = (300, 3400)  # the telephone band: where speech's energy is, by definition
 # kept for the base: its archive carries the LibriSpeech test files
 WHISPER_DIR = "sherpa-onnx-whisper-tiny"
 

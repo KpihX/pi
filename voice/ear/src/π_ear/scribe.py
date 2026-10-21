@@ -64,7 +64,8 @@ from π_ear import asr, contract
 from π_ear.asr import Hypothesis, Word
 from π_ear.io import append_jsonl, read_jsonl, utc_now
 from π_ear.language import FAST
-from π_ear.lexicon import tokens
+from π_ear.lexicon import align, tokens
+from π_ear.lid import POOLED
 from π_ear.sense import Silero
 from π_ear.words import NONE, Context, Heard, Reader, mean_logp
 
@@ -84,6 +85,10 @@ class Piece:
     voice: str | None = None
     mixed: bool = False
     known: bool = False  # its voice was known before it: not a voice born in this piece
+    channel: str = "mic"  # where it was heard: the room, or the machine's own sound
+    echo_of: list[str] = field(default_factory=list)  # machine pieces it repeats
+    measured: bool = False  # its echo already taught the reader what the room does
+    apps: list[str] = field(default_factory=list)  # what played it, on the machine
     fast: Hypothesis | None = None
     slow: Hypothesis | None = None
     language: str | None = None  # what the slow recogniser was told, if anything
@@ -129,13 +134,24 @@ class Scribe:
         source_of=None,
         floor_s: float = 0.0,
         echo=None,
+        person_of=None,
+        scene_of=None,
+        told=None,
+        pooled=None,
     ):
         self.reader = reader
         self.fast, self.slow, self.separator = fast, slow, separator
+        self.told = told  # a fast recogniser that can be told the language (PI_EAR_FAST_TOLD)
+        self.pooled = pooled  # each voice's speech, pooled for its language (lid.py)
         self.write = write
         self.memory = memory
         self.models = models
         self.source_of = source_of or (lambda voice: (None, None))
+        # a person (in the room, or reached through a device), or not: who is asked, and
+        # whose pieces are read first (ear.person_of, from the scene); without a scene,
+        # the spectrum's person/device
+        self.person_of = person_of or (lambda voice: self.source_of(voice)[0] == "person")
+        self.scene_of = scene_of or (lambda voice: None)
         self.echo = echo
         windows = [w for w in (asr.window_s(fast), asr.window_s(slow) if slow else None) if w]
         # strictly shorter than the shortest window: Silero frames of 512 samples
@@ -154,6 +170,8 @@ class Scribe:
         self.revisions: list[tuple] = []  # a heap of (priority, order, piece id)
         self.order = itertools.count()
         self.corrections: list[tuple[str, str, int]] = []
+        self.revoiced: set[int] = set()  # rows the ear said again (revise.py), to re-voice
+        self.said_of = None  # row -> its decision as the ear says it now
         self.last_partial: dict[str, str] = {}
         self.retracted: set[str] = set()
         self.done: set[str] = set()  # runs settled to their end: a late `hear` is ignored
@@ -161,6 +179,7 @@ class Scribe:
         self.person_speaking = False
         self.busy = False
         self.questions = 0
+        self.room = {"fast": [0, 0], "slow": [0, 0]}  # words right, of the machine's, heard here
         self.errors: list[str] = []
         self.open_questions: dict[str | None, str] = {}  # voice -> its open question
         self.pace = {"audio": 0.0, "spent": 0.0}  # the slow recogniser's own speed, measured
@@ -229,6 +248,36 @@ class Scribe:
             self.lock.notify_all()
         return None
 
+    def revoice(self, rows: set[int], said_of) -> None:
+        """The ear said these windows again (revise.py): the pieces they are in may now
+        belong to another voice, and their texts are decided again under it."""
+        with self.lock:
+            self.said_of = said_of
+            self.revoiced |= rows
+            self.lock.notify_all()
+
+    def _revoice(self, rows: set[int]) -> None:
+        with self.lock:
+            keys = list(dict.fromkeys(k for r in sorted(rows) for k in self.of_row.get(r, [])))
+            pieces = [self.pieces[k] for k in keys if k in self.pieces]
+        for piece in pieces:
+            decisions = [d for d in map(self.said_of, piece.rows) if d is not None]
+            share: Counter = Counter()
+            for d in decisions:
+                if d["kind"] in VOICED and d["speaker"]:
+                    share[d["speaker"]] += min(piece.t1, d["t1"]) - max(piece.t0, d["t0"])
+            mass = sum(share.values())
+            voices = {k: round(v / mass, 3) for k, v in share.most_common()} if mass else {}
+            voice = share.most_common(1)[0][0] if share else None
+            if voice == piece.voice and voices == piece.voices:
+                continue
+            piece.voice, piece.voices = voice, voices
+            piece.known = piece.known or any(
+                d["kind"] == "known" and d["speaker"] == voice for d in decisions
+            )
+            if piece.decision:  # read already: decided again, under its voice now
+                self._decide(piece)
+
     def answered(self, voice: str | None) -> None:
         with self.lock:
             self.open_questions.pop(voice, None)
@@ -241,7 +290,14 @@ class Scribe:
                 state.finished = True
                 self.dirty.add(state.id)
             self.lock.notify_all()
-            while self.dirty or self.partials or self.revisions or self.corrections or self.busy:
+            while (
+                self.dirty
+                or self.partials
+                or self.revisions
+                or self.corrections
+                or self.revoiced
+                or self.busy
+            ):
                 self.lock.wait()
 
     def pending(self) -> int:
@@ -276,6 +332,9 @@ class Scribe:
                     job = ("settle", run)
                 elif self.corrections and not self.person_speaking:
                     job = ("correction", self.corrections.pop(0))
+                elif self.revoiced and not self.person_speaking:
+                    job = ("revoice", self.revoiced)
+                    self.revoiced = set()
                 elif self.partials and not (revise and self.alternate):
                     job = ("partial", self.partials.pop())
                     self.alternate = True
@@ -414,16 +473,24 @@ class Scribe:
             mixed=any(d["kind"] in ("noise", "unknown") for d in covering if d["learned"]),
         )
         piece.known = any(d["kind"] == "known" and d["speaker"] == piece.voice for d in covering)
+        piece.channel = next((d.get("channel") for d in decisions if d.get("channel")), "mic")
+        piece.apps = list(dict.fromkeys(a for d in covering for a in d.get("apps") or []))
         if piece.voice is not None and piece.speech is not None:
             self.regime["sum"] += piece.speech
             self.regime["count"] += 1
-        piece.fast = asr.read(self.fast, samples)
+        piece.fast, told = self._read_fast(piece.voice, samples)
         self.reader.heard(piece.fast.text)
         languages = self.reader.languages
         written = languages.of_text(piece.fast.text) if piece.voice is not None else None
-        if written:  # the language of the fast text: a detector heard at once (language.py)
+        # the language of the fast text: a detector heard at once (language.py); not when
+        # it was told the language: its text says what it was told, not what it heard
+        if written and not told:
             language = max(written, key=written.get)
             languages.heard(piece.voice, language, "", True, piece.t1 - piece.t0, FAST)
+        if self.pooled is not None and piece.voice is not None and len(piece.voices) == 1:
+            found = self.pooled.add(piece.voice, samples)  # a voice alone: its own speech
+            if found:
+                languages.heard(piece.voice, found[0], "", True, found[1], POOLED)
         if piece.voice is not None and any(w.logp is not None for w in piece.fast.words):
             self.regime["logp"] += mean_logp(piece.fast)
             self.regime["read"] += 1
@@ -436,6 +503,16 @@ class Scribe:
             self._group(state, piece)
         else:
             piece.samples = None  # nothing will read it again
+
+    def _read_fast(self, voice: str | None, samples: np.ndarray) -> tuple[Hypothesis, bool]:
+        """The fast reading: by the recogniser that can be told the language, when the
+        voice's language is a better bet than detecting it (``Languages.choose``, the same
+        rule as for the slow one) and the model knows that language; else the fast one."""
+        if self.told is not None and voice is not None:
+            language = self.reader.languages.choose(voice, len(samples) / contract.RATE)
+            if language in asr.TELLS.get(getattr(self.told, "name", ""), ()):
+                return asr.read(self.told, samples, language=language), True
+        return asr.read(self.fast, samples), False
 
     def _partial(self, run: str) -> None:
         with self.lock:
@@ -473,7 +550,7 @@ class Scribe:
         if not keys:
             return
         pieces = [self.pieces[k] for k in keys]
-        person = any(self.source_of(p.voice)[0] == "person" for p in pieces)
+        person = any(self.person_of(p.voice) for p in pieces)
         doubt = min(p.decision.get("p", 0.0) for p in pieces)
         # people first, then the most doubtful, then the oldest
         priority = (0 if person else 1, doubt, pieces[0].t0)
@@ -590,6 +667,8 @@ class Scribe:
                 "fast": piece.fast.to_dict() if piece.fast else None,
                 "slow": piece.slow.to_dict() if piece.slow else None,
                 "separated": piece.separated,
+                "channel": piece.channel,
+                "apps": piece.apps,
             },
         )
 
@@ -616,6 +695,8 @@ class Scribe:
                 language=line.get("language"),
                 revision=line["revision"],
                 separated=line["separated"],
+                channel=line.get("channel", "mic"),
+                apps=line.get("apps") or [],
                 asked=True,
             )
             for row in line["rows"]:
@@ -631,8 +712,31 @@ class Scribe:
         bounds = np.round(np.cumsum([0] + sizes) / sum(sizes) * len(words)).astype(int)
         return [" ".join(words[a:b]) for a, b in itertools.pairwise(bounds)]
 
+    def _heard_twice(self, piece: Piece, text: str) -> list[str]:
+        """The machine's pieces a microphone piece repeats: what the machine played,
+        heard through the air before (or past) the echo canceller. Its words are found,
+        in order, in what the machine's channel wrote at that time, more than not."""
+        if piece.channel != "mic" or not text:
+            return []
+        words = tokens(text)
+        with self.lock:
+            played = sorted(
+                (
+                    p
+                    for p in self.pieces.values()
+                    if p.channel != "mic" and p.t0 < piece.t1 and piece.t0 < p.t1
+                ),
+                key=lambda p: p.t0,
+            )
+        said = [w for p in played for w in tokens(p.decision.get("text", ""))]
+        if not said:
+            return []
+        found = sum(op == "=" for op, _, _ in align(words, said)) / len(words)
+        return [p.id for p in played] if found > 1 - found else []
+
     def _decide(self, piece: Piece) -> dict:
         decided = self.reader.read(piece.fast, piece.slow, self._context(piece))
+        piece.echo_of = self._heard_twice(piece, decided["text"])
         piece.revision += 1
         piece.decision = decided
         self._remember(piece)
@@ -670,6 +774,10 @@ class Scribe:
                 "told": piece.language,
                 "speech": None if piece.speech is None else round(piece.speech, 3),
                 "separated": piece.separated,
+                "channel": piece.channel,
+                "apps": piece.apps,
+                "echo_of": piece.echo_of,
+                "scene": _top(self.scene_of(piece.voice)),
                 "written": utc_now(),
             }
         )
@@ -680,7 +788,82 @@ class Scribe:
                 f"p={decided['p']:.2f} {marked or '∅'}"
             )
         self._ask(piece, decided)
+        if piece.channel != "mic":
+            self._echoes_of(piece)
+        elif piece.echo_of:
+            self._measure(piece, decided)
         return decided
+
+    def _measure(self, piece: Piece, decided: dict) -> None:
+        """The room, measured by the stream itself: a microphone piece that heard what the
+        machine played, through the air, read once final, against what the machine's own
+        channel read of the same sound (clean, before the air). The stretch of the
+        machine's words it heard (from the first to the last word its reading found)
+        is its truth: how each recogniser does in this room, and one more example for
+        the reader, as a correction would be, without anyone asked."""
+        if piece.measured or (piece.slow is None and self.slow is not None):
+            return
+        with self.lock:
+            played = sorted(
+                (self.pieces[k] for k in piece.echo_of if k in self.pieces), key=lambda p: p.t0
+            )
+        said = [w for p in played for w in tokens(p.decision.get("text", ""))]
+        found = [j for op, _, j in align(tokens(decided["text"]), said) if op == "="]
+        if not found:
+            return
+        truth = said[min(found) : max(found) + 1]
+        piece.measured = True
+        scores = {}
+        for name, heard in (("fast", piece.fast), ("slow", piece.slow)):
+            if heard is not None:
+                right = sum(op == "=" for op, _, _ in align(truth, tokens(heard.text)))
+                self.room[name][0] += right
+                self.room[name][1] += len(truth)
+                scores[name] = round(right / len(truth), 3)
+        context = self._context(piece)
+        self.reader.learn(Heard(piece.fast, piece.slow, " ".join(truth), context))
+        append_jsonl(
+            self.memory / "taught.jsonl",
+            {
+                "line": None,  # no correction: the stream's own (never undone by an undo)
+                "echo_of": piece.echo_of,
+                "piece": piece.id,
+                "voice": piece.voice,
+                "speech": piece.speech,
+                "regime": context.regime,
+                "confidence": context.confidence,
+                "fast": piece.fast.to_dict(),
+                "slow": piece.slow.to_dict() if piece.slow else None,
+                "truth": " ".join(truth),
+            },
+        )
+        self.write(
+            {
+                "kind": "measure",
+                "piece": piece.id,
+                "of": piece.echo_of,
+                "truth": " ".join(truth),
+                "recall": scores,
+            }
+        )
+
+    def _echoes_of(self, played: Piece) -> None:
+        """The microphone read the machine's sound before the machine's channel did (its
+        recogniser was first): once the machine's reading comes, those microphone pieces
+        are found to repeat it, and are revised to say so."""
+        with self.lock:
+            heard = [
+                p
+                for p in self.pieces.values()
+                if p.channel == "mic"
+                and p.decision
+                and not p.echo_of
+                and p.t0 < played.t1
+                and played.t0 < p.t1
+            ]
+        for piece in heard:
+            if self._heard_twice(piece, piece.decision.get("text", "")):
+                self._decide(piece)
 
     def _ask(self, piece: Piece, decided: dict) -> None:
         final = piece.slow is not None or self.slow is None
@@ -695,13 +878,14 @@ class Scribe:
             or (doubt == "not_understood" and piece.voice is not None)
             or bool(doubtful)
         )
-        source, _ = self.source_of(piece.voice)
+        person = self.person_of(piece.voice)
         with self.lock:
             if (
                 not final
                 or piece.asked
                 or not worth
-                or source != "person"
+                or not person
+                or piece.echo_of  # the machine heard through the air: it was read from the machine
                 or not piece.known  # a voice of one window may be nobody: if real, it returns
                 or piece.voice in self.open_questions
             ):
@@ -732,6 +916,11 @@ class Scribe:
             "slow_seconds_per_second": None if pace is None else round(pace, 3),
             "questions": self.questions,
             "errors": len(self.errors),
+            # what each recogniser reads, through this room, of what the machine played
+            "room_recall": {
+                name: round(right / total, 3) if total else None
+                for name, (right, total) in self.room.items()
+            },
             "regime": None
             if not self.regime["count"]
             else round(self.regime["sum"] / self.regime["count"], 3),
@@ -739,6 +928,10 @@ class Scribe:
             if not self.regime["read"]
             else round(self.regime["logp"] / self.regime["read"], 3),
         }
+
+
+def _top(probabilities: dict | None) -> str | None:
+    return max(probabilities, key=probabilities.get) if probabilities else None
 
 
 def rebuild_reader(

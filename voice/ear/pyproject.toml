@@ -12,6 +12,8 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.5.4",
     "onnxruntime>=1.31.0",
+    "pyaec>=1.0.1",
+    "pywebrtc-audio>=0.2.0",
     "scipy>=1.18.1",
     "sherpa-onnx>=1.13.8",
     "sherpa-onnx-core>=1.13.8",

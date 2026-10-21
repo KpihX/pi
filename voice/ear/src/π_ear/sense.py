@@ -46,6 +46,15 @@ class Run:
     samples: np.ndarray
 
 
+@functools.cache
+def _encoder(path: str):
+    """One CAM++ per process: it holds no state between windows, and every channel's
+    sensor embeds from the ear's one thread."""
+    return sherpa_onnx.SpeakerEmbeddingExtractor(
+        sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=path, num_threads=contract.THREADS)
+    )
+
+
 class Sensor:
     def __init__(self, models: Path, encoder: str = contract.ENCODER):
         vad = sherpa_onnx.VadModelConfig()
@@ -54,15 +63,12 @@ class Sensor:
         self.vad = sherpa_onnx.VoiceActivityDetector(vad, buffer_size_in_seconds=120)
         self.block = vad.silero_vad.window_size
         self.min_speech_s = float(vad.silero_vad.min_speech_duration)  # published default
-        self.encoder = sherpa_onnx.SpeakerEmbeddingExtractor(
-            sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=str(models / encoder), num_threads=contract.THREADS
-            )
-        )
+        self.encoder = _encoder(str(models / encoder))
         self.dim = self.encoder.dim
         self.window = int(contract.ENCODER_WINDOW_S * contract.RATE)
         self.pending = np.empty(0, dtype=np.float32)
         self.fed = 0
+        self.offset = 0  # where this stream's sample 0 sits on the ear's shared clock
         self.history = np.empty(0, dtype=np.float32)  # recent audio, for slicing pieces
         self.history_start = 0
         self.run_start: int | None = None
