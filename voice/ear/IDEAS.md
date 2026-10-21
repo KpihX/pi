@@ -862,3 +862,84 @@ heard through the air: the machine, heard twice. That is step 2's first fact to 
 **Degrading visibly.** Output on but its recorder not running: the microphone is never held
 back (a microphone chunk waits at most for the next one, and not at all when no machine chunk
 ever came), and `ctl status` says `DEGRADED: no chunk of the machine's sound yet`.
+
+### Step 2: where a voice comes from, the scene (`scene.py`)
+
+**Why.** "Person or device" was the wrong question for an ambient ear. A person who is there
+tells four kinds of voice apart, because they answer them differently: someone **in the room**
+(listen, answer), someone **reached through a device** (a meeting, a call: a person too),
+something **recorded** (a video, a podcast: context, nobody to ask), and **π itself** (never
+someone else). Each voice gets P(room, remote, media, self), on every decision (`scene`,
+`scene_p`), every text, and in `ctl status`.
+
+**What is a fact, and what is learned.** Nothing is written by hand; three things are facts:
+
+* *through this machine*: a voice on the machine's channel was played by it. Its microphone
+  windows count for the room only by the share of their energy the canceller did not explain
+  (`1 - echo`). A Beta with one pseudo-window each way: P(machine) = (M + 1) / (M + room + 2).
+* *through another loudspeaker* (a phone, a television): the voice's long-term spectrum, the
+  existing `source.py` model, as evidence.
+* *π itself*: the machine windows π's mouth played (`contract.MOUTH_APP`): the sound server
+  names the application.
+
+**Remote or media: the turns.** Among the voices that come out of a device, the one thing that
+separates a call from a video, whatever the application, is that **a conversation waits for
+the room, a recording does not**. So the ear counts, over the seconds it heard: k1 of the n1
+seconds the voice spoke had the room speaking too; k2 of the n2 seconds without it. Two
+accounts of these four counts, with no parameter:
+
+* *media*: the room speaks at one rate whatever the voice does, p1 = p2 ~ U(0, 1);
+* *conversation*: the room speaks less over the voice than in its silences, p1 ~ U(0, 1),
+  p2 ~ U(p1, 1) (so p1 has the same prior in both, and only the comparison counts).
+
+The log of their ratio (the Bayes factor, one integral, `conversation_evidence`) is added to
+the application's prior log-odds. Its intuition, on the timelines of `tests/test_scene.py`:
+
+| what the counts show | evidence (nats) | then P(remote), P(media) |
+|---|---|---|
+| a meeting: 4 s each, the room answers in the voice's silences only | +41.8 | 0.99, 0.00 |
+| a video with pauses, the room talks whenever it wants (40 % of seconds) | -1.4 | 0.19, 0.80 |
+| a video that never pauses: no silence of it to compare with | **0, exactly** | 0.50, 0.50 |
+| a voice that pauses, and nobody ever takes the turn | -4.1 | 0.02, 0.98 |
+
+The third row is the third law at work: with nothing to compare, the evidence is not small,
+it is none, and the two stay as likely. The fourth: a conversation would have the room speak
+in the voice's silences; a voice nobody ever answers is better told as a recording.
+
+**The first form, refused by its own test.** p1 was compared with a plug-in rate for the room,
+½ before the voice had ever been silent: a video that never paused, talked over by the room
+40 % of the time, came out a conversation (40 % < 50 %). The plug-in was a number set by hand
+in disguise; the two-hypothesis form has none.
+
+**Who spoke in the room, for the turns.** Not one window's echo share: a person talking over a
+loud video is half the machine's energy, and still the room speaking (the end-to-end scene
+lost the person's seconds that way). A voice of the microphone speaks in the room unless it is
+shown to come out of a device, by its windows (this machine) or its spectrum (another
+loudspeaker: the video heard through the air, which first counted as the room answering).
+And a window marks every second it covers, not only its middle (half the seconds were lost).
+
+**What an application plays** is learned from KπX's corrections (`room`, `remote`, `media`,
+`self` on the port): told once that a voice of `Meet` is a person, the next voice out of `Meet`
+starts as one, before any turn; another application learns nothing from it. Before any
+correction, an application is as likely a call as a video: no list of names.
+
+**End to end** (`tests/test_output.py`, synthetic scenes, the whole ear, one run each):
+
+| scene | the device's voice | the room's person |
+|---|---|---|
+| the browser plays a podcast, the person speaks partly over it | media 0.69, remote 0.11 | room |
+| a call: a voice out of `Meet` asks, the person answers, five times | remote 0.70 | room 0.81 |
+
+The remaining mass of the device's voice (room 0.2-0.29) is the microphone's copies of it from
+before the canceller learned the offset: real evidence the cluster mixes, honestly kept.
+
+**The machine heard twice, now said.** A microphone piece whose words are found, in order and
+more than not, in what the machine's channel wrote at that time is marked `echo_of` those
+pieces, never asked about; and since the microphone's recogniser can be first, a machine
+reading that arrives later revises the microphone pieces it explains. In the podcast scene,
+every microphone text from before the canceller converged is now marked.
+
+**What it changes.** Questions and the slow pass's priority go by "a person" (room or remote),
+not by "not a loudspeaker": a colleague in a call is asked about, a video is not. A tie (the
+video that never pauses) is a coin, off ½ only by the one pseudo-window of the prior: whether
+to ask then is a matter of the value of the answer, step 3.

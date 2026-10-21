@@ -16,7 +16,7 @@ import π_ear
 
 DECISIONS = [
     Path(π_ear.__file__).parent / name
-    for name in ("model.py", "words.py", "source.py", "language.py")
+    for name in ("model.py", "words.py", "source.py", "language.py", "scene.py")
 ]
 ORDERING = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 

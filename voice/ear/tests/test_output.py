@@ -153,6 +153,98 @@ def test_the_room_is_heard_over_what_the_machine_plays(tmp_path, monkeypatch):
     # the decisions over the machine say how much of the window was the machine
     over = [e for e in events if "row" in e and e["channel"] == "mic" and e["echo"] is not None]
     assert over and max(e["echo"] for e in over) > 0.5
+    # the scene: the podcast does not wait for anyone, the person is in the room
+    played, person = _voices(events, state, spans)
+    assert played["scene"]["media"] > played["scene"]["remote"] and not _person(played)
+    assert max(person["scene"], key=person["scene"].get) == "room"
+    # before the canceller learned, the microphone read the podcast: it says it is a copy
+    early = [e for e in _texts(events, "mic") if e["text"] and e["t1"] < spans[0][0]]
+    assert early and all(e["echo_of"] for e in early)
+
+
+def _voices(events, state, spans):
+    """The voice the machine played most, and the voice the person's sentences got."""
+    from collections import Counter
+
+    voiced = [e for e in events if "row" in e and e["speaker"]]
+    machine = Counter(e["speaker"] for e in voiced if e["channel"] == "machine")
+    said = Counter(
+        e["speaker"]
+        for e in voiced
+        if e["channel"] == "mic" and any(a <= e["t0"] < b for a, b, _ in spans)
+    )
+    speakers = {s["id"]: s for s in state["speakers"]}
+    return speakers[machine.most_common(1)[0][0]], speakers[said.most_common(1)[0][0]]
+
+
+def _person(speaker):
+    people = speaker["scene"]["room"] + speaker["scene"]["remote"]
+    return people > 1 - people
+
+
+ASKED = [
+    "est-ce que tu as pu relire le chapitre deux hier soir",
+    "et les exercices de la fin, tu les as faits",
+    "d'accord, alors on commence par le troisième exercice",
+    "tu peux m'envoyer ta solution avant ce soir",
+    "parfait, on se reparle jeudi à la même heure",
+]
+ANSWERED = [
+    "oui je l'ai relu mais la dernière partie reste floue",
+    "seulement les deux premiers, le dernier me bloque",
+    "très bien, je partage mon écran tout de suite",
+    "oui je te l'envoie dès que j'ai fini de la rédiger",
+    "ça marche, à jeudi alors",
+]
+
+
+def test_a_meeting_is_people_taking_turns(tmp_path, monkeypatch):
+    """A call in the meeting application: a voice out of the machine asks, the person
+    in the room answers, and so on. Nothing says it is a meeting but the turns."""
+    rng = np.random.default_rng(5)
+    remote = list(synth(contract.MODELS, [0], ASKED, language="fr").values())[0]
+    local = list(synth(contract.MODELS, [1], ANSWERED, language="fr").values())[0]
+    gap = int(0.7 * R)
+    played, voice, at, spans = [np.zeros(R, np.float32)], [], R, []
+    n = R + sum(len(a) + len(b) + 2 * gap for a, b in zip(remote, local, strict=True)) + 4 * R
+    voice = np.zeros(n, np.float32)
+    room = place(rng)
+    for a, b in zip(remote, local, strict=True):
+        played += [a, np.zeros(len(b) + 2 * gap, np.float32)]
+        at += len(a) + gap
+        y = room(b).astype(np.float32)[: n - at]
+        voice[at : at + len(y)] += y
+        spans.append((at / R, (at + len(y)) / R, ""))
+        at += len(b) + gap
+    played = np.concatenate(played)
+    played = np.concatenate([played, np.zeros(n - len(played), np.float32)])[:n]
+    played *= 10 ** (-22 / 20) / np.sqrt(np.mean(played[played != 0] ** 2))
+    heard = place(rng)(loudspeaker(played, rng)).astype(np.float32)
+    heard = np.concatenate([np.zeros(int(OFFSET_S * R), np.float32), heard])[:n]
+    heard *= 10 ** (-36 / 20) / np.sqrt(np.mean(heard[heard != 0] ** 2))
+    voice *= 10 ** (-30 / 20) / np.sqrt(np.mean(voice[voice != 0] ** 2))
+    mic = heard + voice + (rng.standard_normal(n) * 10 ** (-65 / 20)).astype(np.float32)
+    places = Places(
+        root=tmp_path / "live",
+        memory=tmp_path / "memory",
+        audio=tmp_path / "mic",
+        output=tmp_path / "out",
+        corpus=None,
+    )
+    _write(places.audio_dir, mic)
+    _write(places.output_dir, played)
+    places.root.mkdir(parents=True, exist_ok=True)
+    with places.apps.open("w") as f:
+        app = {"app": "Meet", "media": "Meet - TD", "playing": True}
+        f.write(json.dumps({"chunk": chunk_name(0)[:-4], "apps": [app]}) + "\n")
+    _, events = _hear(places, monkeypatch, "on")
+    state = read_json(places.state)
+    other, person = _voices(events, state, spans)
+    assert other["id"] != person["id"]
+    # more probably a person reached through the call than anything else together
+    assert other["scene"]["remote"] > 1 - other["scene"]["remote"], other["scene"]
+    assert _person(other) and _person(person)
+    assert max(person["scene"], key=person["scene"].get) == "room", person["scene"]
 
 
 def test_no_machine_recorder_costs_the_microphone_nothing(tmp_path, monkeypatch):

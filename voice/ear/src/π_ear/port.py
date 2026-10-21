@@ -28,7 +28,10 @@ the machine's own sound (what this machine plays, captured before the air). A
 ``Decision`` and a ``Turns`` say which ``channel`` they were heard on; a microphone
 decision carries ``echo``, the machine's share of its energy (what the echo canceller
 took out); a machine decision and a ``Text`` carry ``apps``, the applications that
-were playing. No field of port 3 changed meaning.
+were playing. Every voiced decision and every text says its ``scene``: room (a person
+here), remote (a person reached through a device), media (a recording), self (π); a
+microphone text that repeats what the machine's channel wrote is ``echo_of`` it. No
+field of port 3 changed meaning.
 
 Changing a field's meaning is a new PORT number, never an edit of this one.
 """
@@ -81,6 +84,8 @@ class Decision:
     channel: str | None  # mic (the room) | machine (what this machine plays)
     echo: float | None  # mic: the machine's share of the window's energy, taken out
     apps: list | None  # machine: the applications playing during the window
+    scene: str | None  # room | remote | media | self: where the voice comes from (scene.py)
+    scene_p: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +131,8 @@ class Text:
     separated: bool  # read again from the voice separated out of the music
     channel: str | None  # mic | machine
     apps: list | None  # machine: what played it
+    echo_of: list | None  # mic: the machine's pieces it repeats (the machine heard through the air)
+    scene: str | None  # where its voice comes from: room | remote | media | self
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +168,19 @@ KINDS = {
     "question": Question,
     "correction": Correction,
 }
-CORRECTIONS = ("same", "different", "not_voice", "name", "person", "device", "text")
+CORRECTIONS = (
+    "same",
+    "different",
+    "not_voice",
+    "name",
+    "person",
+    "device",
+    "room",
+    "remote",
+    "media",
+    "self",
+    "text",
+)
 
 
 def parse(line: dict):

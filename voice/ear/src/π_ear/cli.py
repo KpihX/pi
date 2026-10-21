@@ -177,6 +177,10 @@ class Kind(enum.StrEnum):  # `undo` and `answer` have their own commands
     name = "name"
     person = "person"
     device = "device"
+    room = "room"
+    remote = "remote"
+    media = "media"
+    self = "self"
     text = "text"
 
 
@@ -211,6 +215,8 @@ def correct(
       π-ear correct not_voice --speaker KEY       that "voice" was never a voice
       π-ear correct name 812 --label KπX          call this voice KπX
       π-ear correct device --speaker KEY          that voice comes out of a loudspeaker
+      π-ear correct remote --speaker KEY          a person reached through a call
+      π-ear correct media --speaker KEY           a recording (a video, the radio)
       π-ear correct text --from 163 --to 170 --text "le cours de Galois"
     """
     places = _places(root, memory)

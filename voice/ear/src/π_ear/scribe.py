@@ -64,7 +64,7 @@ from π_ear import asr, contract
 from π_ear.asr import Hypothesis, Word
 from π_ear.io import append_jsonl, read_jsonl, utc_now
 from π_ear.language import FAST
-from π_ear.lexicon import tokens
+from π_ear.lexicon import align, tokens
 from π_ear.sense import Silero
 from π_ear.words import NONE, Context, Heard, Reader, mean_logp
 
@@ -85,6 +85,7 @@ class Piece:
     mixed: bool = False
     known: bool = False  # its voice was known before it: not a voice born in this piece
     channel: str = "mic"  # where it was heard: the room, or the machine's own sound
+    echo_of: list[str] = field(default_factory=list)  # machine pieces it repeats
     apps: list[str] = field(default_factory=list)  # what played it, on the machine
     fast: Hypothesis | None = None
     slow: Hypothesis | None = None
@@ -131,6 +132,8 @@ class Scribe:
         source_of=None,
         floor_s: float = 0.0,
         echo=None,
+        person_of=None,
+        scene_of=None,
     ):
         self.reader = reader
         self.fast, self.slow, self.separator = fast, slow, separator
@@ -138,6 +141,11 @@ class Scribe:
         self.memory = memory
         self.models = models
         self.source_of = source_of or (lambda voice: (None, None))
+        # a person (in the room, or reached through a device), or not: who is asked, and
+        # whose pieces are read first (ear.person_of, from the scene); without a scene,
+        # the spectrum's person/device
+        self.person_of = person_of or (lambda voice: self.source_of(voice)[0] == "person")
+        self.scene_of = scene_of or (lambda voice: None)
         self.echo = echo
         windows = [w for w in (asr.window_s(fast), asr.window_s(slow) if slow else None) if w]
         # strictly shorter than the shortest window: Silero frames of 512 samples
@@ -477,7 +485,7 @@ class Scribe:
         if not keys:
             return
         pieces = [self.pieces[k] for k in keys]
-        person = any(self.source_of(p.voice)[0] == "person" for p in pieces)
+        person = any(self.person_of(p.voice) for p in pieces)
         doubt = min(p.decision.get("p", 0.0) for p in pieces)
         # people first, then the most doubtful, then the oldest
         priority = (0 if person else 1, doubt, pieces[0].t0)
@@ -639,8 +647,31 @@ class Scribe:
         bounds = np.round(np.cumsum([0] + sizes) / sum(sizes) * len(words)).astype(int)
         return [" ".join(words[a:b]) for a, b in itertools.pairwise(bounds)]
 
+    def _heard_twice(self, piece: Piece, text: str) -> list[str]:
+        """The machine's pieces a microphone piece repeats: what the machine played,
+        heard through the air before (or past) the echo canceller. Its words are found,
+        in order, in what the machine's channel wrote at that time, more than not."""
+        if piece.channel != "mic" or not text:
+            return []
+        words = tokens(text)
+        with self.lock:
+            played = sorted(
+                (
+                    p
+                    for p in self.pieces.values()
+                    if p.channel != "mic" and p.t0 < piece.t1 and piece.t0 < p.t1
+                ),
+                key=lambda p: p.t0,
+            )
+        said = [w for p in played for w in tokens(p.decision.get("text", ""))]
+        if not said:
+            return []
+        found = sum(op == "=" for op, _, _ in align(words, said)) / len(words)
+        return [p.id for p in played] if found > 1 - found else []
+
     def _decide(self, piece: Piece) -> dict:
         decided = self.reader.read(piece.fast, piece.slow, self._context(piece))
+        piece.echo_of = self._heard_twice(piece, decided["text"])
         piece.revision += 1
         piece.decision = decided
         self._remember(piece)
@@ -680,6 +711,8 @@ class Scribe:
                 "separated": piece.separated,
                 "channel": piece.channel,
                 "apps": piece.apps,
+                "echo_of": piece.echo_of,
+                "scene": _top(self.scene_of(piece.voice)),
                 "written": utc_now(),
             }
         )
@@ -690,7 +723,27 @@ class Scribe:
                 f"p={decided['p']:.2f} {marked or '∅'}"
             )
         self._ask(piece, decided)
+        if piece.channel != "mic":
+            self._echoes_of(piece)
         return decided
+
+    def _echoes_of(self, played: Piece) -> None:
+        """The microphone read the machine's sound before the machine's channel did (its
+        recogniser was first): once the machine's reading comes, those microphone pieces
+        are found to repeat it, and are revised to say so."""
+        with self.lock:
+            heard = [
+                p
+                for p in self.pieces.values()
+                if p.channel == "mic"
+                and p.decision
+                and not p.echo_of
+                and p.t0 < played.t1
+                and played.t0 < p.t1
+            ]
+        for piece in heard:
+            if self._heard_twice(piece, piece.decision.get("text", "")):
+                self._decide(piece)
 
     def _ask(self, piece: Piece, decided: dict) -> None:
         final = piece.slow is not None or self.slow is None
@@ -705,13 +758,14 @@ class Scribe:
             or (doubt == "not_understood" and piece.voice is not None)
             or bool(doubtful)
         )
-        source, _ = self.source_of(piece.voice)
+        person = self.person_of(piece.voice)
         with self.lock:
             if (
                 not final
                 or piece.asked
                 or not worth
-                or source != "person"
+                or not person
+                or piece.echo_of  # the machine heard through the air: it was read from the machine
                 or not piece.known  # a voice of one window may be nobody: if real, it returns
                 or piece.voice in self.open_questions
             ):
@@ -749,6 +803,10 @@ class Scribe:
             if not self.regime["read"]
             else round(self.regime["logp"] / self.regime["read"], 3),
         }
+
+
+def _top(probabilities: dict | None) -> str | None:
+    return max(probabilities, key=probabilities.get) if probabilities else None
 
 
 def rebuild_reader(

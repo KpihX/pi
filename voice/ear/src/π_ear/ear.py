@@ -59,13 +59,17 @@ from π_ear.io import (
 )
 from π_ear.model import Model, Weights
 from π_ear.port import PORT
+from π_ear.scene import KINDS as SCENES
+from π_ear.scene import Scene
 from π_ear.scribe import Scribe, rebuild_reader
 from π_ear.sense import BANDS, Sensor, Separator, rms_dbfs, spectrum
 from π_ear.source import Source
 from π_ear.words import Reader
 
 VOICED = ("known", "new")
-WHO = ("same", "different", "not_voice", "name", "person", "device")
+WHO = ("same", "different", "not_voice", "name", "person", "device", *SCENES)
+# what a scene correction also says of the voice's spectrum (source.py)
+SOURCE_OF_SCENE = {"room": "person", "remote": "device", "media": "device", "self": "device"}
 MIC, MACHINE = "mic", "machine"
 
 
@@ -208,6 +212,8 @@ class Ear:
         ] = []  # (first sample, the machine's share per frame)
         self.asked: set[str] = set()
         self.source = self._rebuild_source()
+        self.scene = Scene()
+        self.scene.load(saved.get("scene", {}))
         self.reader = Reader(self.model.base.reader)
         if "reader" in saved:
             self.reader.load(saved["reader"])
@@ -232,6 +238,8 @@ class Ear:
                     self.places.models,
                     source_of=self.source_of,
                     floor_s=self.sensor.min_speech_s,
+                    person_of=self.person_of,
+                    scene_of=self.scene_of,
                 )
 
     def _save(self) -> None:
@@ -249,6 +257,7 @@ class Ear:
                 "weights": self.model.base.source,
                 "model": self.model.to_dict(),
                 "reader": self.reader.to_dict(),
+                "scene": self.scene.to_dict(),
             },
         )
 
@@ -418,6 +427,7 @@ class Ear:
         self.tick()
         for channel in self.channels.values():
             self._handle(channel, *channel.sensor.flush())
+        self.scene.settle(max(self.scene.seconds, default=0) + 1)  # nothing more will come
         if self.scribe:
             self.scribe.drain()
         self.persist()
@@ -487,6 +497,23 @@ class Ear:
         if channel.name == MACHINE:
             first = self.origin_second + start // contract.RATE
             apps = self.apps.during(first, first + len(piece.samples) // contract.RATE)
+        scene = None
+        if decision["kind"] in VOICED and decision["speaker"]:
+            # the seconds the window covers the most of: shadows too, every second has a voice
+            first = round(start / contract.RATE)
+            last = max(round((start + len(piece.samples)) / contract.RATE), first + 1)
+            device = None if source is None else (source_p if source == "device" else 1 - source_p)
+            self.scene.heard(
+                decision["speaker"],
+                channel.name,
+                range(first, last),
+                share,
+                apps,
+                learned=learn,
+                device=device,
+            )
+            self.scene.settle(first - self._turn_horizon())
+            scene = self.scene_of(decision["speaker"])
         event = {
             "row": row,
             "t0": self.stream_s(piece.start, channel),
@@ -515,6 +542,8 @@ class Ear:
             "rel_db": None if floor is None else round(level - floor, 1),
             "echo": None if share is None else round(share, 4),
             "apps": apps,
+            "scene": None if scene is None else max(scene, key=scene.get),
+            "scene_p": None if scene is None else round(max(scene.values()), 4),
         }
         run["decisions"].append(event)
         self._write(event)
@@ -551,7 +580,7 @@ class Ear:
             return False
         decisions = self.mic.runs.get(current[0], {}).get("decisions", [])
         voiced = [d["speaker"] for d in decisions if d["kind"] in VOICED]
-        return bool(voiced) and self.source_of(voiced[-1])[0] == "person"
+        return bool(voiced) and bool(self.person_of(voiced[-1]))
 
     def _close(self, channel: Channel, run) -> None:
         """A speech run ended: its turns, then its text, unless every window of it was
@@ -652,11 +681,44 @@ class Ear:
         shape = self.shape_of(self.voice_rows(key))
         return self.source.decide(shape) if shape is not None else (None, None)
 
+    def scene_of(self, key: str | None) -> dict[str, float] | None:
+        """P(room, remote, media, self) for a voice (scene.py), its spectrum as evidence."""
+        name, p = self.source_of(key)
+        device = None if name is None else (p if name == "device" else 1 - p)
+        return self.scene.of(key, device)
+
+    def person_of(self, key: str | None) -> bool | None:
+        """Is the voice more probably a person (here, or reached through a device)?"""
+        p = self.scene_of(key)
+        if p is None:
+            return None
+        people = p["room"] + p["remote"]
+        return people > 1 - people
+
+    @staticmethod
+    def _turn_horizon() -> int:
+        """Seconds after which no window can still join a second: a window and an offset."""
+        return int(math.ceil(contract.ENCODER_WINDOW_S + contract.ECHO_MOST_LAG_S))
+
+    def _rebuild_scene_told(self) -> None:
+        """What corrections said of where voices come from, replayed (after an undo)."""
+        self.scene.told.clear()
+        self.scene.app_told.clear()
+        lines, _ = read_jsonl(self.places.corrections)
+        for number, line in enumerate(lines, 1):
+            if line["kind"] in SCENES and number not in self.undone:
+                for key in self._voices_of(line.get("rows", [])):
+                    self.scene.tell(key, line["kind"])
+
+    def _voices_of(self, rows) -> list[str]:
+        return list(dict.fromkeys(v.key for v in (self.model.voice_of(int(r)) for r in rows) if v))
+
     def _rebuild_source(self) -> Source:
         source = Source(self.model.base.spectra)
         lines, _ = read_jsonl(self.places.corrections)
         for number, line in enumerate(lines, 1):
-            if line["kind"] in ("person", "device") and number not in self.undone:
+            spectral = SOURCE_OF_SCENE.get(line["kind"], line["kind"])
+            if spectral in ("person", "device") and number not in self.undone:
                 shape = self.shape_of(line.get("rows", []))
                 if shape is not None:
                     source.add(line["kind"], shape)
@@ -672,7 +734,7 @@ class Ear:
         voice = self.model.voices.get(key)
         if first == self.session or voice is None or voice.label or key in self.asked:
             return
-        if self.source_of(key)[0] != "person":  # a voice on television is nobody to ask
+        if not self.person_of(key):  # a recording, or π itself, is nobody to ask
             return
         self.asked.add(key)
         self._write(
@@ -712,11 +774,15 @@ class Ear:
                 if refused is None:
                     self.applied.append([number, len(self.store), "text"])
             elif kind in WHO:
-                if kind in ("person", "device"):
+                spectral = SOURCE_OF_SCENE.get(kind, kind)
+                if spectral in ("person", "device"):
                     shape = self.shape_of(rows)
                     if shape is not None:
-                        self.source.add(kind, shape)
-                self.model.correct(kind, rows, line.get("label"))
+                        self.source.add(spectral, shape)
+                if kind in SCENES:
+                    for key in self._voices_of(rows):
+                        self.scene.tell(key, kind)
+                self.model.correct(spectral, rows, line.get("label"))
                 self.applied.append(
                     [number, len(self.store), kind, {"rows": rows, "label": line.get("label")}]
                 )
@@ -797,6 +863,7 @@ class Ear:
                 return "this memory predates observations.jsonl: it cannot be replayed exactly"
             self.model = replayed
             self.source = self._rebuild_source()
+            self._rebuild_scene_told()
         self.applied = kept
         return None
 
@@ -850,6 +917,7 @@ class Ear:
                     "id": v.key,
                     "label": v.label,
                     "source": dict(zip(("is", "p"), self.source_of(v.key), strict=True)),
+                    "scene": {k: round(p, 4) for k, p in (self.scene_of(v.key) or {}).items()},
                     "conditions": len(v.conditions),
                     "evidence": len(self.voice_rows(v.key)),
                     "first_seen_unix": v.first_seen or None,
@@ -936,10 +1004,12 @@ def rebuild(places: Places, applied: list[list]) -> Model | None:
 
     def apply(entry):
         if len(entry) > 3:  # as it was applied: an answer is the correction it resolved to
-            model.correct(entry[2], [int(r) for r in entry[3]["rows"]], entry[3]["label"])
+            kind = SOURCE_OF_SCENE.get(entry[2], entry[2])
+            model.correct(kind, [int(r) for r in entry[3]["rows"]], entry[3]["label"])
             return
         line = lines[entry[0] - 1]
-        model.correct(line["kind"], [int(r) for r in line["rows"]], line.get("label"))
+        kind = SOURCE_OF_SCENE.get(line["kind"], line["kind"])
+        model.correct(kind, [int(r) for r in line["rows"]], line.get("label"))
 
     for obs in observations:
         while pending and pending[0][1] <= obs["row"]:
