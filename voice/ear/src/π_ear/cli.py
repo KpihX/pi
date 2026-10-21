@@ -131,6 +131,22 @@ def ctl(action: Action, root: str = ROOT):
         typer.echo(
             f"floor    {state['audio'].get('floor_dbfs')} dBFS (this session's non-speech level)"
         )
+        reader = state.get("reader", {})
+        if reader.get("fast"):
+            typer.echo(
+                f"what     {reader['fast']} + {reader.get('slow')}  pieces={reader.get('pieces')}"
+                f"  slow behind={reader.get('behind_s')}s at {reader.get('slow_seconds_per_second')}"
+                f" s/s  here: speech {reader.get('regime')}, token logp {reader.get('confidence')}"
+                f"  questions={reader.get('questions')} errors={reader.get('errors')}"
+            )
+        corrections = state.get("corrections", {})
+        if corrections:
+            typer.echo(
+                f"corrections seen={corrections['seen']} applied={corrections['applied']}"
+                f" undone={corrections['undone']}"
+            )
+            for r in corrections.get("refused", []):
+                typer.echo(f"  REFUSED line {r['line']} ({r['kind']}): {r['why']}")
         typer.echo(f"counters {json.dumps(state['counters'])}")
 
 

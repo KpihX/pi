@@ -124,3 +124,5 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
+markers = ["live: replays a real session kept on this machine (make test-live); minutes each"]
+addopts = "-m 'not live'"

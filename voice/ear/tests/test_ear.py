@@ -253,8 +253,11 @@ def test_the_decision_loop_never_waits_for_the_recognisers(tmp_path, two_voices,
     assert runs >= 2 and looped < runs * 1.0, "the loop waited for the scribe"
     ear.scribe.drain()
     texts = [e for e in read_jsonl(places.events)[0] if e.get("kind") == "text"]
-    # each run: revision 0 from the fast reading, revision 1 once the slow one landed
-    assert sorted(e["revision"] for e in texts) == sorted([0, 1] * runs)
+    # each piece: revision 0 from the fast reading, revision 1 once the slow one landed
+    by_piece = {}
+    for e in texts:
+        by_piece.setdefault(e["piece"], []).append(e["revision"])
+    assert len(by_piece) >= runs and all(sorted(r) == [0, 1] for r in by_piece.values())
     assert all(e["text"] == "slow words" for e in texts)
     final = [e for e in texts if e["revision"] == 1]
     assert all(w["agreed"] for e in final for w in e["words"])
@@ -326,3 +329,52 @@ def test_a_tail_too_short_for_the_encoder_is_not_an_observation(tmp_path, two_vo
     _replay(places)
     text = places.events.read_text()
     assert "NaN" not in text and "Infinity" not in text
+
+
+def test_a_memory_older_than_its_spectra_keeps_every_row_in_its_place(tmp_path, two_voices):
+    """Measured live: a pre-v2 memory had rows and no spectra; v2 wrote row k's spectrum
+    at index k - 1449 and every person/device decision read another window. Rows
+    heard before spectra existed are unseen now, and every later row is its own."""
+    a, b, _ = two_voices
+    places = _places(tmp_path, audio=tmp_path / "day1", corpus=None)
+    Scene(seed=0).silence(1).add("A", a).silence(1).write(places.audio_dir)
+    first = _replay(places)
+    before = len(first.store)
+    places.spectra.unlink()  # what a v1.1 memory looks like
+    places2 = _places(tmp_path, audio=tmp_path / "day2", corpus=None)
+    Scene(seed=1).silence(1).add("B", b).silence(1).add("A", a).silence(1).write(places2.audio_dir)
+    ear = _replay(places2)
+    assert len(ear.spectra) == len(ear.store) > before
+    assert all(np.isnan(ear.spectra(r)).all() for r in range(before))
+    assert all(np.isfinite(ear.spectra(r)).all() for r in range(before, len(ear.store)))
+    for key in ear.model.voices:
+        decided, p = ear.source_of(key)
+        assert decided in ("person", "device") and np.isfinite(p)
+    assert ear.counters["rows_without_spectrum"] == 1
+    # and the state the live session left behind: spectra written from the first v2 row
+    # on, at index 0 (KπX's memory): the missing rows are the oldest, put back in front
+    true = [ear.spectra(r).copy() for r in range(len(ear.store))]
+    np.asarray(true[before:], dtype=np.float32).tofile(places2.spectra)
+    again = _replay(_places(tmp_path, audio=tmp_path / "none", corpus=None))
+    assert all(np.array_equal(again.spectra(r), true[r]) for r in range(before, len(true)))
+    assert all(np.isnan(again.spectra(r)).all() for r in range(before))
+
+
+def test_the_run_in_progress_is_handed_over_exactly(two_voices):
+    """At every chunk, the run in progress is the audio from its start to now (live,
+    past 60 s it was sliced from a negative index: ``test_live`` holds that case, on
+    the 70 s runs of real studio talk)."""
+    from π_ear.sense import Sensor
+
+    a, b, later = two_voices
+    x = np.concatenate([a, b, later, a, b, later])  # speech, back to back
+    sensor, longest = Sensor(contract.MODELS), 0.0
+    for start in range(0, len(x), contract.RATE):
+        sensor.feed(x[start : start + contract.RATE])
+        current = sensor.run_audio()
+        if current is not None:
+            begin, samples = current
+            assert np.array_equal(samples, x[begin : begin + len(samples)])
+            assert begin + len(samples) == sensor.fed
+            longest = max(longest, len(samples) / contract.RATE)
+    assert longest > 10

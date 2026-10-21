@@ -115,12 +115,12 @@ def test_questions_are_listed_and_answered_in_one_line(tmp_path):
     root, memory = tmp_path / "live", tmp_path / "memory"
     root.mkdir()
     question = {
-        "port": 2,
+        "port": 3,
         "session": "s1",
         "kind": "question",
         "id": "s1:4.2#text",
         "about": "text",
-        "run": "s1:4.2",
+        "piece": "s1:4.2#0",
         "rows": [3, 4],
         "speaker": "v1",
         "choices": ["call pi x now", "call pie ex now"],

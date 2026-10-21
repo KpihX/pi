@@ -1,10 +1,12 @@
-# π-ear v2: the streaming ear of π, who and what
+# π-ear v2.1: the streaming ear of π, who and what
 
 Two servers and one directory, as before. The recorder never stops, the ear follows it, and what
 the ear has learned is on disk at every instant. v1 answered **who**; v2 answers **what** too, in
 the same spirit: one learned model per question, every decision a posterior, every doubt named,
 and one teacher besides the stream, **a correction said once** (typed, or spoken through the
-mouth and heard back by the ear: the inbox does not care).
+mouth and heard back by the ear: the inbox does not care). v2.1 is v2 after its first live test
+(two hours of a football broadcast heard by a laptop, KπX in the room): what it got wrong, and
+how each fix was measured on the replay of that session, is in `IDEAS.md`, section "v2.1".
 
 ```
       [microphone]
@@ -16,8 +18,9 @@ mouth and heard back by the ear: the inbox does not care).
    SERVER B: the ear
      Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live, + shadow windows offset by 1 s)
      Model    who: windows -> conditions -> voices, in a place; person or device
-     Scribe   what, on its own thread: Parakeet v3 while it is said, Whisper turbo in the silence,
-              a learned reader choosing between them, the memory of what KπX taught
+     Scribe   what, on its own thread: runs cut into pieces (a voice's phrase, under Whisper's
+              window), Parakeet v3 at once, Whisper turbo on groups of pieces with context,
+              a learned reader choosing between them, each voice's language, what KπX taught
            |
    /tmp/π/state.json                  atomic, ~1/s: what is known now
    /tmp/π/events.jsonl                the port (out): one line per window, turn, text, question, correction
@@ -25,7 +28,7 @@ mouth and heard back by the ear: the inbox does not care).
    ~/.cache/π/ear/model.json          the checkpoint (who + the reader)
    ~/.cache/π/ear/embeddings.f32      one row per window heard; spectra.f32 its spectral shape
    ~/.cache/π/ear/observations.jsonl  when, how and where each row was decided: the replay
-   ~/.cache/π/ear/runs.jsonl          every reading of every run; taught.jsonl every text taught
+   ~/.cache/π/ear/pieces.jsonl        every reading of every piece; taught.jsonl every text taught
    ~/.cache/π/corpus/*.raw            the audio of the session, bounded, outside RAM
 ```
 
@@ -33,14 +36,15 @@ mouth and heard back by the ear: the inbox does not care).
 
 1. **100 % stream.** No setup phase, no calibration phase: the first window is decided like the
    thousandth.
-2. **Nothing tuned, everything learned.** `tests/test_law.py` parses `model.py`, `words.py` and
-   `source.py` and fails on any numeric literal but 0 and 1, and on any comparison with a
+2. **Nothing tuned, everything learned.** `tests/test_law.py` parses `model.py`, `words.py`,
+   `source.py` and `language.py` and fails on any numeric literal but 0 and 1, and on any comparison with a
    constant. The numbers live in `weights/base-*.json`, measured by `π-ear base` on public
    recordings no test uses, then moved by the stream and by corrections.
 3. **Every model knows when it does not know.** Who: `unknown`, `margin` (nats), `trust` (a
-   calibrated probability). What: a named doubt per text (`clear`, `unseen`, `taught`,
-   `ambiguous`, `not_understood`), a trust per word, and *questions* when it hesitates between
-   readings, or when a known voice spoke and it did not understand (a cough asks nothing).
+   calibrated probability). What: a named doubt per text, from the reader's own posterior
+   (`clear`, `unseen`, `taught`, `partial`: "I understood bits of it", `ambiguous`,
+   `not_understood`), a trust per word, and *questions*, only to people, about the words it is
+   unsure of (a commentator on television is nobody to ask; a cough asks nothing).
 
 ## Who (`model.py`), in one screen
 
@@ -78,34 +82,44 @@ International by default, French measured too, anything else plugs in:
 | canary-180m | 1 % | 15 % | 0.25 | 2-9 |
 
 ```
- speaking ... partial (fast, re-read while the run goes on: the text appears as it is said)
- run ends ... text r0 (fast, at once)
- silence  ... text r1 (slow)   the reader chooses among: fast, slow, the substitutions it
-                               learned, the corrected runs it recalls, and "I did not understand"
- doubt    ... question         when it is ambiguous or not understood: answer it once
+ speaking ... partial     the open part of the run, re-read when the scribe is free
+ a piece  ... text r0     cut where the voice changes, or before Whisper's 30 s window
+              overflows, at Silero's deepest dip: read by Parakeet at once
+ later    ... text r1     Whisper reads as many pieces as its window holds (it reads better
+              with context), in the language that voice speaks; its timed sentences go back
+              to their pieces; the reader chooses among both readings, the substitutions it
+              learned, the corrected pieces it recalls, and "I did not understand"
+ doubt    ... question    to a person, about the words it is unsure of: answer it once
 ```
 
-The **reader** is a Bayesian conditional logit (evidence maximisation, no hand-set prior) over 11
-features of each reading: who wrote it, how much the other recogniser agrees, token confidence,
-learned substitutions, recall of a corrected run, known words, and, for "I did not understand",
-low confidence, two recognisers apart, and a run Silero itself found little like speech. Its base
-weights come from 80 public runs (Piper voices in English and French, clean and degraded) and the
-ESC-50 sounds as the VAD lets them through, plus *correction episodes*: every run the
-recognisers got wrong, corrected once and heard again, so that a correction is trusted from the
-first time. Each word carries its own trust and `agreed` / `new` marks.
+The **reader** is a Bayesian conditional logit (evidence maximisation, no hand-set prior) over
+the features of each reading: who wrote it, how much the other recogniser agrees, token
+confidence (against what it usually is in this place), learned substitutions, recall of a
+corrected piece, known words, and, for "I did not understand", low confidence, two recognisers
+apart in one language, and a piece Silero found less like speech than the speech of this place.
+Every sensor level is relative to the place: a television through a laptop is quiet to Silero
+and to Parakeet, and that is not "nothing was said". **Language** is not a learned feature but a
+probability added with Bayes' coefficient: `log P(the reading's language | its voice)`, learned
+per voice from what Whisper detected it speaking (`language.py`), so a Parakeet translation into
+English of a French voice loses, and an English guest in a French room is still written in
+English. The base weights come from Piper voices in English and French in three regimes (clean,
+in a room, played by a loudspeaker over indoor sounds), the ESC-50 sounds as the VAD lets them
+through, and correction episodes (a correction trusted the first time).
 
 ## The port and the inbox: plug anything in
 
 ```json
-{"port":2,"kind":"session","weights":"…","fast":"parakeet-v3","slow":"whisper-turbo",…}
-{"port":2,"row":42,"t0":82.6,"t1":84.6,"kind":"known","speaker":"1abe…","condition":"9f0c…",
+{"port":3,"kind":"session","weights":"…","fast":"parakeet-v3","slow":"whisper-turbo",…}
+{"port":3,"row":42,"t0":82.6,"t1":84.6,"kind":"known","speaker":"1abe…","condition":"9f0c…",
  "label":"KπX","source":"person","source_p":0.99,"p":1.0,"margin":187.4,"trust":0.998,"shadow":false,…}
-{"port":2,"kind":"turns","run":"…:80.6","segments":[[80.6,81.6,"1abe…"],[81.6,84.6,"77d2…"]]}
-{"port":2,"kind":"partial","run":"…:80.6","text":"send the notes to"}
-{"port":2,"kind":"text","run":"…:80.6","revision":1,"text":"send the notes to KπX","doubt":"taught",
- "p":0.97,"words":[{"w":"send","trust":0.99,"agreed":true,"new":false},…],"readings":[…]}
-{"port":2,"kind":"question","id":"…:80.6#text","about":"text","choices":["… pi x","… pie ex"],"doubt":"ambiguous"}
-{"port":2,"kind":"correction","what":"text","answers":"…:80.6#text","line":7,"refused":null}
+{"port":3,"kind":"turns","run":"…:80.6","segments":[[80.6,81.6,"1abe…"],[81.6,84.6,"77d2…"]]}
+{"port":3,"kind":"partial","piece":"…:80.6#2","run":"…:80.6","t0":84.1,"text":"send the notes to"}
+{"port":3,"kind":"text","piece":"…:80.6#2","run":"…:80.6","speakers":{"1abe…":0.92,"77d2…":0.08},
+ "revision":1,"text":"send the notes to KπX","doubt":"taught","p":0.97,"language":"en","told":"en",
+ "speech":0.61,"words":[{"w":"send","trust":0.99,"agreed":true,"new":false},…],"readings":[…]}
+{"port":3,"kind":"question","id":"…:80.6#2#text","about":"text","piece":"…:80.6#2",
+ "choices":["… pi x","… pie ex"],"words":["pi","x"],"doubt":"unseen"}
+{"port":3,"kind":"correction","what":"text","answers":"…:80.6#2#text","line":7,"refused":null}
 ```
 
 A consumer (the arbiter, the mouth) reads `port.read()` / `port.follow()` and gets typed events;
@@ -114,10 +128,11 @@ terminal uses:
 
 ```python
 inbox = port.Inbox(memory)
-inbox.correct("text", rows, text="send the notes to KπX")   # or same/different/not_voice/name/person/device
-inbox.answer(question_id, text="Alice")                        # a name, or what was said
-inbox.answer(question_id, choice=1)                            # or one of the question's choices
-inbox.undo(line)                                               # forget one, exactly
+# what: text, same, different, not_voice, name, person or device
+inbox.correct("text", rows, text="send the notes to KπX")
+inbox.answer(question_id, text="Alice")  # a name, or what was said
+inbox.answer(question_id, choice=1)  # or one of the question's choices
+inbox.undo(line)  # forget one, exactly
 ```
 
 So a vocal correction is: the mouth reads a `question` aloud, the ear hears the answer, the
@@ -176,10 +191,42 @@ Then `make status`, `make events`, `make questions`, `make answer Q=… A="…"`
 | English + French, clean and under music at 0 dB, Parakeet + turbo | 3 errors in 49 words (6 %), two of them one homophone; every text revised in the silence |
 | a name mis-heard, answered once | written right the next time, no question asked |
 
+### On a real session (PSG - Barça, 2026-10-20, replayed: `make test-live`)
+
+Word recall against two other systems' readings of the same audio (Whisper turbo told
+French on 30 s blocks / Parakeet on 20 s blocks): a measurement, not a target, and
+neither reference is the truth. v2.0 is what the ear wrote live.
+
+| segment | what makes it hard | v2.0 live | v2.1 replayed |
+|---|---|---|---|
+| match, 9 min | TV across the room at -40 dBFS, crowd under it | .426 / .593 | .396 / **.598** |
+| KπX in the room, 8.5 min | short phrases over the TV, Whisper detecting 7 languages | .235 / .436 | **.312 / .480** |
+| studio, 12 min | talk that never pauses; Parakeet translating to English | .392 / .506 | **.775 / .673** |
+| a player interviewed, 2 min | question and answer in one run | .013 / .016 | **.752** / .144 |
+| 17 min without a cut | whistle, ads, studio, interview | | .784 / .613, slow pass 0.74 s per s, never behind |
+| almost silence, 3 min | -50 dBFS | | 4 pieces, 80 % of the words written heard by another system |
+
+Who on the same record: every television voice `device`, KπX `person`; questions only about
+people already known (KπX's name, KπX's doubtful words), 0 to 4 per segment; 0 scribe errors.
+Limits, measured: KπX over the television stays near the recognisers' own oracle (.38: what
+the better of the two readings would give, piece by piece); a voice heard alone at the very
+start of a memory, misdetected the same way by both detectors, is told that language until
+another voice or a longer detection says otherwise (the goal, 30 s cold: English, once). On
+the match the two references disagree (each favours its own recogniser): the reader's
+preference between recognisers is the base's until KπX corrects a piece.
+
 ## Tests
 
 ```bash
 make test-fast   # no model, no download: law, maths, model, reader, disk, CLI
 make test        # + the real sensors, recognisers and simulated rooms (needs make fetch)
+make test-live   # + a real session replayed (needs its recording on this machine)
 make check       # ruff
 ```
+
+`make test-live` replays segments of a real session (`tests/live/<name>.json`, its
+manifest: where each segment is and what makes it hard) through the ear, from the memory
+it had then, with the real recognisers. The recording itself stays on the operator's
+machine (`PI_EAR_LIVE`, default `~/.cache/π/data/live/`): broadcast audio and the voices of
+a home are never committed. No reading is the truth: each segment is measured against two
+other systems' readings and against what the ear wrote live.

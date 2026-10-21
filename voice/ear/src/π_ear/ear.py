@@ -26,7 +26,6 @@ from __future__ import annotations
 import math
 import threading
 import time
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,8 +46,8 @@ from π_ear.io import (
 )
 from π_ear.model import Model, Weights
 from π_ear.port import PORT
-from π_ear.scribe import RunText, Scribe, rebuild_reader
-from π_ear.sense import BANDS, Sensor, Separator, rms_dbfs, spectrum, speech_probability
+from π_ear.scribe import Scribe, rebuild_reader
+from π_ear.sense import BANDS, Sensor, Separator, rms_dbfs, spectrum
 from π_ear.source import Source
 from π_ear.words import Reader
 
@@ -148,7 +147,10 @@ class Ear:
         # [line, rows at the time, kind, {rows, label} as applied (an answer resolved)]
         self.applied: list[list] = saved.get("applied", [])
         self.undone: set[int] = set(saved.get("undone", []))
+        # every correction the ear could not obey, and why: shown by `ctl status`, never silent
+        self.refused: list[dict] = saved.get("refused", [])
         self.counters = saved.get("counters", {})
+        self._align_spectra()
         self.seen: dict[str, str] = saved.get("seen", {})  # voice -> the session it was first heard
         self.asked: set[str] = set()
         self.source = self._rebuild_source()
@@ -174,7 +176,15 @@ class Ear:
                     else None
                 )
                 self.scribe = Scribe(
-                    self.reader, fast, slow, separator, self._write, self.places.memory
+                    self.reader,
+                    fast,
+                    slow,
+                    separator,
+                    self._write,
+                    self.places.memory,
+                    self.places.models,
+                    source_of=self.source_of,
+                    floor_s=self.sensor.min_speech_s,
                 )
 
     def _save(self) -> None:
@@ -186,6 +196,7 @@ class Ear:
                 "corrections_seen": self.corrections_seen,
                 "applied": self.applied,
                 "undone": sorted(self.undone),
+                "refused": self.refused,
                 "counters": self.counters,
                 "seen": self.seen,
                 "weights": self.model.base.source,
@@ -254,9 +265,9 @@ class Ear:
                 self.floor["power"] += float(np.mean(np.square(chunk.samples)))
                 self.floor["chunks"] += 1
             self._handle(pieces, runs)
-            self._partial()
+            self._hear()
         if self.scribe:
-            self.scribe.set_speaking(self.sensor.speaking())
+            self.scribe.set_speaking(self.sensor.speaking(), self._person_speaking())
         if worked and self.live:
             self.tailer.prune()
         return worked
@@ -361,16 +372,25 @@ class Ear:
                 + (f"  {source}" if source == "device" else "")
             )
 
-    def _partial(self) -> None:
-        """The run in progress, handed to the scribe: the text appears while it is said."""
+    def _hear(self) -> None:
+        """The run in progress, handed to the scribe: it cuts and reads it as it grows."""
         if self.scribe is None:
             return
         current = self.sensor.run_audio()
         if current is None:
             return
         start, samples = current
-        rows = self.runs.get(start, {}).get("rows", [])
-        self.scribe.partial(self.run_id(start), samples, list(rows))
+        decisions = self.runs.get(start, {}).get("decisions", [])
+        self.scribe.hear(self.run_id(start), self.stream_s(start), samples, decisions)
+
+    def _person_speaking(self) -> bool:
+        """Is the voice of the run in progress a person (the scribe keeps free for them)?"""
+        current = self.sensor.run_audio()
+        if current is None:
+            return False
+        decisions = self.runs.get(current[0], {}).get("decisions", [])
+        voiced = [d["speaker"] for d in decisions if d["kind"] in VOICED]
+        return bool(voiced) and self.source_of(voiced[-1])[0] == "person"
 
     def _close(self, run) -> None:
         """A speech run ended: its turns, then its text, unless every window of it was
@@ -382,8 +402,6 @@ class Ear:
             return
         decisions = info["decisions"]
         self._turns(run, decisions)
-        voices = [d["speaker"] for d in decisions if d["kind"] in VOICED and d["learned"]]
-        voices = voices or [d["speaker"] for d in decisions if d["kind"] in VOICED]
         identifier = self.run_id(run.start)
         if all(d["kind"] == "noise" for d in decisions):
             self._bump("runs_of_sounds")
@@ -393,19 +411,7 @@ class Ear:
         if self.scribe is None:
             return
         self._bump("runs_transcribed")
-        mixed = any(d["kind"] in ("noise", "unknown") for d in decisions if d["learned"])
-        self.scribe.finish(
-            RunText(
-                run=identifier,
-                t0=self.stream_s(run.start),
-                t1=self.stream_s(run.start + len(run.samples)),
-                rows=info["rows"],
-                voice=Counter(voices).most_common(1)[0][0] if voices else None,
-                samples=run.samples,
-                mixed=mixed,
-                speech=float(np.mean(speech_probability(self.places.models, run.samples))),
-            )
-        )
+        self.scribe.finish(identifier, self.stream_s(run.start), run.samples, decisions)
 
     def _turns(self, run, decisions: list[dict]) -> None:
         """Who spoke when, to the half window (Q4): each half window takes the voice of
@@ -437,38 +443,68 @@ class Ear:
             return []
         return [r for c in voice.conditions for r in self.model.clusters[c].members]
 
+    def _align_spectra(self) -> None:
+        """One spectral row per embedding row, whatever the memory's history.
+
+        Measured live (2026-10-20): a memory written before v2 had 1449 rows and no
+        spectra; v2 appended spectra from row 1449 on, at index 0, so every source
+        decision of that session read another window's spectrum (KπX came out
+        a device), and the voices heard after the last spectral row had none
+        (``source_p``: NaN). Both files only ever grow together since v2, so the rows
+        without a spectrum are the oldest ones: they are put back in front, as unseen
+        rows (NaN), kept out of every mean.
+        """
+        missing = len(self.store) - len(self.spectra)
+        if missing > 0:
+            unseen = [np.full(BANDS, np.nan)] * missing
+            self.spectra.rows = unseen + self.spectra.rows
+            self._bump("rows_without_spectrum")
+        elif missing < 0:  # a crash between the two appends: the extra rows are no one's
+            self.spectra.rows = self.spectra.rows[: len(self.store)]
+        else:
+            return
+        np.asarray(self.spectra.rows, dtype=np.float32).reshape(-1, BANDS).tofile(
+            self.places.spectra
+        )
+
+    def shape_of(self, rows) -> np.ndarray | None:
+        """The mean spectral shape of these windows, over those that were seen; None if none was."""
+        seen = [self.spectra(r) for r in rows if r < len(self.spectra)]
+        seen = [x for x in seen if np.all(np.isfinite(x))]
+        return np.mean(seen, axis=0) if seen else None
+
     def source_of(self, key: str | None) -> tuple[str | None, float | None]:
+        """Person or device, for a voice: told by a correction, else decided from its shape.
+        A voice whose windows were never seen spectrally is not decided: (None, None)."""
         voice = self.model.voices.get(key) if key else None
         if voice is None:
             return None, None
         if voice.source:
             return voice.source, 1.0
-        rows = self.voice_rows(key)
-        if not rows:
-            return None, None
-        shape = np.mean([self.spectra(r) for r in rows if r < len(self.spectra)], axis=0)
-        return self.source.decide(shape)
+        shape = self.shape_of(self.voice_rows(key))
+        return self.source.decide(shape) if shape is not None else (None, None)
 
     def _rebuild_source(self) -> Source:
         source = Source(self.model.base.spectra)
-        spectra = EmbeddingStore(self.places.spectra, BANDS)
         lines, _ = read_jsonl(self.places.corrections)
         for number, line in enumerate(lines, 1):
             if line["kind"] in ("person", "device") and number not in self.undone:
-                rows = [r for r in line.get("rows", []) if r < len(spectra)]
-                if rows:
-                    source.add(line["kind"], np.mean([spectra(r) for r in rows], axis=0))
+                shape = self.shape_of(line.get("rows", []))
+                if shape is not None:
+                    source.add(line["kind"], shape)
         return source
 
     # -- questions (Q5) ----------------------------------------------------------------------
     def _ask_name(self, event: dict) -> None:
-        """A voice heard again in another session, still nameless: ask who it is, once."""
+        """A person heard again in another session, still nameless: ask who it is, once."""
         key = event["speaker"]
         if event["kind"] not in VOICED or key is None:
             return
         first = self.seen.setdefault(key, self.session)
         voice = self.model.voices.get(key)
         if first == self.session or voice is None or voice.label or key in self.asked:
+            return
+        if self.source_of(key)[0] != "person":  # a voice on television is nobody to ask
             return
         self.asked.add(key)
         self._write(
@@ -501,15 +537,17 @@ class Ear:
                 refused = self._undo(int(line["line"]))
             elif kind == "text":
                 refused = (
-                    self.scribe.correct(rows, line["text"], number) if self.scribe else "no scribe"
+                    self.scribe.correct(rows, line["text"], number, line.get("piece"))
+                    if self.scribe
+                    else "no scribe"
                 )
                 if refused is None:
                     self.applied.append([number, len(self.store), "text"])
             elif kind in WHO:
                 if kind in ("person", "device"):
-                    known = [r for r in rows if r < len(self.spectra)]
-                    if known:
-                        self.source.add(kind, np.mean([self.spectra(r) for r in known], axis=0))
+                    shape = self.shape_of(rows)
+                    if shape is not None:
+                        self.source.add(kind, shape)
                 self.model.correct(kind, rows, line.get("label"))
                 self.applied.append(
                     [number, len(self.store), kind, {"rows": rows, "label": line.get("label")}]
@@ -517,6 +555,10 @@ class Ear:
             else:
                 refused = f"unknown kind {kind!r}"
             self._bump("corrections")
+            if refused:
+                self.refused.append(
+                    {"line": number, "kind": kind, "why": refused, "utc": utc_now()}
+                )
             self._write(
                 {
                     "kind": "correction",
@@ -551,16 +593,21 @@ class Ear:
         if asked is None:
             return "answer", [], line, f"no question {question!r} in this record"
         if asked["about"] == "name":
-            return (
-                "name",
-                asked["rows"],
-                {**line, "label": line.get("label") or line.get("text")},
-                None,
-            )
+            name = (line.get("label") or line.get("text") or "").strip()
+            if not name:
+                return "answer", [], line, "an answer to a name question names someone"
+            return "name", asked["rows"], {**line, "label": name}, None
         text = line.get("text")
         if text is None and line.get("choice") is not None:
-            text = asked["choices"][int(line["choice"])]
-        return "text", asked["rows"], {**line, "text": text}, None
+            choices = asked["choices"]
+            if not 0 <= int(line["choice"]) < len(choices):
+                return "answer", [], line, f"choice {line['choice']} of {len(choices)}"
+            text = choices[int(line["choice"])]
+        if text is None:  # "" is an answer: nothing was said
+            return "answer", [], line, "an answer gives a text or a choice"
+        if self.scribe:
+            self.scribe.answered(asked.get("speaker"))
+        return "text", asked["rows"], {**line, "text": text, "piece": asked.get("piece")}, None
 
     def _undo(self, target: int) -> str | None:
         """Forget one correction exactly: rebuild what it taught by replaying the rest."""
@@ -570,7 +617,9 @@ class Ear:
         kept = [a for a in self.applied if a[0] != target]
         self.undone.add(target)
         if entry[2] == "text":
-            self.reader = rebuild_reader(self.places.memory, self.model.base.reader, self.undone)
+            self.reader = rebuild_reader(
+                self.places.memory, self.model.base.reader, self.undone, self.reader
+            )
             if self.scribe:
                 self.scribe.reader = self.reader
         else:
@@ -657,6 +706,13 @@ class Ear:
                 "lexicon_words": sum(len(v) for v in self.reader.memory.lexicon.values()),
                 "substitutions": len(self.reader.memory.substitutions),
                 "pending": self.scribe.pending() if self.scribe else 0,
+                **(self.scribe.stats() if self.scribe else {}),
+            },
+            "corrections": {
+                "seen": self.corrections_seen,
+                "applied": len(self.applied),
+                "undone": sorted(self.undone),
+                "refused": self.refused,
             },
             "absorbed": model.absorbed,
             "rows": len(self.store),
