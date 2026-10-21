@@ -708,6 +708,29 @@ crowd, KπX's shouts made voices of one window each (16 dB over the floor, a per
 spectrum: rightly people), and each was asked what it had said. A voice of one window may be
 nobody; a real one comes back.
 
+And then the live test (`make test-live`) replayed KπX's segment once more and Whisper was
+told Chinese four times: the order of the scribe's jobs varies with the clock, people's
+pieces are revised first, and for minutes the room was KπX's voice alone, its misdetections
+confirming each other while the television's French waited in the queue. A second detector
+was there all along: the language of what the fast recogniser wrote, at once, on every
+piece, with its own reliability learned like Whisper's (`"fast"`). It detected nothing, and
+that showed the deepest bug of the pass: the text's language (character trigrams with an
+open class) took the trigrams already seen as the open class's universe, so a French trigram
+seen once was likelier "in another language" than in French, and on the base's few hundred
+words "le match est fini ce soir" was 99.9999 % another language. The reader's language term
+had paid it on every French reading until the stream's own words outgrew it. The universe is
+every trigram that could be written now ((characters + 1)^3). A detector never seen wrong
+also came out "unknown" instead of "reliable" (Laplace's succession now: one right and one
+wrong pseudo-detection at the data's mean length). Replayed three times, KπX's voice is told
+French 11 to 13 times and never another language.
+
+Fixing the text's language moved the match: the reader prefers the fast reading more often
+(52 pieces of 94 against 43), says "not understood" less (17 against 23) and "ambiguous"
+more (6 against 1); against Whisper-fr 0.438 -> 0.396, against Parakeet 0.582 -> 0.598. Each
+reference favours its own recogniser, and nothing unsupervised says which recogniser is
+right in this regime: the reader's preference is still the base's, until KπX corrects a
+piece. Not tuned to move a number.
+
 **Zero trust, the review.** Every module read again, line by line, each finding with a test
 that fails without its fix: a voice change was gated on `trust or 1` (a calibrated trust of
 0 read as 1); the audio of every piece was kept for the whole session (460 MB on two hours);
@@ -724,4 +747,30 @@ test built loaded its own Whisper turbo (a gigabyte). Recognisers are loaded onc
 process and shared, behind a lock (their language is set per call).
 
 ### The replay, segment by segment (word recall, vs Whisper-fr / vs Parakeet)
+
+Final build, from the memory of the session's end (`make test-live`; lab runs 6-11). "Only
+fast/slow" is what one recogniser alone would have given; "oracle" the better reading of
+each piece against Whisper-fr. The reader beats either recogniser alone where they disagree
+by regime, and sits at the oracle where one of them is simply right.
+
+| segment | v2.0 live | v2.1 | only fast | only slow | oracle | told French |
+|---|---|---|---|---|---|---|
+| match | .426 / .593 | .396 / .598 | .430 / .588 | .433 / .549 | .420 | 23 of 94 |
+| KπX | .235 / .436 | .312 / .480 | .256 / .468 | .348 / .486 | .377 | 12 of 18 of KπX's (0 another language, 3 replays) |
+| studio | .392 / .506 | .775 / .673 | .593 / .651 | .808 / .637 | .842 | 0 of 94 (detection right) |
+| player | .013 / .016 | .752 / .144 | .285 / .171 | .718 / .134 | .752 | 0 of 17 |
+| crowd | | .217 / .377 | .210 / .441 | .252 / .364 | .280 | 15 of 53 |
+| whistle, ads | | .167 / .587 | .167 / .659 | .190 / .641 | .167 | 0 of 21 |
+| another programme | | .333 / .342 | | | | |
+| 17 min in one stretch | | .784 / .613 | | | | slow pass 0.74 s/s, 0 behind |
+
+What the numbers do not say: the Whisper-fr reference was itself told French, so telling
+French flatters it (the Parakeet column is the neutral one); on segments shorter than its
+30 s blocks (the interview, 48 s; the goal, 30 s) it is not a measurement at all, a block
+straddling the segment counting whole or not at all. KπX's own segment is bounded by the
+recognisers (oracle .38), not by the reader. Cold start is the remaining weakness of the
+language model: alone at the start of a memory and misdetected the same way by both
+detectors, a voice is told that language (the goal replayed from nothing: English, once)
+until another voice or a longer detection says otherwise; a memory keeps its room's
+languages from one session to the next.
 

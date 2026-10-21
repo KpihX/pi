@@ -344,3 +344,19 @@ in `IDEAS.md`, section "v2.1", with what each fix measured on the replay.
    should be few, about KπX's own words only.
 3. Answer one (`make questions`, `make answer`): KπX's voice's language and words then stay.
 4. If KπX's voice comes out a device, `make correct C="person --speaker b54d13…"`, once.
+
+**Open, measured, not solved here:**
+
+1. Cold start of the language model: a voice alone at the start of a memory, misdetected
+   the same way by both detectors, is told that language (the goal replayed from nothing:
+   English, once). A memory keeps its room's languages, so it happens once per memory.
+5. Which recogniser to prefer in a regime is the base's until a correction: on the match the
+   two references disagree by 4 points each way. An unsupervised signal for it (the voice's
+   own agreement between readings over time?) is open.
+2. KπX over the television is bounded by the recognisers (oracle .38 against Whisper-fr):
+   a better recogniser for far, overlapped speech, or the separator on those runs, is the
+   next lever, not the reader.
+3. Voices still fragment on shouts and crowd (one window, a new key): no question is asked
+   about them now, but who should merge them back once they recur.
+4. A run of only known sounds longer than a slow window has its first pieces written
+   before the run is retracted (8 runs of sounds in 969 live, none that long).

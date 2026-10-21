@@ -63,6 +63,7 @@ import numpy as np
 from π_ear import asr, contract
 from π_ear.asr import Hypothesis, Word
 from π_ear.io import append_jsonl, read_jsonl, utc_now
+from π_ear.language import FAST
 from π_ear.lexicon import tokens
 from π_ear.sense import Silero
 from π_ear.words import NONE, Context, Heard, Reader, mean_logp
@@ -418,6 +419,11 @@ class Scribe:
             self.regime["count"] += 1
         piece.fast = asr.read(self.fast, samples)
         self.reader.heard(piece.fast.text)
+        languages = self.reader.languages
+        written = languages.of_text(piece.fast.text) if piece.voice is not None else None
+        if written:  # the language of the fast text: a detector heard at once (language.py)
+            language = max(written, key=written.get)
+            languages.heard(piece.voice, language, "", True, piece.t1 - piece.t0, FAST)
         if piece.voice is not None and any(w.logp is not None for w in piece.fast.words):
             self.regime["logp"] += mean_logp(piece.fast)
             self.regime["read"] += 1

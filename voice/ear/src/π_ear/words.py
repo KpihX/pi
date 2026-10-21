@@ -68,7 +68,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from π_ear.asr import Hypothesis
-from π_ear.language import Languages
+from π_ear.language import FAST, Languages
 from π_ear.lexicon import Memory, align, errors, tokens
 from π_ear.sphere import choice_probabilities, fit_choice
 
@@ -564,6 +564,13 @@ def fit_reader(pieces: list[Heard]) -> dict:
         if heard.language and heard.slow is not None and heard.slow.language:
             seconds = heard.context.seconds or (heard.fast.words[-1].t1 if heard.fast.words else 1)
             reader.languages.measured(seconds, heard.slow.language == heard.language)
+    for heard in pieces:  # the fast recogniser's text, as a detector of its language
+        written = reader.languages.of_text(heard.fast.text) if heard.language else None
+        if written:
+            seconds = heard.context.seconds or (heard.fast.words[-1].t1 if heard.fast.words else 1)
+            reader.languages.measured(
+                seconds, max(written, key=written.get) == heard.language, FAST
+            )
     episodes = 0
     for heard in pieces:
         readings, features = reader.matrix(heard.fast, heard.slow, heard.context)

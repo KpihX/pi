@@ -310,6 +310,7 @@ def base_reader(data: Path, models: Path, rng) -> dict:
     on speech, as the ear does live (``Context.regime``).
     """
     from π_ear import asr
+    from π_ear.language import FAST, SLOW, Languages
     from π_ear.sense import Sensor, speech_probability
     from π_ear.words import Context, Heard, fit_reader, mean_logp
 
@@ -403,6 +404,8 @@ def base_reader(data: Path, models: Path, rng) -> dict:
     # reliability in length was free, and three detections of one voice on the live
     # replay turned it over (longer came out less reliable).
     window = asr.window_s(slow) if slow else None
+    texts = Languages()
+    texts.load({"words": out["languages"]["words"]})
     if slow is not None and window:
         by_voice: dict[tuple, list] = {}
         for name, x, _, voice, language in pieces:
@@ -419,7 +422,16 @@ def base_reader(data: Path, models: Path, rng) -> dict:
                 detected = heard_by(contract.SLOW, slow, x).language
                 if detected:
                     out["languages"]["base"].append(
-                        [len(x) / contract.RATE, float(detected == language)]
+                        [len(x) / contract.RATE, float(detected == language), SLOW]
+                    )
+                written = texts.of_text(heard_by(contract.FAST, fast, x).text)
+                if written:
+                    out["languages"]["base"].append(
+                        [
+                            len(x) / contract.RATE,
+                            float(max(written, key=written.get) == language),
+                            FAST,
+                        ]
                     )
                 k *= 2
     out["regime"] = means["clean"]

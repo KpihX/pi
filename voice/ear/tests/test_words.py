@@ -343,7 +343,9 @@ def test_languages_round_trip():
     # v2.1's first build saved a weight per detection and its counts: recounted
     old = {**languages.to_dict(), "detections": [["v1", "fr", 2.0, 0.8]], "voices": {"v1": {}}}
     again.load(old)
-    assert again.detections == [("v1", "fr", 2.0)] and again.of_voice("v1")["fr"] > 0
+    assert again.detections == [("v1", "fr", 2.0, "slow")] and again.of_voice("v1")["fr"] > 0
+    again.load({**old, "detections": [["v1", "fr", 2.0]]})  # before it: no weight, no detector
+    assert again.detections == [("v1", "fr", 2.0, "slow")]
     assert again.of_text(FR[1]) == languages.of_text(FR[1])
 
 
@@ -436,3 +438,44 @@ def test_a_voice_misdetected_in_its_regime_is_told_the_language_of_the_room():
     spoken = languages.of_voice("guest")
     assert max(spoken, key=spoken.get) == "en"
     assert languages.choose("guest", 2.0) in ("en", None)
+
+
+def test_the_fast_text_is_a_detector_with_its_own_reliability():
+    """The fast recogniser's text is a language detector heard at once on every piece;
+    its reliability is learned apart from Whisper's: Parakeet translates long studio
+    talk to English, so its detections are less reliable the longer the piece."""
+    languages = Languages()
+    for seconds in (2.0, 4.0, 8.0, 16.0, 28.0):
+        for _ in range(10):
+            languages.measured(seconds, True)  # Whisper: right at every length
+        for i in range(10):  # the fast text: right on short pieces, translated on long
+            languages.measured(seconds, i * 28.0 >= seconds * 10 - 28.0, "fast")
+    for _ in range(12):
+        languages.heard("tv", "fr", FR[0], True, 25.0)
+    languages.refit()
+    assert languages.detection_right(28.0, None, "fast") < languages.detection_right(
+        2.0, None, "fast"
+    )
+    assert languages.detection_right(28.0) > languages.detection_right(28.0, None, "fast")
+    # the room's French reaches a new voice from the fast text alone, before any slow pass
+    for _ in range(6):
+        languages.heard("tv2", "fr", "", True, 3.0, "fast")
+    languages.heard("kpihx", "zh", FR[1], True, 4.1)
+    languages.refit()
+    assert languages.choose("kpihx", 2.0) in ("fr", None)
+
+
+def test_the_language_of_a_text_is_read_with_the_base_s_own_few_words(base):
+    """The open class once took the trigrams already seen as its universe: with the
+    base's few hundred words, a French trigram seen once was likelier "in another
+    language", and "le match est fini ce soir" came out 99.9999 % another language."""
+    reader = Reader(base)
+    for text, language in (
+        ("le match est fini ce soir", "fr"),
+        ("Yamal, l'accélération de mal, yamal face à Zé Révri", "fr"),
+        ("No, uh just from the match the coach the way", "en"),
+    ):
+        written = reader.languages.of_text(text)
+        assert max(written, key=written.get) == language, (text, written)
+    written = reader.languages.of_text("我先走想了他心目里方")
+    assert max(written, key=written.get) == "?"

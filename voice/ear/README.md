@@ -191,6 +191,30 @@ Then `make status`, `make events`, `make questions`, `make answer Q=… A="…"`
 | English + French, clean and under music at 0 dB, Parakeet + turbo | 3 errors in 49 words (6 %), two of them one homophone; every text revised in the silence |
 | a name mis-heard, answered once | written right the next time, no question asked |
 
+### On a real session (PSG - Barça, 2026-10-20, replayed: `make test-live`)
+
+Word recall against two other systems' readings of the same audio (Whisper turbo told
+French on 30 s blocks / Parakeet on 20 s blocks): a measurement, not a target, and
+neither reference is the truth. v2.0 is what the ear wrote live.
+
+| segment | what makes it hard | v2.0 live | v2.1 replayed |
+|---|---|---|---|
+| match, 9 min | TV across the room at -40 dBFS, crowd under it | .426 / .593 | .396 / **.598** |
+| KπX in the room, 8.5 min | short phrases over the TV, Whisper detecting 7 languages | .235 / .436 | **.312 / .480** |
+| studio, 12 min | talk that never pauses; Parakeet translating to English | .392 / .506 | **.775 / .673** |
+| a player interviewed, 2 min | question and answer in one run | .013 / .016 | **.752** / .144 |
+| 17 min without a cut | whistle, ads, studio, interview | | .784 / .613, slow pass 0.74 s per s, never behind |
+| almost silence, 3 min | -50 dBFS | | 4 pieces, 80 % of the words written heard by another system |
+
+Who on the same record: every television voice `device`, KπX `person`; questions only about
+people already known (KπX's name, KπX's doubtful words), 0 to 4 per segment; 0 scribe errors.
+Limits, measured: KπX over the television stays near the recognisers' own oracle (.38: what
+the better of the two readings would give, piece by piece); a voice heard alone at the very
+start of a memory, misdetected the same way by both detectors, is told that language until
+another voice or a longer detection says otherwise (the goal, 30 s cold: English, once). On
+the match the two references disagree (each favours its own recogniser): the reader's
+preference between recognisers is the base's until KπX corrects a piece.
+
 ## Tests
 
 ```bash
