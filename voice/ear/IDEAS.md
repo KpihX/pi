@@ -788,3 +788,77 @@ its own speakers and picked up by its own microphone. Two consequences the analy
 
 Every "device" voice of that session was the machine itself. Nothing measured above changes;
 what it means does (see the proposals that follow this correction).
+
+---
+
+## v2.2 (2026-10-21): an ambient ear (KπX: "un système humain, ambiant, jamais confiné")
+
+KπX's correction, kept here because it is the brief of everything below: the ear is not for one
+voice. KπX alone, with friends or classmates, in a meeting with a trusted group, with voices
+coming out of the phone or the PC, with a video playing: it must understand the scene the way
+a person who is there does, and assume no scenario. And two answers: the machine's own output
+may be captured, by configuration (`PI_EAR_OUTPUT`, on by default; off, the microphone alone is
+the ear); what it played is kept, optimised (text and metadata, no audio past the corpus bound).
+
+### Step 1: two streams, one ear
+
+**Why.** What the machine plays exists, exactly, before it reaches the air: its output's
+monitor. A person in the room does not have that; the ear does, so it should not guess
+through the microphone what it can read directly.
+
+**What it is.** `make rec-out` records the monitor beside the microphone (same chunks, same
+names: one clock) and `π-ear apps` writes which applications play, each second
+(`apps.jsonl`, from the sound server). The ear has two channels (`ear.Channel`): the
+microphone and the machine. Each has its own sensor, runs and floor; both feed **one** model
+of who, the machine's windows in a place of their own. Every decision, turn and text says its
+`channel`; the machine's say which `apps` played them (port 4).
+
+**Taking the machine out of the microphone (`echo.py`), measured before it was built**
+(lab `aec_domain`, `aec_compare`: a simulated laptop, its small speakers and the room, French
+sentences said over LibriSpeech it plays):
+
+| canceller | echo removed | the person's words read (Parakeet), person as loud as the machine |
+|---|---|---|
+| none | 0 dB | almost none |
+| WebRTC AEC3 | 20-25 dB | **none**: its residual suppressor gates the near end in double talk |
+| Speex MDF, linear only | about 16 dB | **three quarters** |
+
+AEC3 is built for telephony, where silencing the near end while the far end speaks is a
+feature; for an ear that must hear people while the machine plays, it is the failure itself.
+MDF estimates its own step from the stream (Valin 2007), so nothing is set. Its limit is
+physical and measured: a small driver pushed into its nonlinearity leaves what no linear
+filter models (a scene drawn with a harsher driver: 9-11 dB removed, the person still unread).
+
+**The offset between the two recorders is learned**, never assumed: they start at different
+moments, so the streams are apart by up to a chunk plus the output's latency, more than any
+filter tail. GCC-PHAT on each stretch of played sound finds it (to the sample on four lags
+from 0 to 900 ms, plus the speaker's and room's own few milliseconds); the most frequent
+estimate since the last hole in the stream is used; until there is one, nothing is subtracted.
+
+**Two bugs found by building it, each with its test.** The two streams arrive one chunk at a
+time live but all at once in a replay: the machine's chunks were pushed first and the bounded
+reference had dropped the start when the microphone needed it. The streams are now merged by
+their seconds (a machine chunk goes first while it is not further ahead than an offset can
+reach). And a microphone chunk waiting for the machine's could see its file pruned before the
+corpus copied it: the corpus copies at the read now.
+
+**The canceller's doubt, two numbers** (the third law): `echo` on every microphone decision,
+the share of its energy that went with the machine; `left` per chunk, how much of what remains
+the machine still explains (the coherence of the cleaned microphone with the reference). Where
+the canceller failed, `left` is high, and the state says so.
+
+**What it does to a scene** (`tests/test_output.py`: a podcast in English played by the
+laptop, a person speaking French in the room, partly over it):
+
+| | the person over the machine | the person after it |
+|---|---|---|
+| output off | the sentence is lost: the microphone writes the podcast in its place | read |
+| output on | "Je voudrais qu'on reprenne le chapitre 3 demain matin." | read, unchanged |
+
+And the podcast itself is read from the machine, clean, attributed to the browser. Until the
+offset is learned (the first stretch of played sound) the microphone still writes the podcast
+heard through the air: the machine, heard twice. That is step 2's first fact to use.
+
+**Degrading visibly.** Output on but its recorder not running: the microphone is never held
+back (a microphone chunk waits at most for the next one, and not at all when no machine chunk
+ever came), and `ctl status` says `DEGRADED: no chunk of the machine's sound yet`.

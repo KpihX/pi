@@ -247,7 +247,7 @@ def test_the_decision_loop_never_waits_for_the_recognisers(tmp_path, two_voices,
     started = time.monotonic()
     while ear.tick():
         pass
-    ear._handle(*ear.sensor.flush())
+    ear._handle(ear.mic, *ear.sensor.flush())
     looped = time.monotonic() - started
     runs = ear.counters.get("runs_transcribed", 0)
     assert runs >= 2 and looped < runs * 1.0, "the loop waited for the scribe"

@@ -4,7 +4,7 @@ Two directions, both files, both append-only:
 
 * **out**, the record ``events.jsonl``: what the ear heard and decided. A
   consumer (the arbiter first) reads THIS, never the ear's internals. Every line
-  carries ``"port": 3``; lines of an older port are skipped, never guessed;
+  carries ``"port": 4``; lines of an older port are skipped, never guessed;
 * **in**, the inbox ``corrections.jsonl``: what anyone tells the ear, a person
   at a terminal, the arbiter, or a voice through the mouth and the ear itself.
   ``Inbox`` writes it; the running ear obeys at its next tick.
@@ -23,6 +23,13 @@ speech run (cut at Silero's dips, shorter than the slow recogniser's window), na
 A scribe job that fails is written as ``"kind": "error"``, outside the port (a
 consumer never needs it; ``ctl status`` counts them).
 
+Port 4 (2026-10-21, the ambient ear): two channels, the microphone (the room) and
+the machine's own sound (what this machine plays, captured before the air). A
+``Decision`` and a ``Turns`` say which ``channel`` they were heard on; a microphone
+decision carries ``echo``, the machine's share of its energy (what the echo canceller
+took out); a machine decision and a ``Text`` carry ``apps``, the applications that
+were playing. No field of port 3 changed meaning.
+
 Changing a field's meaning is a new PORT number, never an edit of this one.
 """
 
@@ -35,7 +42,7 @@ from pathlib import Path
 
 from π_ear.io import read_jsonl
 
-PORT = 3
+PORT = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +77,10 @@ class Decision:
     shadow: bool  # shifted by half a window: places the turns, never learned from
     run: float
     rms_dbfs: float
-    rel_db: float | None  # level above this session's non-speech floor
+    rel_db: float | None  # level above this session's non-speech floor (of its channel)
+    channel: str | None  # mic (the room) | machine (what this machine plays)
+    echo: float | None  # mic: the machine's share of the window's energy, taken out
+    apps: list | None  # machine: the applications playing during the window
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +90,7 @@ class Turns:
     t0: float
     t1: float
     segments: list  # [t0, t1, voice | "unknown" | "noise"]
+    channel: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +124,8 @@ class Text:
     told: str | None  # the language the slow recogniser was given (None: it detected one)
     speech: float | None  # Silero's mean over the piece
     separated: bool  # read again from the voice separated out of the music
+    channel: str | None  # mic | machine
+    apps: list | None  # machine: what played it
 
 
 @dataclass(frozen=True, slots=True)

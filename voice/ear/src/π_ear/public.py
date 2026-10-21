@@ -516,6 +516,13 @@ def synth(
     return out
 
 
+def chunk_name(index: int) -> str:
+    """The name arecord gives the chunk ``index`` seconds after 2026-10-18 00:00:00."""
+    from datetime import datetime, timedelta
+
+    return (datetime(2026, 10, 18) + timedelta(seconds=index)).strftime("%Y%m%d-%H%M%S.raw")
+
+
 @dataclass
 class Scene:
     """A simulated room: turns of speech and sounds over a noise floor, with its truth."""
@@ -554,9 +561,7 @@ class Scene:
         pcm = (np.clip(np.concatenate(self.audio), -1, 1) * 32767).astype("<i2")
         step = contract.RATE * contract.CHUNK_S
         for index, start in enumerate(range(0, len(pcm), step)):
-            (directory / f"20261018-{index:06d}.raw").write_bytes(
-                pcm[start : start + step].tobytes()
-            )
+            (directory / chunk_name(index)).write_bytes(pcm[start : start + step].tobytes())
         return directory
 
     def label_at(self, t0: float, t1: float) -> str:

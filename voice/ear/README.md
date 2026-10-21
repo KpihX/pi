@@ -167,7 +167,15 @@ make fetch    # 2. models + public corpora into ~/.cache/π (~2.4 GB downloaded 
 make rec      # pane 1: the recorder. Start once, never stop.
 make run      # pane 2: the ear. One line per decision and per text.
 make watch    # pane 3: the state moving on disk.
+make rec-out  # pane 4: what this machine plays, and which application plays it.
 ```
+
+**The machine's own sound** (`PI_EAR_OUTPUT=on`, the default). What this machine plays is
+recorded beside the microphone from its output's monitor (`PI_EAR_OUTPUT_SOURCE`, default
+`@DEFAULT_MONITOR@`, through `pipewire-pulse`), read as a channel of its own (its voices are the
+machine's, with the application that played them), and taken out of the microphone (`echo.py`),
+so the room is heard over a video, a call or music. `PI_EAR_OUTPUT=off`: the microphone alone,
+as before. Without `make rec-out`, the ear behaves as off and `make status` says so.
 
 Then `make status`, `make events`, `make questions`, `make answer Q=… A="…"`,
 `make correct C="text 812 --text '…'"`, `make undo N=3`, `make why ROW=812`,

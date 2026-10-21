@@ -115,7 +115,7 @@ def test_questions_are_listed_and_answered_in_one_line(tmp_path):
     root, memory = tmp_path / "live", tmp_path / "memory"
     root.mkdir()
     question = {
-        "port": 3,
+        "port": 4,
         "session": "s1",
         "kind": "question",
         "id": "s1:4.2#text",

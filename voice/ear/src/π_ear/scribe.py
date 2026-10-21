@@ -84,6 +84,8 @@ class Piece:
     voice: str | None = None
     mixed: bool = False
     known: bool = False  # its voice was known before it: not a voice born in this piece
+    channel: str = "mic"  # where it was heard: the room, or the machine's own sound
+    apps: list[str] = field(default_factory=list)  # what played it, on the machine
     fast: Hypothesis | None = None
     slow: Hypothesis | None = None
     language: str | None = None  # what the slow recogniser was told, if anything
@@ -414,6 +416,8 @@ class Scribe:
             mixed=any(d["kind"] in ("noise", "unknown") for d in covering if d["learned"]),
         )
         piece.known = any(d["kind"] == "known" and d["speaker"] == piece.voice for d in covering)
+        piece.channel = next((d.get("channel") for d in decisions if d.get("channel")), "mic")
+        piece.apps = list(dict.fromkeys(a for d in covering for a in d.get("apps") or []))
         if piece.voice is not None and piece.speech is not None:
             self.regime["sum"] += piece.speech
             self.regime["count"] += 1
@@ -590,6 +594,8 @@ class Scribe:
                 "fast": piece.fast.to_dict() if piece.fast else None,
                 "slow": piece.slow.to_dict() if piece.slow else None,
                 "separated": piece.separated,
+                "channel": piece.channel,
+                "apps": piece.apps,
             },
         )
 
@@ -616,6 +622,8 @@ class Scribe:
                 language=line.get("language"),
                 revision=line["revision"],
                 separated=line["separated"],
+                channel=line.get("channel", "mic"),
+                apps=line.get("apps") or [],
                 asked=True,
             )
             for row in line["rows"]:
@@ -670,6 +678,8 @@ class Scribe:
                 "told": piece.language,
                 "speech": None if piece.speech is None else round(piece.speech, 3),
                 "separated": piece.separated,
+                "channel": piece.channel,
+                "apps": piece.apps,
                 "written": utc_now(),
             }
         )

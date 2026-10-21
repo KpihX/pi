@@ -48,6 +48,26 @@ LANGUAGE = os.environ.get("PI_EAR_LANGUAGE", "")  # empty: the recognisers detec
 # Whisper turbo read through the music on their own (3 % and 5 % at 0 dB). The
 # slot stays: "sherpa-onnx-spleeter-2stems-int8", or any separator that works.
 SEPARATOR = os.environ.get("PI_EAR_SEPARATOR", "none")
+# The machine's own sound (echo.py): "on" captures what this machine plays, next to
+# the microphone (`make rec-out`), reads it as its own channel and cancels it out of
+# the microphone; "off" listens to the microphone alone. A choice of consent and of
+# transport, never a judgement: the ear works either way.
+OUTPUT = os.environ.get("PI_EAR_OUTPUT", "on")
+OUTPUT_SOURCE = os.environ.get("PI_EAR_OUTPUT_SOURCE", "@DEFAULT_MONITOR@")
+# The name the mouth gives its own playback stream: what π itself says is known to be π.
+MOUTH_APP = "π-mouth"
+# Speex MDF's frame (10 ms) and filter tail: the laptop's speaker-to-microphone path
+# with the room's reverberation, measured to fit in 256 ms (lab aec_compare, 2026-10-21).
+ECHO_FRAME = 160
+ECHO_TAIL_S = 0.256
+# The offset between the two recorders: up to a chunk (they start at different
+# moments) plus the output's latency. The stretch it is estimated on: long enough to
+# hold that lag and several syllables of what the machine played.
+ECHO_MOST_LAG_S = 1.5
+ECHO_ESTIMATE_S = 8.0
+ECHO_KEEP_CHUNKS = 8  # reference chunks kept in memory (a resource bound)
+SHARE_KEEP_CHUNKS = 120  # the machine's share per frame, kept for the windows still to decide
+SPEECH_BAND_HZ = (300, 3400)  # the telephone band: where speech's energy is, by definition
 # kept for the base: its archive carries the LibriSpeech test files
 WHISPER_DIR = "sherpa-onnx-whisper-tiny"
 
