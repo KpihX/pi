@@ -160,6 +160,15 @@ def test_the_room_is_heard_over_what_the_machine_plays(tmp_path, monkeypatch):
     # before the canceller learned, the microphone read the podcast: it says it is a copy
     early = [e for e in _texts(events, "mic") if e["text"] and e["t1"] < spans[0][0]]
     assert early and all(e["echo_of"] for e in early)
+    # and the stream measured the room with them: the machine's reading of the same sound
+    # is the truth of what the microphone read through the air, a lesson for the reader
+    measures = [e for e in events if e.get("kind") == "measure"]
+    copies = {e["piece"] for e in _texts(events, "mic") if e["echo_of"]}
+    assert measures and {m["piece"] for m in measures} <= copies
+    assert all(m["truth"] and 0 < max(m["recall"].values()) <= 1 for m in measures)
+    taught = read_jsonl(places.memory / "taught.jsonl")[0]
+    assert [t["piece"] for t in taught if t.get("echo_of")] == [m["piece"] for m in measures]
+    assert state["reader"]["room_recall"]["fast"] is not None
     # second thoughts (revise.py): what the ear says last of each window is what its
     # model says now; the first windows of a voice, said unknown, were said again
     _said_last_is_thought_now(ear, events)

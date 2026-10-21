@@ -8,6 +8,15 @@ mouth and heard back by the ear: the inbox does not care). v2.1 is v2 after its 
 (two hours of a football broadcast heard by a laptop, KπX in the room): what it got wrong, and
 how each fix was measured on the replay of that session, is in `IDEAS.md`, section "v2.1".
 
+v2.2 is the **ambient** ear (`IDEAS.md`, "v2.2"): alone, with friends, in a call, with a video
+playing, it understands the scene as a person there would. Five steps, each measured: the
+machine's own sound as a second channel, taken out of the microphone (`echo.py`, `device.py`);
+where each voice comes from, room, remote, media or π itself (`scene.py`); second thoughts,
+decisions said again when the model knows better, and questions asked only when an answer
+should change something (`revise.py`); two voices at once never learned as one
+(`overlap.py`); each voice's language over all it said, and the room measured by the stream
+itself (`lid.py`, `scribe.py`).
+
 ```
       [microphone]
            |
@@ -16,8 +25,10 @@ how each fix was measured on the replay of that session, is in `IDEAS.md`, secti
    <the audio directory>        the whole transport between the two servers
            |
    SERVER B: the ear
-     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live, + shadow windows offset by 1 s)
-     Model    who: windows -> conditions -> voices, in a place; person or device
+     Sensor   Silero VAD  ->  CAM++ (2 s windows, cut live, + shadow windows offset by 1 s);
+              pyannote segmentation (two voices at once?), on each channel
+     Model    who: windows -> conditions -> voices, in a place; room, remote, media or self;
+              thought over at every silence (revisions)
      Scribe   what, on its own thread: runs cut into pieces (a voice's phrase, under Whisper's
               window), Parakeet v3 at once, Whisper turbo on groups of pieces with context,
               a learned reader choosing between them, each voice's language, what KπX taught
@@ -37,7 +48,7 @@ how each fix was measured on the replay of that session, is in `IDEAS.md`, secti
 1. **100 % stream.** No setup phase, no calibration phase: the first window is decided like the
    thousandth.
 2. **Nothing tuned, everything learned.** `tests/test_law.py` parses `model.py`, `words.py`,
-   `source.py` and `language.py` and fails on any numeric literal but 0 and 1, and on any comparison with a
+   `source.py`, `language.py`, `scene.py` and `revise.py` and fails on any numeric literal but 0 and 1, and on any comparison with a
    constant. The numbers live in `weights/base-*.json`, measured by `π-ear base` on public
    recordings no test uses, then moved by the stream and by corrections.
 3. **Every model knows when it does not know.** Who: `unknown`, `margin` (nats), `trust` (a

@@ -360,3 +360,25 @@ in `IDEAS.md`, section "v2.1", with what each fix measured on the replay.
    about them now, but who should merge them back once they recur.
 4. A run of only known sounds longer than a slow window has its first pieces written
    before the run is retracted (8 runs of sounds in 969 live, none that long).
+
+**Open after v2.2 (the ambient ear), measured, not solved here:**
+
+1. Fragments: four synthetic voices of one engine in one room come out as three to six
+   voices even when nobody cuts in (IDEAS, step 4). The segmenter's local speakers are an
+   independent sensor of "same voice" within ten seconds; their reliability has to be
+   measured before they are used as evidence.
+2. Overlap: the gate kept only refuses windows more a mix than a voice. The finer rule (one
+   frame overlapped) helped scenes where people cut in but split a telephone-band voice:
+   a segmenter that tells band-limited speech from two voices is needed for it. A
+   calibration was refused (AUC 0.66-0.72 on the base's mixes, the stream's prior ran away).
+3. The voice links of the model of who (is this condition that voice?) are not calibrated:
+   their nats are the model's own. The answers to `same` questions are their labels.
+4. A fast recogniser told the language (`PI_EAR_FAST_TOLD`) is a slot, off: Canary 180m won
+   once and lost twice on the live recording. A larger multilingual model, when sherpa-onnx
+   publishes one, is to be measured the same way (`lab/fast_bench`).
+5. A piece whose voice changed is decided again from its readings, not read again in that
+   voice's language: its audio is gone once both recognisers have read it.
+6. The remote/media turn evidence needs the room to answer: a call where KπX only listens
+   reads as a video until the application has been told once (`remote`).
+7. Owed by KπX, live: `make rec-out` beside `make rec`, a call and a video in one session,
+   and one `remote` or `media` correction per application.

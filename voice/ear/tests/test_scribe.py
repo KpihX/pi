@@ -464,3 +464,43 @@ def test_revisions_go_on_while_a_television_talks_without_a_pause(tmp_path, voic
     scribe.finish("long", 4.0, long, _decisions(40, ["tv"], 4.0))
     scribe.set_speaking(False)
     scribe.drain()
+
+
+def test_the_fast_reader_is_told_the_language_once_it_is_a_better_bet():
+    """Step 5: a fast recogniser that can be told the language reads a voice whose
+    language is known better than detecting it; another voice, or a language the model
+    does not know, goes to the fast one, as before."""
+    from types import SimpleNamespace
+
+    from π_ear import asr
+    from π_ear.scribe import Scribe
+
+    heard = []
+
+    def recogniser(name, takes):
+        def read(samples, language=None):
+            heard.append((name, language))
+            return Hypothesis(name, (), language, name)
+
+        if not takes:
+            return lambda samples: read(samples)
+        read.name = name
+        return read
+
+    told = recogniser("canary-180m", True)
+    told.name = "canary-180m"
+    languages = {"kpihx": "fr", "guest": None, "far": "ja"}
+    me = SimpleNamespace(
+        told=told,
+        fast=recogniser("parakeet-v3", False),
+        reader=SimpleNamespace(
+            languages=SimpleNamespace(choose=lambda voice, seconds: languages.get(voice))
+        ),
+    )
+    audio = np.zeros(contract.RATE, np.float32)
+    assert Scribe._read_fast(me, "kpihx", audio)[1] is True
+    assert Scribe._read_fast(me, "guest", audio)[1] is False
+    assert Scribe._read_fast(me, "far", audio)[1] is False  # Canary knows no Japanese
+    assert Scribe._read_fast(me, None, audio)[1] is False
+    assert heard == [("canary-180m", "fr"), ("parakeet-v3", None)] * 1 + [("parakeet-v3", None)] * 2
+    assert "fr" in asr.TELLS["canary-180m"]

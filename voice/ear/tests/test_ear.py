@@ -241,6 +241,9 @@ def _plug(monkeypatch, fast=None, slow=None):
 def test_the_decision_loop_never_waits_for_the_recognisers(tmp_path, two_voices, monkeypatch):
     fast = Slow("slow words", "fast")
     _plug(monkeypatch, fast, Slow("slow words", "slow"))
+    # the loop's own sensors are not what is timed here, the scribe is: the segmenter
+    # costs some 90 ms a window, a replay feeds a window every few milliseconds
+    monkeypatch.setattr(contract, "SEGMENTATION", "none")
     places = _places(tmp_path, audio=tmp_path / "chunks", corpus=None)
     _scene(*two_voices[:2]).write(places.audio_dir)
     ear = Ear(places, from_start=True, live=False)

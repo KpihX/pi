@@ -65,6 +65,7 @@ from π_ear.asr import Hypothesis, Word
 from π_ear.io import append_jsonl, read_jsonl, utc_now
 from π_ear.language import FAST
 from π_ear.lexicon import align, tokens
+from π_ear.lid import POOLED
 from π_ear.sense import Silero
 from π_ear.words import NONE, Context, Heard, Reader, mean_logp
 
@@ -86,6 +87,7 @@ class Piece:
     known: bool = False  # its voice was known before it: not a voice born in this piece
     channel: str = "mic"  # where it was heard: the room, or the machine's own sound
     echo_of: list[str] = field(default_factory=list)  # machine pieces it repeats
+    measured: bool = False  # its echo already taught the reader what the room does
     apps: list[str] = field(default_factory=list)  # what played it, on the machine
     fast: Hypothesis | None = None
     slow: Hypothesis | None = None
@@ -134,9 +136,13 @@ class Scribe:
         echo=None,
         person_of=None,
         scene_of=None,
+        told=None,
+        pooled=None,
     ):
         self.reader = reader
         self.fast, self.slow, self.separator = fast, slow, separator
+        self.told = told  # a fast recogniser that can be told the language (PI_EAR_FAST_TOLD)
+        self.pooled = pooled  # each voice's speech, pooled for its language (lid.py)
         self.write = write
         self.memory = memory
         self.models = models
@@ -173,6 +179,7 @@ class Scribe:
         self.person_speaking = False
         self.busy = False
         self.questions = 0
+        self.room = {"fast": [0, 0], "slow": [0, 0]}  # words right, of the machine's, heard here
         self.errors: list[str] = []
         self.open_questions: dict[str | None, str] = {}  # voice -> its open question
         self.pace = {"audio": 0.0, "spent": 0.0}  # the slow recogniser's own speed, measured
@@ -471,13 +478,19 @@ class Scribe:
         if piece.voice is not None and piece.speech is not None:
             self.regime["sum"] += piece.speech
             self.regime["count"] += 1
-        piece.fast = asr.read(self.fast, samples)
+        piece.fast, told = self._read_fast(piece.voice, samples)
         self.reader.heard(piece.fast.text)
         languages = self.reader.languages
         written = languages.of_text(piece.fast.text) if piece.voice is not None else None
-        if written:  # the language of the fast text: a detector heard at once (language.py)
+        # the language of the fast text: a detector heard at once (language.py); not when
+        # it was told the language: its text says what it was told, not what it heard
+        if written and not told:
             language = max(written, key=written.get)
             languages.heard(piece.voice, language, "", True, piece.t1 - piece.t0, FAST)
+        if self.pooled is not None and piece.voice is not None and len(piece.voices) == 1:
+            found = self.pooled.add(piece.voice, samples)  # a voice alone: its own speech
+            if found:
+                languages.heard(piece.voice, found[0], "", True, found[1], POOLED)
         if piece.voice is not None and any(w.logp is not None for w in piece.fast.words):
             self.regime["logp"] += mean_logp(piece.fast)
             self.regime["read"] += 1
@@ -490,6 +503,16 @@ class Scribe:
             self._group(state, piece)
         else:
             piece.samples = None  # nothing will read it again
+
+    def _read_fast(self, voice: str | None, samples: np.ndarray) -> tuple[Hypothesis, bool]:
+        """The fast reading: by the recogniser that can be told the language, when the
+        voice's language is a better bet than detecting it (``Languages.choose``, the same
+        rule as for the slow one) and the model knows that language; else the fast one."""
+        if self.told is not None and voice is not None:
+            language = self.reader.languages.choose(voice, len(samples) / contract.RATE)
+            if language in asr.TELLS.get(getattr(self.told, "name", ""), ()):
+                return asr.read(self.told, samples, language=language), True
+        return asr.read(self.fast, samples), False
 
     def _partial(self, run: str) -> None:
         with self.lock:
@@ -767,7 +790,62 @@ class Scribe:
         self._ask(piece, decided)
         if piece.channel != "mic":
             self._echoes_of(piece)
+        elif piece.echo_of:
+            self._measure(piece, decided)
         return decided
+
+    def _measure(self, piece: Piece, decided: dict) -> None:
+        """The room, measured by the stream itself: a microphone piece that heard what the
+        machine played, through the air, read once final, against what the machine's own
+        channel read of the same sound (clean, before the air). The stretch of the
+        machine's words it heard (from the first to the last word its reading found)
+        is its truth: how each recogniser does in this room, and one more example for
+        the reader, as a correction would be, without anyone asked."""
+        if piece.measured or (piece.slow is None and self.slow is not None):
+            return
+        with self.lock:
+            played = sorted(
+                (self.pieces[k] for k in piece.echo_of if k in self.pieces), key=lambda p: p.t0
+            )
+        said = [w for p in played for w in tokens(p.decision.get("text", ""))]
+        found = [j for op, _, j in align(tokens(decided["text"]), said) if op == "="]
+        if not found:
+            return
+        truth = said[min(found) : max(found) + 1]
+        piece.measured = True
+        scores = {}
+        for name, heard in (("fast", piece.fast), ("slow", piece.slow)):
+            if heard is not None:
+                right = sum(op == "=" for op, _, _ in align(truth, tokens(heard.text)))
+                self.room[name][0] += right
+                self.room[name][1] += len(truth)
+                scores[name] = round(right / len(truth), 3)
+        context = self._context(piece)
+        self.reader.learn(Heard(piece.fast, piece.slow, " ".join(truth), context))
+        append_jsonl(
+            self.memory / "taught.jsonl",
+            {
+                "line": None,  # no correction: the stream's own (never undone by an undo)
+                "echo_of": piece.echo_of,
+                "piece": piece.id,
+                "voice": piece.voice,
+                "speech": piece.speech,
+                "regime": context.regime,
+                "confidence": context.confidence,
+                "fast": piece.fast.to_dict(),
+                "slow": piece.slow.to_dict() if piece.slow else None,
+                "truth": " ".join(truth),
+            },
+        )
+        self.write(
+            {
+                "kind": "measure",
+                "piece": piece.id,
+                "of": piece.echo_of,
+                "truth": " ".join(truth),
+                "recall": scores,
+            }
+        )
 
     def _echoes_of(self, played: Piece) -> None:
         """The microphone read the machine's sound before the machine's channel did (its
@@ -838,6 +916,11 @@ class Scribe:
             "slow_seconds_per_second": None if pace is None else round(pace, 3),
             "questions": self.questions,
             "errors": len(self.errors),
+            # what each recogniser reads, through this room, of what the machine played
+            "room_recall": {
+                name: round(right / total, 3) if total else None
+                for name, (right, total) in self.room.items()
+            },
             "regime": None
             if not self.regime["count"]
             else round(self.regime["sum"] / self.regime["count"], 3),

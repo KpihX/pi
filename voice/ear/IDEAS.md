@@ -998,3 +998,141 @@ question: each answer to a `same` question is exactly the label that would calib
 re-read by the recognisers in its voice's language (its audio is gone once read by both):
 re-reading from the corpus is step 5's. The windows of earlier sessions are not thought over
 again (their record is closed; their voices are, through the model).
+
+### Step 4: two voices at once (`overlap.py`)
+
+**Why.** At a table, in a meeting, people talk over each other all the time. CAM++ turns a
+window into the direction of *a* voice; two voices at once give a direction between theirs.
+Decided, it is the louder one at best. Learned, it drags a voice towards the other, and the
+merge invariant can then fuse two people into one.
+
+**How much it costs the ear, measured first** (lab `ov_e2e`: four Piper voices, two French
+and two English, sixty turns in one simulated room, half of the turns cut into the previous
+one by 0.4-1.2 s; truth of who spoke when by Silero on each clean voice):
+
+| scene | voices found (truth: 4) | purity of the windows of one voice |
+|---|---|---|
+| nobody cuts in | 3 to 6 | 0.70 to 0.78 |
+| half of the turns cut in | 2 to 3 | 0.48 to 0.56 |
+
+Half of all windows then hold two voices, and the ear learned from 33 to 34 of them per scene.
+
+**The sensor.** pyannote segmentation-3.0 (Plaquet & Bredin 2023), the sherpa-onnx int8
+export: ten seconds in, the posterior of nobody / one of three local speakers / two of them
+at once for each 17 ms frame (frames seen by several passes: their mean); one pass per second
+of speech at most, given the speech run the window is in, the frames kept between windows. Cost, measured: 2 minutes of conversation heard
+in 8.4 s instead of 5.2 s on one thread, under 3 % of real time.
+
+**What it decides, nothing more.** A window *more a mix than one voice* (more of its
+speech heard as two voices at once than as one voice alone, by the segmenter's expected
+frames of each) is decided (who is the louder?) and never learned, like a shadow; every
+decision says its `overlap`, that share (port 5).
+
+**The rule, chosen by two measurements that pull apart.** The first rule called a window a
+mix when its most probably overlapped *frame* was more probably overlapped than not. On the
+scenes above it helped:
+
+| scene | windows learned although mixed | clean windows lost | voices found | purity |
+|---|---|---|---|---|
+| 1 | 34 -> 29 | 10 | 3 -> 3 | 0.48 -> 0.53 |
+| 2 | 33 -> 19 | 3 | 2 -> **4** | 0.56 -> 0.58 |
+| 3 | 34 -> 16 | 0 | 2 -> 2 | 0.53 -> 0.58 |
+
+But in one of the twelve rooms where nobody speaks over anybody (`tests/test_real.py`, room
+3), it called twelve windows of FSDD's voices mixes, single frames of their telephone-band
+digits heard as two voices, and one of them came out three voices. A call's voice is
+telephone-band too: a gate that splits callers is worse than none. The share rule keeps room
+3 whole; on the scenes above it catches only the long overlaps (4 to 6 windows), and purity
+stays as without it (0.46 against 0.48 on scene 1, equal on the others). On real speech (the
+pyannote sample, its RTTM) the share is 0.14 on average where two people speak at once and
+0.03 where one does, and no clean window is a mix; its overlaps last a third of a window at
+most, so none is either (`tests/test_overlap.py`). The gate kept is the safe one: it never
+learns a window that is more a mix than a voice, and short overlaps are learned as the
+louder voice. A segmenter that tells telephone-band speech from two voices is what the
+first rule needs.
+
+**The context it is given, a bug found by the podcast scene.** The segmenter first heard the
+ten seconds before each window, whatever they were. After the machine's podcast, those ten
+seconds reached back over a stretch the echo canceller had worked on, and the person who
+spoke alone after it came out a mix (0.62 to 0.90; on the raw microphone 0.03): never
+learned, the person's room evidence fell and the scene called them media. The segmenter is
+now given the speech run the window is in, no more (the decision concerns that run, and its
+local speakers are a run's); the person is a person of the room again.
+
+**A calibration, tried and refused by its measurement.** The segmenter's posteriors carry the
+prior of the meetings it was trained on. The first build re-learned them: the base measured
+what its score looks like on one-voice and two-voice windows (mixes of the base's own voices
+through simulated places), and the stream learned how often its windows are mixes, by EM.
+Measured, the score separates the two with an AUC of 0.66 to 0.72 only
+(`public.measure_overlap`), and with evidence that weak the stream's estimate ran away: on two
+scenes of three it reached "every window is a mix", and the ear learned nothing at all. Weak
+evidence is used as what it is: the segmenter's own word, at its own prior. (FSDD's digits,
+recorded at 8 kHz, were first in the base's mixes: a 1.4 s overlap of a digit over a
+LibriSpeech voice scored as one voice; the base reader's Piper voices replaced them.)
+
+**Not yet: fragments.** Even with nobody cutting in, four people came out as three to six
+voices: synthetic voices of one engine, in one room, are close, and the model fuses or splits
+them by its own evidence. The repairs that exist are the merge invariant (fusion when one
+voice explains two clusters better), the revisions (step 3: what a fusion changes is said
+again) and the "same?" question when the model is in doubt. A segmenter's local speakers are
+another, independent sensor of "same voice" within ten seconds; using them as evidence for
+continuity needs their reliability measured first, and on this base it would be measured on
+the same weak separation. Left open, with these numbers.
+
+### Step 5: what was said, in the voice's language, and the room measured by itself
+
+**Why.** The live test's two failures of *what*: the fast recogniser (Parakeet v3, which
+cannot be told a language) wrote English or nothing for French television, and Whisper's own
+language detection on KπX's short phrases was wrong more often than right. Four things were
+tried; two are in, two were refused by their measurement.
+
+**1. A voice's language over all it said (`lid.py`), in.** Lab `slid`, the live recording,
+Whisper base's language identification on the speech of a segment cut in stretches:
+
+| voice | 4 s stretches right | 8 s | 30 s |
+|---|---|---|---|
+| KπX, over the television | 27 of 40 (0.68) | 21 of 24 (0.88) | 6 of 6 |
+| the player interviewed | 29 of 30 | 15 of 15 | 4 of 4 |
+| the studio | 39 of 40 | 40 of 40 | 22 of 22 |
+
+So each voice's own pieces (pieces of one voice only) are pooled until they fill Whisper's
+30 s window, and detected once: 0.6 to 0.85 s of two threads per 30 s of the voice
+(measured while other jobs shared the machine), about 2 to 3 % of its time. It is one
+more detector of `language.py` (`pooled`), its reliability measured on the base like the
+others' (`public.measure_pooled`: the base reader's voices, three regimes, 2 to 16 s; 60
+detections, all right, so with Laplace's two pseudo-detections it starts near-reliable), then
+judged on the stream against what its voice turned out to speak. Whisper turbo's export does
+not serve language identification (128 mel bands: every call came back empty).
+
+**2. A fast recogniser told the language, a slot, off.** Once a voice's language is a better
+bet than detecting it (the rule the slow recogniser already follows), a recogniser that can be
+told it reads the piece (`PI_EAR_FAST_TOLD`; its fast text is then not counted as a detection
+of its language: it says what it was told). Measured on the live recording (lab `fast_bench`,
+the share of Whisper-turbo-told-French's words found):
+
+| segment | Parakeet v3 | Canary 180m told French | Canary told English |
+|---|---|---|---|
+| the player | 0.12 | **0.52** | 0.05 |
+| the interview | 0.16 | 0.03 | 0.03 |
+| KπX | 0.29 | 0.16 | 0.03 |
+
+Canary 180m wins once and loses twice: it often writes nothing (sherpa-onnx's own warning,
+its first token is end of text, issue #3919). The larger multilingual models (Canary 1B v2,
+Qwen3-ASR) were not found among sherpa-onnx's published archives. The slot is there,
+tested, and off.
+
+**3. A reading fused word by word, refused.** Taking, where the two recognisers disagree,
+the word the word model trusts more (lab `fuse_bench`: Piper test voices, French and
+English, a room and a loudspeaker, 356 words): fast alone 9.0 % of words wrong, slow alone
+11.0 %, fused 10.7 %, the better of the two per sentence 6.2 %. The word model was fitted to
+say how much a word of the chosen reading deserves trust, not to choose between two words; it
+does not know enough to, and the fused reading is not added.
+
+**4. The room, measured by the stream (`scribe._measure`), in.** Step 2 already marks a
+microphone piece that heard what the machine played through the air (`echo_of`). The
+machine's own channel read that same sound clean: once the microphone piece is read, the
+stretch of the machine's words it heard is its truth. Each recogniser's recall of it is
+summed into `room_recall` (`ctl status`: how each reads, *in this room*, what a loudspeaker
+plays here), a `measure` is published (port 5), and the reader learns the piece as it would a
+correction (kept in `taught.jsonl`, never undone by an undo since no correction made it).
+Truth from the stream, nobody asked: law one. Tested end to end on the podcast scene.

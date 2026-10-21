@@ -15,6 +15,8 @@ Two directions, both files, both append-only:
     Partial     the text of a piece still being said (provisional)
     Text        a piece's reading, revised as evidence lands: words, trust, doubt
     Revision    a window decided again: who the ear says it was now, and why
+    Measure     the room measured by the stream: what the microphone read of what
+                the machine played, against the machine's own reading
     Question    what the ear wants to know: a name, which reading was said, or
                 whether two voices are one
     Correction  one case told to the ear, as it applied it (or why it refused)
@@ -42,7 +44,12 @@ written again with ``revision`` counting how many times (0 at first); its pieces
 ``Text`` are revised under their voice now. A ``Question`` may be about ``same``: are
 these two ``speakers`` one voice, with the model's ``p`` and the ``value`` of an answer
 (the decisions it is expected to change); its answer is ``same`` or ``different``. A
-consumer keeps the latest of each: no field of port 4 changed meaning.
+consumer keeps the latest of each. A ``Decision`` says its ``overlap``: the segmenter's
+P(two voices at once in the window) (``overlap.py``); a window more probably a mix than
+not is decided but never learned. A ``Measure`` is written when a microphone piece that
+heard the machine through the air is read: its ``truth`` (the machine's own reading of
+that stretch) and each recogniser's ``recall`` of it; the reader learns from it as from a
+correction. No field of port 4 changed meaning.
 
 Changing a field's meaning is a new PORT number, never an edit of this one.
 """
@@ -97,6 +104,7 @@ class Decision:
     apps: list | None  # machine: the applications playing during the window
     scene: str | None  # room | remote | media | self: where the voice comes from (scene.py)
     scene_p: float | None
+    overlap: float | None = None  # P(two voices at once in the window), the segmenter's
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +169,15 @@ class Text:
 
 
 @dataclass(frozen=True, slots=True)
+class Measure:
+    session: str
+    piece: str  # the microphone piece
+    of: list  # the machine's pieces it heard
+    truth: str  # what the machine's channel read of that stretch
+    recall: dict  # recogniser -> the share of the truth's words it read
+
+
+@dataclass(frozen=True, slots=True)
 class Question:
     session: str
     id: str
@@ -195,6 +212,7 @@ KINDS = {
     "text": Text,
     "question": Question,
     "revision": Revision,
+    "measure": Measure,
     "correction": Correction,
 }
 CORRECTIONS = (

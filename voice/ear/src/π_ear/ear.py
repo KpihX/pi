@@ -42,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-from π_ear import asr, contract, echo
+from π_ear import asr, contract, echo, lid, overlap
 from π_ear.device import Apps
 from π_ear.io import (
     Corpus,
@@ -57,7 +57,9 @@ from π_ear.io import (
     utc_now,
     write_atomic,
 )
+from π_ear.lid import Pooled
 from π_ear.model import Model, Weights
+from π_ear.overlap import Overlap
 from π_ear.port import PORT
 from π_ear.revise import Second, resolve
 from π_ear.scene import KINDS as SCENES
@@ -87,6 +89,7 @@ class Channel:
     floor: dict = field(default_factory=lambda: {"power": 0.0, "chunks": 0})
     first: int | None = None  # the second of its first chunk, on the shared clock
     last: int | None = None  # the second of its last chunk
+    overlap: Overlap | None = None  # two voices at once (overlap.py), if its sensor is there
 
     def floor_dbfs(self) -> float | None:
         if not self.floor["chunks"]:
@@ -246,6 +249,10 @@ class Ear:
                     floor_s=self.sensor.min_speech_s,
                     person_of=self.person_of,
                     scene_of=self.scene_of,
+                    told=asr.build(contract.FAST_TOLD, self.places.models),
+                    pooled=Pooled(self.places.models)
+                    if lid.available(self.places.models)
+                    else None,
                 )
 
     def _save(self) -> None:
@@ -325,6 +332,7 @@ class Ear:
             Tailer(directory, contract.chunk_bytes() if self.live else 0, from_start=from_start),
             Sensor(self.places.models),
             Corpus(corpus, self.places.corpus_max_chunks),
+            overlap=Overlap(self.places.models) if overlap.available(self.places.models) else None,
         )
 
     # the microphone channel, under the names the rest of the ear (and its tests) know
@@ -479,7 +487,18 @@ class Ear:
         row = self.store.append(vec)
         x = self.store(row)  # the stored float32 vector: what a replay will see, bit for bit
         self.spectra.append(spectrum(piece.samples))
-        learn = piece.full and not piece.shadow
+        # two voices at once: decided (who is the louder?), never learned as one voice
+        mixed = (
+            channel.overlap.of(
+                channel.sensor._slice, piece.start, piece.start + len(piece.samples), piece.run
+            )
+            if channel.overlap is not None
+            else None
+        )
+        two = mixed is not None and 1 - mixed < mixed
+        learn = piece.full and not piece.shadow and not two
+        if two:
+            self._bump("overlapped")
         follows = run["last"] if learn else None
         start = channel.sensor.offset + piece.start
         t = round(self.origin + start / contract.RATE, 3)  # when it was said
@@ -550,6 +569,7 @@ class Ear:
             "rms_dbfs": level,
             "rel_db": None if floor is None else round(level - floor, 1),
             "echo": None if share is None else round(share, 4),
+            "overlap": None if mixed is None else round(mixed, 4),
             "apps": apps,
             "scene": None if scene is None else max(scene, key=scene.get),
             "scene_p": None if scene is None else round(max(scene.values()), 4),
