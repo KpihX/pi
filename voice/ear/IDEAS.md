@@ -565,3 +565,98 @@ is the same line as a typed one.
 text, so every cough that reached the reader asked "what was said?". Now: `ambiguous` asks; a
 `not_understood` asks only in a run of a known voice (someone spoke and the ear missed it); a
 sound nobody owns, not understood, asks nothing. Measured on fold 5: no question from 160 sounds.
+
+---
+
+## v2.1 (2026-10-21): the first live test, PSG - Barça, answered
+
+KπX ran the three panes for 2 h 11 min in front of a football broadcast (a laptop
+microphone, the television across the room, KπX in it), and sent the record, the memory
+and the last hour of corpus. That hour is kept on this machine as a **live recording**
+(`π_ear.live`, never committed: broadcast audio and the voices of a home); its manifest,
+`tests/live/2026-10-20-psg-barca.json`, names ten segments and what makes each hard, and
+`make test-live` replays them through the ear from the memory it had. CAM++ run again on
+the corpus reproduces the stored rows with cos 1.00000: the replay is exact.
+
+No reading is taken as the truth. Every number below is a word recall against two other
+systems' readings of the same hour (Whisper turbo told French on 30 s blocks; Parakeet on
+20 s blocks), next to what v2.0 wrote live, and next to what the ear's own two readings
+alone would have given: a measurement of where the loss is, not a target.
+
+### What the live test showed
+
+| | measured live (v2.0) |
+|---|---|
+| who | the commentator (1145 windows) and the consultant (685) stable for 100 min; studio host, consultants, pitch-side, a sponsor's voice found again 65 min apart; KπX's own voice (`b54d13`, learned on 2026-10-19) in the room all along; 40 voices for 12 to 15 people (fragments); an independent judge (ERes2Net) agrees on 75 % of windows |
+| person or device | **a bug**: a memory older than v2 had 1449 rows and no spectra; spectra were appended from index 0, so every decision read another window's spectrum (KπX: device) and late voices had none (`NaN`). Aligned again: every television voice `device`, KπX `person` at 1.000 |
+| what | 37 % of the words written, where Whisper alone held 53 %; 318 of 662 texts "not understood" (106 real sentences), 516 questions, 2 texts `clear` in two hours |
+| why | Parakeet answering in English on studio talk (more the longer the piece); Whisper's language detection writing Russian, Portuguese, Turkish, Japanese or Chinese on short phrases, mostly KπX's; Whisper reading only the first 30 s of a run (a 70.9 s run lost half); Silero's mean on real speech 0.3-0.7 and Parakeet's token log-probability -0.8 where the base had learned 0.9 and -0.1; `ambiguous` named whenever two readings differed by one word; the slow pass 16 min behind on studio talk that never paused |
+
+### What changed, each measured on the replay
+
+**Pieces** (`scribe.py`). The unit of text is a piece of a run, cut where the voice changes
+(the turns of the model of who) and where Whisper's window would overflow, at Silero's
+deepest dip, never shorter than the VAD's own shortest speech. A piece is final while its
+run goes on. An interview's question and answer, one text live, are two pieces, two voices.
+
+**Reading with context.** Whisper reads better the longer its input (0.84 on 30 s of match
+commentary, 0.76 on 15 s, 0.64 on 8 s) and wrote "..." on short pieces read alone. The slow
+recogniser now reads as many consecutive pieces as its window holds; its sentences, timed
+(sherpa-onnx's segment timestamps), go back to the pieces they were said in.
+
+**Language, learned per voice** (`language.py`). A Dirichlet per voice over what Whisper
+*detected* it speaking, its prior the room, itself a Dirichlet with one pseudo-reading over
+the known languages and one for a language never written here; the detector's reliability
+as a function of length, measured on the base then on the stream; the voice's language
+given to Whisper when it is the better bet than detection at this length. In the reader it
+is not a learned feature but a probability, added with Bayes' coefficient one:
+`log P(the reading's language | its voice)` against the voice's best.
+
+The designs that failed on the way, each on the replay of KπX's segment:
+
+1. counting every reading, told ones included: one misdetected phrase of KπX ("I'm so happy
+   to have you") locked his voice, then the room, into English, each forced reading
+   confirming it: recall 0.002;
+2. the room as a plain average: one detection made it 100 % English;
+3. a learned weight on `1 - in_language`: trained on translation episodes the base made
+   separable, it grew to -18, then -53, and a right French reading paid for the room's
+   still uncertain language;
+4. measured against the other readings only: a lone Chinese reading of KπX paid nothing;
+5. the expectation over the text's language: the text detector's own doubt (a word model:
+   "J'imagine des mains." was "another language", two words unseen) made right readings pay.
+   Now: the text's most probable language, by character trigrams with an open class.
+
+**Every sensor level relative to the regime.** Silero's mean and Parakeet's token
+log-probability are read against their means over the known voices of this place (the
+base's own as one pseudo-piece), not as levels: a television through a laptop is quiet to
+both, and that is not "nothing was said". The base reader now also hears its Piper
+sentences through a loudspeaker in a room over indoor sounds (three regimes).
+
+**The doubt is the posterior.** `ambiguous`: the reader cannot choose (the chosen reading
+more probably not the best). `partial` (new): it can, but the best reading there is holds
+more words probably wrong than right, by the word model's own trust ("I understood bits of
+it"): a reading's `p` is "the best of the readings", not "a right reading", and over 300
+synthetic pieces of every garbling, no piece was ever `ambiguous` without it. The word model
+learns from every word of every reading against the truth (it once learned from the
+reader's choice with unfitted weights, and agreed words came out untrusted). Two readings
+apart are a doubt about speech only in one language (a translation is not).
+
+**Questions worth someone's attention.** Only about a person (a commentator is nobody to
+ask), one open per voice, and about the words: a sure sentence around one unsure name asks
+about that name, and a word KπX confirmed is never asked again.
+
+**A slow pass that keeps pace.** Partials and revisions take turns (a first build always
+read the partial first, and revised nothing while the television spoke); people first,
+then the most doubtful; nothing slow while a person speaks; its own speed measured.
+
+**Bugs the live test found**, each with a test that fails without its fix: the spectra of
+an old memory (aligned, missing rows put back in front); a saved reader that froze the
+weights of the base it was saved under (they are refitted on the current base now); the
+run in progress past 60 s sliced from a negative index (the partials of studio talk read
+the wrong audio); a scribe job that failed killed its thread and the ear waited forever
+(errors are written to the record now, and the scribe goes on); a late `hear` re-opening
+a finished run.
+
+### The replay, segment by segment (word recall, vs Whisper-fr / vs Parakeet)
+
+(see the table at the end of this section, filled from `make test-live` and the lab runs)

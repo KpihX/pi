@@ -1,152 +1,281 @@
-"""The scribe: *what* was said, written as it is said, revised in the silences.
+"""The scribe: *what* was said, written as it is said, revised as soon as it can be.
 
-One thread, three kinds of work, in this order of priority:
+The unit of text is a **piece**: a speech run cut at Silero's deepest dips, so that no
+piece is longer than what the slow recogniser reads whole (Whisper: under 30 s). The
+cuts are made as the run grows (the open part is cut at the deepest dip of its first
+window as soon as it is longer than a window), so a piece is final while its run
+still goes on: on studio talk that never pauses, the text of the first minute is
+written in the first minute, not after the run ends.
 
-1. **final**: a speech run just ended. The fast recogniser reads it whole, the
-   reader decides, and a ``text`` line (revision 0) is written at once;
-2. **partial**: a run is still going on. The fast recogniser re-reads it from its
-   start whenever it is free (the latest audio wins, nothing queues up), and a
-   ``partial`` line is written when the words change: the text appears while it
-   is being said;
-3. **revision**, only while the room is silent: the slow recogniser reads the
-   run again (on the voice separated from the music, if a separator is plugged
-   in and the run mixed both),
-   the reader decides between all the readings, and a ``text`` line with the
-   next revision is written. Corrections, too, are absorbed here: the weights
-   are refitted and the corrected run is read again.
+Measured live (2026-10-20, two hours of a football broadcast heard by a laptop):
+Whisper dropped everything after 30 s of a run (a 70.9 s run lost half its words), and
+read worse the shorter its input (word recall 0.84 on 30 s of match commentary, 0.64 on
+8 s); Parakeet answered in English on French studio talk the longer the piece (2 % of
+the words at 4 s, 77 % at 32 s), while on match commentary it needed long pieces (0.30
+at 2 s, 0.65 at 12 s). No length is right for every recogniser and every regime, so:
 
-What the reader decided is never hidden: each ``text`` line carries the chosen
-reading, its probability, its margin, its named doubt, its words with their
-own trust, and the other readings. When the doubt is ``ambiguous``, or
-``not_understood`` in a run of a known voice, a ``question`` is written: the arbiter, or the operator, or
-a voice, may answer it, and the answer is a correction like any other.
+* pieces are cut where the voice changes (the turns of the model of who) and where the
+  slow recogniser's window would overflow, at Silero's deepest dip, never shorter than
+  the VAD's own shortest speech;
+* the slow recogniser reads as many consecutive pieces as its window holds, and its
+  timed sentences go back to the pieces they were said in;
+* a translation by the fast recogniser is recognised by its language (``language.py``)
+  and loses to the slow reading. A first build also re-read a piece in halves when the
+  halves were "more in the voice's language": on short phrases the estimate was noise,
+  the fast reading's recall on KπX's own segment fell from 0.26 to 0.09; removed.
+
+One thread, the work in this order:
+
+1. **settle**: a run grew or ended: new pieces are cut, read by the fast recogniser,
+   decided, and written (``text``, revision 0);
+2. **partial**: the open part of a run in progress is read again whenever the thread is
+   free (latest audio wins): the text appears while it is said;
+3. **correct**: what KπX said a piece was, absorbed (not while a person is speaking:
+   the thread stays free for them);
+4. **revise**: the slow recogniser reads a piece in the language its voice speaks
+   (``language.py``), and the reader decides again (``text``, next revision). Most
+   valuable first: pieces of people before pieces of devices, the most doubtful first.
+   Not only in silences (the television never pauses), but never while a person is
+   speaking.
+
+Every decision is written with its doubt. A ``question`` is written when it is worth
+someone's attention: the reader could not choose (``ambiguous``), understood only bits
+(``partial``), or nothing of a known voice, or holds a word more probably wrong than
+right (the question names those words), *and* the voice is a person (a commentator on
+television is nobody to ask), and that voice has no question still open.
 """
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import threading
+import time
+import traceback
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from π_ear.asr import Hypothesis
+from π_ear import asr, contract
+from π_ear.asr import Hypothesis, Word
 from π_ear.io import append_jsonl, read_jsonl, utc_now
-from π_ear.words import NONE, Reader
+from π_ear.sense import Silero
+from π_ear.words import NONE, Context, Heard, Reader, mean_logp
+
+VOICED = ("known", "new")
 
 
 @dataclass
-class RunText:
+class Piece:
+    id: str
     run: str
     t0: float
     t1: float
-    rows: list[int]
-    voice: str | None
     samples: np.ndarray | None
+    speech: float | None
+    rows: list[int] = field(default_factory=list)
+    voices: dict[str, float] = field(default_factory=dict)  # share of the piece's time
+    voice: str | None = None
     mixed: bool = False
-    speech: float | None = None  # Silero's mean speech probability over the run
     fast: Hypothesis | None = None
     slow: Hypothesis | None = None
+    language: str | None = None  # what the slow recogniser was told, if anything
     revision: int = -1
-    separated: bool = False
     asked: bool = False
+    separated: bool = False
     decision: dict = field(default_factory=dict)
 
 
+@dataclass
+class Open:
+    """A run in progress: its audio, Silero's frames over it, what is settled."""
+
+    id: str
+    start: float  # stream seconds
+    silero: Silero
+    audio: np.ndarray
+    decisions: list[dict] = field(default_factory=list)
+    settled: int = 0  # frames already in pieces
+    count: int = 0
+    finished: bool = False
+    group: list[str] = field(default_factory=list)  # settled pieces still to be read slowly
+
+
+def cut(probs: np.ndarray, start: int, most: int, floor: int = 1) -> int:
+    """Where the open part [start, ...) is cut: Silero's deepest dip inside its first
+    ``most`` frames, at least ``floor`` frames from its start (the VAD's own shortest
+    speech: a first build cut 32 ms pieces)."""
+    lo = start + min(max(floor, 1), most - 1)
+    return lo + int(np.argmin(probs[lo : start + most]))
+
+
 class Scribe:
-    def __init__(self, reader: Reader, fast, slow, separator, write, memory: Path, echo=None):
+    def __init__(
+        self,
+        reader: Reader,
+        fast,
+        slow,
+        separator,
+        write,
+        memory: Path,
+        models: Path,
+        source_of=None,
+        floor_s: float = 0.0,
+        echo=None,
+    ):
         self.reader = reader
         self.fast, self.slow, self.separator = fast, slow, separator
         self.write = write
         self.memory = memory
+        self.models = models
+        self.source_of = source_of or (lambda voice: (None, None))
         self.echo = echo
+        windows = [w for w in (asr.window_s(fast), asr.window_s(slow) if slow else None) if w]
+        # strictly shorter than the shortest window: Silero frames of 512 samples
+        self.frame = Silero(models).block
+        self.most = (
+            int(min(windows) * contract.RATE / self.frame) - 1 if windows else None
+        )  # frames
+        self.floor = max(1, int(floor_s * contract.RATE / self.frame))
         self.lock = threading.Condition()
-        self.runs: dict[str, RunText] = {}
-        self.of_row: dict[int, str] = {}
-        self.finals: list[str] = []
-        self.revisions: list[str] = []
+        self.open: dict[str, Open] = {}
+        self.dirty: set[str] = set()  # open runs with new audio, to cut
+        self.partials: set[str] = set()  # open runs whose open part is to be read again
+        self.alternate = False  # a partial, then a revision, when both wait
+        self.pieces: dict[str, Piece] = {}
+        self.of_row: dict[int, list[str]] = {}  # a window straddling a cut is in two pieces
+        self.revisions: list[tuple] = []  # a heap of (priority, order, piece id)
+        self.order = itertools.count()
         self.corrections: list[tuple[str, str, int]] = []
-        self.live_partial: tuple[str, np.ndarray, list[int]] | None = None
         self.last_partial: dict[str, str] = {}
-        self.closed: set[str] = set()  # runs finished or retracted: no partial after them
+        self.retracted: set[str] = set()
+        self.done: set[str] = set()  # runs settled to their end: a late `hear` is ignored
         self.speaking = False
+        self.person_speaking = False
         self.busy = False
         self.questions = 0
+        self.errors: list[str] = []
+        self.open_questions: dict[str | None, str] = {}  # voice -> its open question
+        self.pace = {"audio": 0.0, "spent": 0.0}  # the slow recogniser's own speed, measured
+        # what the sensors usually say of the known voices of this place: Silero's mean,
+        # and the fast recogniser's mean token log-probability
+        self.regime = {"sum": 0.0, "count": 0.0, "logp": 0.0, "read": 0.0}
         threading.Thread(target=self._work, daemon=True).start()
 
-    # -- what the ear hands over ------------------------------------------------------
-    def set_speaking(self, speaking: bool) -> None:
+    # -- what the ear hands over -----------------------------------------------------
+    def set_speaking(self, speaking: bool, person: bool = False) -> None:
         with self.lock:
-            self.speaking = speaking
+            self.speaking, self.person_speaking = speaking, speaking and person
             self.lock.notify_all()
 
-    def partial(self, run: str, samples: np.ndarray, rows: list[int]) -> None:
+    def hear(self, run: str, start: float, samples: np.ndarray, decisions: list[dict]) -> None:
+        """The run in progress, all of it so far (the latest call wins)."""
         if self.fast is None:
             return
         with self.lock:
-            self.live_partial = (run, samples, rows)
+            state = self.open.get(run)
+            if state is None:
+                if run in self.retracted or run in self.done:
+                    return
+                state = self.open[run] = Open(run, start, Silero(self.models), samples[:0])
+            state.audio, state.decisions = samples, list(decisions)
+            self.dirty.add(run)
             self.lock.notify_all()
 
-    def finish(self, text: RunText) -> None:
+    def finish(self, run: str, start: float, samples: np.ndarray, decisions: list[dict]) -> None:
         if self.fast is None:
             return
+        self.hear(run, start, samples, decisions)
         with self.lock:
-            self.closed.add(text.run)
-            self.runs[text.run] = text
-            for row in text.rows:
-                self.of_row[row] = text.run
-            if self.live_partial and self.live_partial[0] == text.run:
-                self.live_partial = None
-            self.finals.append(text.run)
-            self.lock.notify_all()
+            if run in self.open:
+                self.open[run].finished = True
+                self.dirty.add(run)
+                self.lock.notify_all()
 
     def retract(self, run: str) -> None:
-        """A run with no recognised voice: its partial text, if any, was not speech."""
+        """A run of known sounds only: nothing of it is text, and a partial is taken back."""
         with self.lock:
-            self.closed.add(run)
-            if self.live_partial and self.live_partial[0] == run:
-                self.live_partial = None
-            if self.last_partial.pop(run, None):
-                self.write({"kind": "partial", "run": run, "text": "", "retracted": True})
+            self.retracted.add(run)
+            self.open.pop(run, None)
+            self.dirty.discard(run)
+            for key in [k for k in self.last_partial if k.startswith(run + "#")]:
+                if self.last_partial.pop(key):
+                    self.write(
+                        {"kind": "partial", "piece": key, "run": run, "text": "", "retracted": True}
+                    )
 
-    def correct(self, rows: list[int], truth: str, line: int) -> str | None:
-        """A text correction: the run its rows belong to is the one corrected."""
+    def correct(
+        self, rows: list[int], truth: str, line: int, piece: str | None = None
+    ) -> str | None:
+        """A text correction: of one piece (an answer names it), or of the pieces its
+        rows belong to, each then taught its share of the words."""
         with self.lock:
-            runs = list(dict.fromkeys(self.of_row[r] for r in rows if r in self.of_row))
-            runs = runs or self._recall(rows)
-            if not runs:
-                return "these rows belong to no transcribed run"
-            for run in runs:
-                self.corrections.append((run, truth, line))
+            if piece is not None:
+                pieces = [piece] if piece in self.pieces or self._recall(rows, piece) else []
+            else:
+                pieces = list(dict.fromkeys(k for r in rows for k in self.of_row.get(r, [])))
+                pieces = sorted(pieces or self._recall(rows), key=lambda k: self.pieces[k].t0)
+            if not pieces:
+                return "these rows belong to no transcribed piece"
+            parts = [truth] if len(pieces) == 1 else self._share(pieces, truth)
+            self.corrections += [(p, part, line) for p, part in zip(pieces, parts, strict=True)]
             self.lock.notify_all()
         return None
 
-    def drain(self) -> None:
-        """Wait until every pending reading, revision and correction is written."""
+    def answered(self, voice: str | None) -> None:
         with self.lock:
-            self.speaking = False
+            self.open_questions.pop(voice, None)
+
+    def drain(self) -> None:
+        """Wait until every run is settled and every piece is read by both recognisers."""
+        with self.lock:
+            self.speaking = self.person_speaking = False
+            for state in self.open.values():
+                state.finished = True
+                self.dirty.add(state.id)
             self.lock.notify_all()
-            while (
-                self.finals or self.revisions or self.corrections or self.busy or self.live_partial
-            ):
+            while self.dirty or self.partials or self.revisions or self.corrections or self.busy:
                 self.lock.wait()
 
     def pending(self) -> int:
-        return len(self.finals) + len(self.revisions) + len(self.corrections)
+        return len(self.revisions) + len(self.corrections) + len(self.dirty) + len(self.partials)
 
-    # -- the thread ------------------------------------------------------------------------
+    def behind_s(self) -> float:
+        """Seconds of audio waiting for the slow recogniser."""
+        return sum(
+            self.pieces[k].t1 - self.pieces[k].t0 for _, _, keys in self.revisions for k in keys
+        )
+
+    # -- the thread --------------------------------------------------------------------
     def _next(self):
+        """The next job. Cutting runs into pieces comes first (cheap, and it gives every
+        piece its first reading); then corrections; then partials and slow revisions in
+        turn: live, a run grows every second, and a first build that always put the
+        partial first never revised anything while the television spoke. Nothing slow
+        while a person speaks: the scribe stays free for them."""
         with self.lock:
             while True:
-                if self.finals:
-                    job = ("final", self.finals.pop(0))
-                elif self.corrections and not self.speaking:
+                self.dirty &= set(self.open)
+                self.partials &= set(self.open)
+                finished = [r for r in self.dirty if self.open[r].finished]
+                revise = bool(self.revisions) and not self.person_speaking
+                if finished or self.dirty:
+                    run = finished[0] if finished else next(iter(self.dirty))
+                    self.dirty.discard(run)
+                    job = ("settle", run)
+                elif self.corrections and not self.person_speaking:
                     job = ("correction", self.corrections.pop(0))
-                elif self.live_partial is not None:
-                    job, self.live_partial = ("partial", self.live_partial), None
-                elif self.revisions and not self.speaking:
-                    job = ("revision", self.revisions.pop(0))
-                elif self.reader.dirty and not self.speaking:
+                elif self.partials and not (revise and self.alternate):
+                    job = ("partial", self.partials.pop())
+                    self.alternate = True
+                elif revise:
+                    job = ("revision", heapq.heappop(self.revisions)[2])
+                    self.alternate = False
+                elif (
+                    self.reader.dirty or self.reader.languages.dirty
+                ) and not self.person_speaking:
                     job = ("refit", None)
                 else:
                     self.busy = False
@@ -158,125 +287,339 @@ class Scribe:
 
     def _work(self) -> None:
         while True:
-            kind, what = self._next()
+            kind = what = None
             try:
+                kind, what = self._next()
                 getattr(self, f"_{kind}")(what)
+            except Exception as error:  # a job that fails must not take the scribe with it
+                self.errors.append(f"{kind}: {error!r}")
+                self.write(
+                    {
+                        "kind": "error",
+                        "job": kind,
+                        "what": str(what)[:200],
+                        "error": traceback.format_exc()[-2000:],
+                    }
+                )
             finally:
                 with self.lock:
                     self.busy = False
                     self.lock.notify_all()
 
-    def _partial(self, job) -> None:
-        run, samples, rows = job
-        heard = self.fast(samples)
-        with self.lock:  # a run closed while it was being read keeps its last word
-            if run not in self.closed and heard.text != self.last_partial.get(run, ""):
-                self.last_partial[run] = heard.text
-                self.write({"kind": "partial", "run": run, "text": heard.text, "rows": rows})
-
-    def _final(self, run: str) -> None:
-        text = self.runs[run]
-        text.fast = self.fast(text.samples)
-        self.last_partial.pop(run, None)
-        self._decide(text)
-        if self.slow is not None:
+    def _settle(self, run: str) -> None:
+        with self.lock:
+            state = self.open.get(run)
+            if state is None:
+                return
+            audio, decisions, finished = state.audio, state.decisions, state.finished
+        fed = len(state.silero.probs) * self.frame + len(state.silero.pending)
+        state.silero.feed(audio[fed:])
+        probs = np.asarray(state.silero.probs)
+        total = len(audio) // self.frame
+        turns = self._turn_cuts(state, probs, decisions, total)
+        while True:
+            turns = [t for t in turns if t > state.settled]
+            if turns and (not self.most or turns[0] - state.settled <= self.most):
+                end = turns[0]  # the voice changes: a piece is one voice's
+            elif self.most and total - state.settled > self.most:
+                end = cut(probs, state.settled, self.most, self.floor)  # the window is full
+            else:
+                break
+            self._piece(state, state.settled, end, total, audio, probs, decisions)
+            state.settled = end
+        if finished:
+            self._piece(state, state.settled, total, total, audio, probs, decisions)
+            self._flush(state)
             with self.lock:
-                self.revisions.append(run)
-                self.lock.notify_all()
+                self.open.pop(run, None)
+                self.dirty.discard(run)
+                self.done.add(run)
+                self.last_partial.pop(f"{run}#{state.count}", None)
+            return
+        with self.lock:
+            self.partials.add(run)
+            self.lock.notify_all()
 
-    def _revision(self, run: str) -> None:
-        text = self.runs[run]
-        audio = text.samples
-        if text.mixed and self.separator is not None:
-            audio, text.separated = self.separator(audio), True
-        text.slow = self.slow(audio)
-        self._decide(text)
-        # after the decision: a word heard for the first time is "new" this time,
-        # and known from then on, never confirmed by the very reading it is in
-        self.reader.agree(text.fast, text.slow, text.voice)
+    def _turn_cuts(self, state: Open, probs, decisions, total: int) -> list[int]:
+        """Where the voice changes inside the open part: between the middles of two
+        consecutive learned windows given to two different voices, at Silero's deepest
+        dip, when the change is more probably real than not. A piece is one voice's phrase, so its text is that voice's (an interview's
+        question and answer, measured live in one run, become two pieces)."""
+        frames = contract.RATE / self.frame
+        voiced = sorted(
+            (d for d in decisions if d["learned"] and d["kind"] in VOICED and d["speaker"]),
+            key=lambda d: d["t0"],
+        )
+        cuts, last = [], state.settled
+        for a, b in itertools.pairwise(voiced):
+            if a["speaker"] == b["speaker"]:
+                continue
+            # a change is a cut only if it is more probably real than not, by the model of
+            # who's own calibrated trust (Q1): on fast match commentary, cuts between two
+            # unsure windows made fragments nobody could read (measured on the replay)
+            both = (a.get("trust") or 1) * (b.get("trust") or 1)
+            if both < 1 - both:
+                continue
+            lo = int(((a["t0"] + a["t1"]) / 2 - state.start) * frames)
+            hi = int(((b["t0"] + b["t1"]) / 2 - state.start) * frames)
+            lo, hi = max(lo, last + self.floor), min(hi, total - self.floor)
+            if hi - lo < 1:
+                continue
+            at = lo + int(np.argmin(probs[lo:hi]))
+            cuts.append(at)
+            last = at
+        return cuts
+
+    def _piece(self, state: Open, a: int, b: int, total: int, audio, probs, decisions) -> None:
+        """Frames [a, b) of a run become a piece (the last one takes the run's tail)."""
+        lo, hi = a * self.frame, len(audio) if b >= total else b * self.frame
+        t0, t1, samples = (
+            state.start + lo / contract.RATE,
+            state.start + hi / contract.RATE,
+            audio[lo:hi],
+        )
+        if not len(samples):
+            return
+        key = f"{state.id}#{state.count}"
+        state.count += 1
+        covering = [d for d in decisions if d["t0"] < t1 and t0 < d["t1"]]
+        share: Counter = Counter()
+        for d in covering:
+            if d["kind"] in VOICED and d["speaker"]:
+                share[d["speaker"]] += min(t1, d["t1"]) - max(t0, d["t0"])
+        mass = sum(share.values())
+        frames = probs[a : max(b, a + 1)]
+        piece = Piece(
+            id=key,
+            run=state.id,
+            t0=round(t0, 3),
+            t1=round(t1, 3),
+            samples=samples,
+            speech=float(np.mean(frames)) if len(frames) else None,
+            rows=[d["row"] for d in covering],
+            voices={k: round(v / mass, 3) for k, v in share.most_common()} if mass else {},
+            voice=share.most_common(1)[0][0] if share else None,
+            mixed=any(d["kind"] in ("noise", "unknown") for d in covering if d["learned"]),
+        )
+        if piece.voice is not None and piece.speech is not None:
+            self.regime["sum"] += piece.speech
+            self.regime["count"] += 1
+        piece.fast = asr.read(self.fast, samples)
+        if piece.voice is not None and any(w.logp is not None for w in piece.fast.words):
+            self.regime["logp"] += mean_logp(piece.fast)
+            self.regime["read"] += 1
+        with self.lock:
+            self.pieces[key] = piece
+            for row in piece.rows:
+                self.of_row.setdefault(row, []).append(key)
+        self._decide(piece)
+        if self.slow is not None:
+            self._group(state, piece)
+
+    def _partial(self, run: str) -> None:
+        with self.lock:
+            state = self.open.get(run)
+            if state is None:
+                return
+            audio = state.audio
+        lo = state.settled * self.frame
+        if len(audio) - lo <= 0:
+            return
+        heard = asr.read(self.fast, audio[lo:])
+        key = f"{state.id}#{state.count}"
+        with self.lock:
+            if state.id in self.retracted or state.id not in self.open:
+                return
+            if heard.text != self.last_partial.get(key, ""):
+                self.last_partial[key] = heard.text
+                t0 = round(state.start + lo / contract.RATE, 3)
+                self.write(
+                    {"kind": "partial", "piece": key, "run": state.id, "t0": t0, "text": heard.text}
+                )
+
+    def _group(self, state: Open, piece: Piece) -> None:
+        """Pieces are read slowly together, as many consecutive ones as the slow
+        recogniser's window holds: Whisper reads better with context (word recall 0.84
+        on 30 s of match commentary, 0.64 on 8 s pieces, measured live) and wrote "..."
+        for short pieces it heard alone; its timed sentences then go back to their pieces."""
+        window = (self.most or 0) * self.frame / contract.RATE
+        if state.group and piece.t1 - self.pieces[state.group[0]].t0 >= window:
+            self._flush(state)
+        state.group.append(piece.id)
+
+    def _flush(self, state: Open) -> None:
+        keys, state.group = tuple(state.group), []
+        if not keys:
+            return
+        pieces = [self.pieces[k] for k in keys]
+        person = any(self.source_of(p.voice)[0] == "person" for p in pieces)
+        doubt = min(p.decision.get("p", 0.0) for p in pieces)
+        # people first, then the most doubtful, then the oldest
+        priority = (0 if person else 1, doubt, pieces[0].t0)
+        with self.lock:
+            heapq.heappush(self.revisions, (priority, next(self.order), keys))
+            self.lock.notify_all()
+
+    def _revision(self, keys: tuple[str, ...]) -> None:
+        pieces = [self.pieces[k] for k in keys]
+        start = pieces[0].t0
+        audio = np.concatenate([p.samples for p in pieces])
+        separated = any(p.mixed for p in pieces) and self.separator is not None
+        if separated:
+            audio = self.separator(audio)
+        seconds = len(audio) / contract.RATE
+        share: Counter = Counter()
+        for p in pieces:
+            if p.voice is not None:
+                share[p.voice] += p.t1 - p.t0
+        voice = share.most_common(1)[0][0] if share else None
+        told = self.reader.languages.choose(voice, seconds) if seconds else None
+        started = time.monotonic()
+        heard = asr.read(self.slow, audio, told or "")
+        self.pace["spent"] += time.monotonic() - started
+        self.pace["audio"] += seconds
+        languages = self.reader.languages
+        # a detection is evidence before the decision, weighted by how often a detection
+        # this long is right: on the first group already, Parakeet's English for a French
+        # player is a translation (measured live, cold start). A told reading only
+        # teaches what its language is written with.
+        right = languages.detection_right(seconds) if told is None else None
+        languages.heard(
+            voice, heard.language or told, heard.text, right or 1, told is None, seconds
+        )
+        for piece in pieces:
+            lo, hi = piece.t0 - start, piece.t1 - start
+            mine = [w for w in heard.words if lo <= (w.t0 + w.t1) / 2 < hi]
+            if len(pieces) == 1:
+                mine = list(heard.words)
+            words = tuple(Word(w.text, w.t0 - lo, w.t1 - lo, w.logp) for w in mine)
+            text = " ".join(w.text for w in mine) if len(pieces) > 1 else heard.text
+            piece.slow = Hypothesis(text, words, heard.language, heard.source)
+            piece.language, piece.separated = told, separated
+            self._decide(piece)
+            self.reader.agree(piece.fast, piece.slow, piece.voice)
 
     def _correction(self, job) -> None:
-        run, truth, line = job
-        text = self.runs[run]
-        self.reader.learn(text.fast, text.slow, text.voice, truth, text.speech)
+        key, truth, line = job
+        piece = self.pieces[key]
+        heard = Heard(piece.fast, piece.slow, truth, self._context(piece))
+        self.reader.learn(heard)
         append_jsonl(
             self.memory / "taught.jsonl",
             {
                 "line": line,
-                "run": run,
-                "voice": text.voice,
-                "fast": text.fast.to_dict(),
-                "slow": text.slow.to_dict() if text.slow else None,
-                "speech": text.speech,
+                "piece": key,
+                "voice": piece.voice,
+                "speech": piece.speech,
+                "regime": heard.context.regime,
+                "confidence": heard.context.confidence,
+                "fast": piece.fast.to_dict(),
+                "slow": piece.slow.to_dict() if piece.slow else None,
                 "truth": truth,
             },
         )
         self.reader.refit()
-        self._decide(text)
+        piece.asked = True
+        self._decide(piece)
 
     def _refit(self, _) -> None:
         self.reader.refit()
 
     # -- the decision, written ------------------------------------------------------------
-    def _remember(self, text: RunText) -> None:
+    def _context(self, piece: Piece) -> Context:
+        """The piece, against what the sensors usually say here: the means over the
+        known voices of this place, with the base's own as one pseudo-piece before any
+        (the reader's base pieces were measured that way)."""
+        base = self.reader.base
+
+        def usual(total: float, count: float, prior: float | None) -> float | None:
+            mass = count + (1 if prior is not None else 0)
+            return (total + (prior or 0.0)) / mass if mass else None
+
+        return Context(
+            piece.voice,
+            piece.speech,
+            usual(self.regime["sum"], self.regime["count"], base.get("regime")),
+            piece.t1 - piece.t0,
+            usual(self.regime["logp"], self.regime["read"], base.get("confidence")),
+        )
+
+    def _remember(self, piece: Piece) -> None:
         """Every reading kept: a correction may come sessions later, and finds it here."""
         append_jsonl(
-            self.memory / "runs.jsonl",
+            self.memory / "pieces.jsonl",
             {
-                "run": text.run,
-                "t0": text.t0,
-                "t1": text.t1,
-                "rows": text.rows,
-                "voice": text.voice,
-                "revision": text.revision,
-                "speech": text.speech,
-                "fast": text.fast.to_dict() if text.fast else None,
-                "slow": text.slow.to_dict() if text.slow else None,
-                "separated": text.separated,
+                "piece": piece.id,
+                "run": piece.run,
+                "t0": piece.t0,
+                "t1": piece.t1,
+                "rows": piece.rows,
+                "voice": piece.voice,
+                "voices": piece.voices,
+                "revision": piece.revision,
+                "speech": piece.speech,
+                "language": piece.language,
+                "fast": piece.fast.to_dict() if piece.fast else None,
+                "slow": piece.slow.to_dict() if piece.slow else None,
+                "separated": piece.separated,
             },
         )
 
-    def _recall(self, rows: list[int]) -> list[str]:
-        """The runs of earlier sessions these rows belong to, from ``runs.jsonl``."""
+    def _recall(self, rows: list[int], piece: str | None = None) -> list[str]:
+        """The pieces of earlier sessions these rows (or this piece) belong to (``pieces.jsonl``)."""
         found: dict[str, dict] = {}
         wanted = set(rows)
-        for line in read_jsonl(self.memory / "runs.jsonl")[0]:
-            if wanted & set(line["rows"]):
-                found[line["run"]] = line  # the latest reading of each run wins
-        for run, line in found.items():
-            self.runs[run] = RunText(
-                run=run,
+        for line in read_jsonl(self.memory / "pieces.jsonl")[0]:
+            if line["piece"] == piece or (piece is None and wanted & set(line["rows"])):
+                found[line["piece"]] = line  # the latest reading of each piece wins
+        for key, line in found.items():
+            self.pieces[key] = Piece(
+                id=key,
+                run=line["run"],
                 t0=line["t0"],
                 t1=line["t1"],
-                rows=line["rows"],
-                voice=line["voice"],
                 samples=None,
                 speech=line.get("speech"),
+                rows=line["rows"],
+                voices=line.get("voices", {}),
+                voice=line["voice"],
                 fast=Hypothesis.from_dict(line["fast"]),
                 slow=Hypothesis.from_dict(line["slow"]),
+                language=line.get("language"),
                 revision=line["revision"],
                 separated=line["separated"],
                 asked=True,
             )
             for row in line["rows"]:
-                self.of_row[row] = run
-        return list(found)
+                self.of_row.setdefault(row, []).append(key)
+        return sorted(found, key=lambda k: self.pieces[k].t0)
 
-    def _decide(self, text: RunText) -> None:
-        decided = self.reader.read(text.fast, text.slow, text.voice, text.speech)
-        text.revision += 1
-        text.decision = decided
-        self._remember(text)
-        heard = text.slow or text.fast
+    def _share(self, keys: list[str], truth: str) -> list[str]:
+        """One truth over several pieces: its words shared in proportion to their readings."""
+        words = truth.split()
+        sizes = [
+            max(len((self.pieces[k].slow or self.pieces[k].fast).text.split()), 1) for k in keys
+        ]
+        bounds = np.round(np.cumsum([0] + sizes) / sum(sizes) * len(words)).astype(int)
+        return [" ".join(words[a:b]) for a, b in itertools.pairwise(bounds)]
+
+    def _decide(self, piece: Piece) -> dict:
+        decided = self.reader.read(piece.fast, piece.slow, self._context(piece))
+        piece.revision += 1
+        piece.decision = decided
+        self._remember(piece)
+        heard = piece.slow or piece.fast
         self.write(
             {
                 "kind": "text",
-                "run": text.run,
-                "t0": text.t0,
-                "t1": text.t1,
-                "rows": text.rows,
-                "speaker": text.voice,
-                "revision": text.revision,
+                "piece": piece.id,
+                "run": piece.run,
+                "t0": piece.t0,
+                "t1": piece.t1,
+                "rows": piece.rows,
+                "speaker": piece.voice,
+                "speakers": piece.voices,
+                "revision": piece.revision,
                 "text": decided["text"],
                 "p": round(decided["p"], 6),
                 "margin": round(decided["margin"], 3),
@@ -296,38 +639,77 @@ class Scribe:
                     for r in decided["readings"]
                 ],
                 "language": heard.language if heard else None,
-                "separated": text.separated,
+                "told": piece.language,
+                "speech": None if piece.speech is None else round(piece.speech, 3),
+                "separated": piece.separated,
                 "written": utc_now(),
             }
         )
         if self.echo:
             marked = " ".join(w["w"] if w["agreed"] else f"[{w['w']}?]" for w in decided["words"])
             self.echo(
-                f"[{text.t0:8.2f}-{text.t1:8.2f}] text r{text.revision} {decided['doubt']:14s} "
+                f"[{piece.t0:8.2f}-{piece.t1:8.2f}] text r{piece.revision} {decided['doubt']:14s} "
                 f"p={decided['p']:.2f} {marked or '∅'}"
             )
-        final = text.slow is not None or self.slow is None
-        # Ask when the ear hesitates between readings, or when someone it knows spoke
-        # and it did not understand; a sound nobody owns, not understood, is no question.
-        ask = decided["doubt"] == "ambiguous" or (
-            decided["doubt"] == "not_understood" and text.voice is not None
+        self._ask(piece, decided)
+        return decided
+
+    def _ask(self, piece: Piece, decided: dict) -> None:
+        final = piece.slow is not None or self.slow is None
+        doubt = decided["doubt"]
+        # the words more probably wrong than right: a sure sentence around one unsure
+        # name is still worth one question, about that name
+        doubtful = [
+            w["w"] for w in decided["words"] if w["trust"] < 1 - w["trust"] and w["new"]
+        ]  # a word KπX confirmed for this voice is not asked again, however unsure
+        worth = (
+            doubt in ("ambiguous", "partial")
+            or (doubt == "not_understood" and piece.voice is not None)
+            or bool(doubtful)
         )
-        if ask and not text.asked and final:
-            text.asked = True
+        source, _ = self.source_of(piece.voice)
+        with self.lock:
+            if (
+                not final
+                or piece.asked
+                or not worth
+                or source != "person"
+                or piece.voice in self.open_questions
+            ):
+                return
+            piece.asked = True
             self.questions += 1
-            choices = [r["text"] for r in decided["readings"] if r["text"] != NONE]
-            self.write(
-                {
-                    "kind": "question",
-                    "id": f"{text.run}#text",
-                    "about": "text",
-                    "run": text.run,
-                    "rows": text.rows,
-                    "speaker": text.voice,
-                    "choices": choices,
-                    "doubt": decided["doubt"],
-                }
-            )
+            self.open_questions[piece.voice] = f"{piece.id}#text"
+        choices = [r["text"] for r in decided["readings"] if r["text"] != NONE]
+        self.write(
+            {
+                "kind": "question",
+                "id": f"{piece.id}#text",
+                "about": "text",
+                "piece": piece.id,
+                "rows": piece.rows,
+                "speaker": piece.voice,
+                "choices": choices,
+                "doubt": doubt,
+                "words": doubtful,
+            }
+        )
+
+    def stats(self) -> dict:
+        pace = self.pace["spent"] / self.pace["audio"] if self.pace["audio"] else None
+        return {
+            "pieces": len(self.pieces),
+            "behind_s": round(self.behind_s(), 1),
+            "slow_seconds_per_second": None if pace is None else round(pace, 3),
+            "questions": self.questions,
+            "errors": len(self.errors),
+            "regime": None
+            if not self.regime["count"]
+            else round(self.regime["sum"] / self.regime["count"], 3),
+            "confidence": None
+            if not self.regime["read"]
+            else round(self.regime["logp"] / self.regime["read"], 3),
+        }
 
 
 def rebuild_reader(memory: Path, base: dict, undone: set[int]) -> Reader:
@@ -337,11 +719,18 @@ def rebuild_reader(memory: Path, base: dict, undone: set[int]) -> Reader:
         if line["line"] in undone:
             continue
         reader.learn(
-            Hypothesis.from_dict(line["fast"]),
-            Hypothesis.from_dict(line["slow"]),
-            line["voice"],
-            line["truth"],
-            line.get("speech"),
+            Heard(
+                Hypothesis.from_dict(line["fast"]),
+                Hypothesis.from_dict(line["slow"]),
+                line["truth"],
+                Context(
+                    line["voice"],
+                    line.get("speech"),
+                    line.get("regime"),
+                    None,
+                    line.get("confidence"),
+                ),
+            )
         )
     reader.refit()
     return reader

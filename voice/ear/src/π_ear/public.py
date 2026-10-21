@@ -293,50 +293,114 @@ FR_BASE = [
 
 
 def base_reader(data: Path, models: Path, rng) -> dict:
-    """The reader's base weights: public runs heard by both recognisers, truth known.
+    """The reader's base weights: public pieces heard by both recognisers, truth known.
 
-    Clean and degraded speech in English and French, and indoor sounds whose truth
-    is "nothing was said": that is where "I did not understand" learns its weight.
+    English and French sentences of Piper voices, heard in three regimes, because the
+    live test showed the reader must not learn one (2026-10-20: on a television heard
+    by a laptop, Silero's mean on real speech was 0.3-0.7, where clean speech gives
+    0.82-0.94, and "I did not understand" took 106 real sentences):
+
+    * ``clean``: as synthesised;
+    * ``room``: through a simulated place (``place``);
+    * ``tv``: played by a loudspeaker (``loudspeaker``), in a place, over a bed of
+      indoor sounds at 0-15 dB under it (ESC-50 folds 1-3, looped).
+
+    And the indoor sounds alone in each regime, as the VAD lets them through: their
+    truth is "nothing was said". Each piece carries its regime's own mean of Silero
+    on speech, as the ear does live (``Context.regime``).
     """
     from π_ear import asr
-    from π_ear.words import fit_reader
+    from π_ear.sense import Sensor, speech_probability
+    from π_ear.words import Context, Heard, fit_reader, mean_logp
 
     fast, slow = asr.build(contract.FAST, models), asr.build(contract.SLOW, models)
     if fast is None:
         return {}
-    clips: list[tuple[np.ndarray, str]] = []
+    sensor = Sensor(models)
+    sounds = [x for _, clips in sorted(esc50(data, BASE_FOLDS).items()) for x in clips]
+
+    def bed(n: int) -> np.ndarray:
+        """Indoor sounds one after another, as long as asked."""
+        out, size = [], 0
+        while size < n:
+            out.append(sounds[int(rng.integers(len(sounds)))])
+            size += len(out[-1])
+        return np.concatenate(out)[:n]
+
+    def regime(name: str, x: np.ndarray) -> np.ndarray:
+        if name == "clean":
+            return x
+        if name == "room":
+            return condition(x, rng)
+        y = condition(loudspeaker(x, rng), rng)
+        b = bed(len(y))
+        level = np.mean(y * y) / (np.mean(b * b) or 1.0) / 10 ** (rng.uniform(0, 15) / 10)
+        return (y + b * np.sqrt(level)).astype(np.float32)
+
+    def runs_of(x: np.ndarray) -> list[np.ndarray]:
+        _, found = sensor.feed(x)
+        _, tail = sensor.feed(np.zeros(contract.RATE, dtype=np.float32))
+        return [r.samples for r in found + tail]
+
+    def spoken(x: np.ndarray) -> float:
+        """Silero's mean over what the VAD let through, as the ear computes it on a piece."""
+        inside = runs_of(x)
+        return float(np.mean(speech_probability(models, np.concatenate(inside) if inside else x)))
+
+    REGIMES = ("clean", "room", "tv")
+    pieces: list[tuple[str, np.ndarray, str, str | None, str | None]] = []
     for language, sentences, speakers in (
         ("en", EN_BASE, [100, 300, 600]),
         ("fr", FR_BASE, [0, 1]),
     ):
-        for clips_of_voice in synth(models, speakers, sentences, language=language).values():
-            for x, truth in zip(clips_of_voice, sentences, strict=True):
-                clips.append((x, truth))
-                clips.append((condition(x, rng), truth))
-    # Indoor sounds as the ear meets them: what Silero lets through of each clip,
-    # one run at a time. Their truth is "nothing was said".
-    from π_ear.sense import Sensor, speech_probability
-
-    sensor = Sensor(models)
-    for _, sounds in sorted(esc50(data, BASE_FOLDS).items()):
-        for clip in sounds:
-            _, runs = sensor.feed(clip)
-            _, tail = sensor.feed(np.zeros(contract.RATE, dtype=np.float32))
-            clips += [(run.samples, "") for run in runs + tail]
-
-    def spoken(x):
-        """Silero's mean over what it let through, as the ear computes it on a run."""
-        _, found = sensor.feed(x)
-        _, tail = sensor.feed(np.zeros(contract.RATE, dtype=np.float32))
-        inside = np.concatenate([r.samples for r in found + tail]) if found + tail else x
-        return float(np.mean(speech_probability(models, inside)))
-
-    runs = []
-    for x, truth in clips:
-        heard = heard_by(contract.FAST, fast, x)
-        again = heard_by(contract.SLOW, slow, x) if slow else None
-        runs.append((heard, again, truth, spoken(x)))
-    return fit_reader(runs)
+        for speaker, clips in synth(models, speakers, sentences, language=language).items():
+            for x, truth in zip(clips, sentences, strict=True):
+                for name in REGIMES:
+                    pieces.append((name, regime(name, x), truth, f"{speaker}", language))
+    for clip in sounds[:: max(1, len(sounds) // 40)]:
+        for name in REGIMES:
+            for run in runs_of(regime(name, clip)):
+                pieces.append((name, run, "", None, None))
+    speech = [(name, spoken(x)) for name, x, truth, _, _ in pieces]
+    means = {
+        name: float(
+            np.mean(
+                [
+                    s
+                    for (n, s), (_, _, t, _, _) in zip(speech, pieces, strict=True)
+                    if n == name and t
+                ]
+            )
+        )
+        for name in REGIMES
+    }
+    readings = [
+        (heard_by(contract.FAST, fast, x), heard_by(contract.SLOW, slow, x) if slow else None)
+        for _, x, _, _, _ in pieces
+    ]
+    confidence = {
+        name: float(
+            np.mean(
+                [
+                    mean_logp(f)
+                    for (n, _, t, _, _), (f, _) in zip(pieces, readings, strict=True)
+                    if n == name and t and f.words
+                ]
+            )
+        )
+        for name in REGIMES
+    }
+    heard = []
+    for (name, x, truth, voice, language), (_, s), (f, g) in zip(
+        pieces, speech, readings, strict=True
+    ):
+        context = Context(voice, s, means[name], len(x) / contract.RATE, confidence[name])
+        heard.append(Heard(f, g, truth, context, language))
+    out = fit_reader(heard)
+    out["regime"] = means["clean"]
+    out["confidence"] = confidence["clean"]
+    out["regimes"] = {"speech": means, "confidence": confidence}
+    return out
 
 
 def heard_by(name: str, recognizer, x: np.ndarray):

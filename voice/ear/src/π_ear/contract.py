@@ -53,6 +53,7 @@ WHISPER_DIR = "sherpa-onnx-whisper-tiny"
 
 # --- formats -----------------------------------------------------------------
 KEY_BYTES = 8  # a speaker key is 16 hex characters
+TEXT_GRAM = 3  # characters per n-gram of the text language model (language.py)
 
 # --- resources --------------------------------------------------------------
 IDLE_SLEEP_S = 0.1
@@ -67,6 +68,9 @@ MODELS = HOME / "models"
 DATA = HOME / "data"
 MEMORY = HOME / "ear"
 CORPUS = HOME / "corpus"
+LIVE = Path(
+    os.path.expanduser(os.environ.get("PI_EAR_LIVE", str(DATA / "live")))
+)  # never committed
 WEIGHTS = Path(__file__).parent / "weights"
 
 

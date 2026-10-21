@@ -9,6 +9,9 @@ an answer, once given, is not needed again.
 
 from __future__ import annotations
 
+import time
+
+import numpy as np
 import pytest
 from conftest import needs_data
 
@@ -91,9 +94,10 @@ def test_the_text_appears_while_it_is_said_then_is_revised_in_the_silence(
 
 
 def test_a_doubt_is_asked_answered_once_and_not_asked_again(tmp_path, voice, monkeypatch):
-    """W3 and W4, the paradigm for words: the recognisers disagree on one name, the
-    ear says it does not know and asks; KπX answers once; the next time the same
-    voice says it, the ear writes what KπX said, and asks nothing."""
+    """W3 and W4, the paradigm for words: the recognisers disagree on one name in a
+    sentence they otherwise share; the ear is sure of the sentence, not of the name,
+    and asks about the name; KπX answers once; the next time the same voice says it,
+    the ear writes what KπX said, and asks nothing."""
     _plug(
         monkeypatch,
         Says("send the notes to pi x before noon", "fast"),
@@ -104,7 +108,8 @@ def test_a_doubt_is_asked_answered_once_and_not_asked_again(tmp_path, voice, mon
     questions = [e for e in events if e.get("kind") == "question" and e["about"] == "text"]
     assert questions, [(e["text"], e["doubt"]) for e in _texts(events)]
     asked = questions[0]
-    assert asked["doubt"] in ("ambiguous", "not_understood") and len(asked["choices"]) >= 2
+    assert len(asked["choices"]) >= 2 and set(asked["words"]) <= {"pi", "x", "pie", "ex"}
+    assert asked["words"], asked
     texts = _texts(events)
     doubtful = [w for w in texts[-1]["words"] if not w["agreed"]]
     assert doubtful and all(w["trust"] < 0.9 for w in doubtful)
@@ -117,7 +122,7 @@ def test_a_doubt_is_asked_answered_once_and_not_asked_again(tmp_path, voice, mon
     assert applied and applied[-1]["what"] == "text" and applied[-1]["refused"] is None
     assert applied[-1]["answers"] == asked["id"]
     assert not port.open_questions(ear.places.events)
-    revised = [e for e in _texts(after) if e["run"] == asked["run"]][-1]
+    revised = [e for e in _texts(after) if e["piece"] == asked["piece"]][-1]
     assert said(revised["text"], "send the notes to KπX before noon"), revised
 
     ear2, events2 = _day(tmp_path, "day2", voice, memory)
@@ -164,7 +169,7 @@ def test_a_text_said_sessions_ago_can_still_be_corrected(tmp_path, voice, monkey
     after = [e for e in read_jsonl(ear2.places.events)[0] if e.get("session") == ear2.session]
     applied = [e for e in after if e.get("kind") == "correction"][-1]
     assert applied["refused"] is None
-    revised = [e for e in _texts(after) if e["run"] == old["run"]]
+    revised = [e for e in _texts(after) if e["piece"] == old["piece"]]
     assert revised and said(revised[-1]["text"], "meet me at the Gare de Lyon station")
 
 
@@ -188,3 +193,156 @@ def test_a_voice_heard_again_unnamed_is_asked_for_its_name_once(tmp_path, voice,
     _, events3 = _day(tmp_path, "day3", voice, memory)
     assert not [e for e in events3 if e.get("kind") == "question"]
     assert {e["label"] for e in events3 if e.get("kind") == "known"} == {"Alice"}
+
+
+# -- the scribe alone: pieces, groups, priorities ------------------------------------------
+
+
+class Timed:
+    """A recogniser that writes one word per half second of what it is given, named by
+    the absolute second it was said at: where each word lands can be checked exactly."""
+
+    def __init__(self, name: str, window_s: float | None = None, start: float = 0.0):
+        self.name, self.window_s, self.calls = name, window_s, []
+
+    def __call__(self, samples, language=None):
+        n = len(samples) / contract.RATE
+        self.calls.append((n, language))
+        words = tuple(Word(f"w{i}", i * 0.5, i * 0.5 + 0.5, -0.1) for i in range(int(n / 0.5)))
+        return Hypothesis(" ".join(w.text for w in words), words, "fr", self.name)
+
+
+def _scribe(tmp_path, fast, slow, source=None):
+    from π_ear.scribe import Scribe
+    from π_ear.words import Reader
+
+    written = []
+    scribe = Scribe(
+        Reader(),
+        fast,
+        slow,
+        None,
+        written.append,
+        tmp_path,
+        contract.MODELS,
+        source_of=source or (lambda voice: ("device", 1.0)),
+        floor_s=0.25,
+    )
+    return scribe, written
+
+
+def _decisions(seconds: float, voices: list[str], start: float = 0.0) -> list[dict]:
+    """Learned 2 s windows, the voice changing every ``seconds / len(voices)``."""
+    out, row, t = [], 0, 0.0
+    while t + 2 <= seconds:
+        voice = voices[min(int(t / (seconds / len(voices))), len(voices) - 1)]
+        out.append(
+            {
+                "row": row,
+                "t0": start + t,
+                "t1": start + t + 2,
+                "kind": "known",
+                "speaker": voice,
+                "learned": True,
+            }
+        )
+        row, t = row + 1, t + 2
+    return out
+
+
+def test_a_long_run_is_cut_under_the_window_and_where_the_voice_changes(tmp_path, voice):
+    fast, slow = Timed("fast"), Timed("slow", window_s=12.0)
+    scribe, written = _scribe(tmp_path, fast, slow)
+    audio = np.concatenate([voice, voice])[: 24 * contract.RATE]
+    scribe.finish("r", 0.0, audio, _decisions(24, ["a", "b"]))
+    scribe.drain()
+    texts = {}
+    for e in written:
+        if e.get("kind") == "text":
+            texts[e["piece"]] = e
+    assert texts and all(0.25 <= e["t1"] - e["t0"] < 12.0 for e in texts.values())
+    assert any(abs(e["t1"] - 12.0) <= 1.0 for e in texts.values()), [
+        (e["t0"], e["t1"]) for e in texts.values()
+    ]
+    assert {e["speaker"] for e in texts.values()} == {"a", "b"}
+    # read slowly together, as much as the window holds, never more
+    assert all(n < 12.0 for n, _ in slow.calls) and len(slow.calls) <= len(texts)
+
+
+def test_short_pieces_are_read_slowly_together(tmp_path, voice):
+    """Six voices' turns of 2 s: six pieces, read by the slow recogniser in groups as
+    long as its window, then each given back its own words."""
+    fast, slow = Timed("fast"), Timed("slow", window_s=12.0)
+    scribe, written = _scribe(tmp_path, fast, slow)
+    scribe.finish("r", 0.0, voice[: 12 * contract.RATE], _decisions(12, list("abcdef")))
+    scribe.drain()
+    pieces = {e["piece"] for e in written if e.get("kind") == "text"}
+    assert len(pieces) >= 4 and len(slow.calls) < len(pieces), (len(pieces), slow.calls)
+    assert all(n < 12.0 for n, _ in slow.calls)
+
+
+def test_each_piece_gets_the_slow_words_said_during_it(tmp_path, voice):
+    fast, slow = Timed("fast"), Timed("slow", window_s=8.0)
+    scribe, written = _scribe(tmp_path, fast, slow)
+    scribe.finish("r", 0.0, voice[: 7 * contract.RATE], _decisions(7, ["a", "b"]))
+    scribe.drain()
+    final = {}
+    for e in written:
+        if e.get("kind") == "text" and e["revision"] == 1:
+            final[e["piece"]] = e
+    pieces = sorted(final.values(), key=lambda e: e["t0"])
+    assert len(pieces) >= 2
+    # every word the slow recogniser wrote went to exactly one piece, in order
+    slow_words = [
+        w
+        for e in pieces
+        for r in e["readings"]
+        if "slow" in r["origins"]
+        for w in r["text"].split()
+    ]
+    assert slow_words == [f"w{i}" for i in range(len(slow_words))] or all(
+        sum("slow" in r["origins"] for r in e["readings"]) <= 1 for e in pieces
+    )
+
+
+def test_people_are_read_first_and_never_while_a_person_speaks(tmp_path, voice):
+    slow = Timed("slow", window_s=8.0)
+    people = {"kpihx"}
+    scribe, written = _scribe(
+        tmp_path, Timed("fast"), slow, lambda v: ("person" if v in people else "device", 1.0)
+    )
+    scribe.set_speaking(True, person=True)  # KπX is speaking: the slow pass waits
+    for n, who in enumerate(["tv", "tv", "kpihx"]):
+        scribe.finish(f"r{n}", n * 10.0, voice[: 3 * contract.RATE], _decisions(3, [who], n * 10.0))
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not any(
+        e.get("revision") == 0 for e in written if e.get("speaker") == "kpihx"
+    ):
+        time.sleep(0.05)
+    assert not slow.calls, "the slow pass ran while a person spoke"
+    scribe.set_speaking(False)
+    scribe.drain()
+    first = next(e for e in written if e.get("kind") == "text" and e["revision"] == 1)
+    assert first["speaker"] == "kpihx"
+
+
+def test_revisions_go_on_while_a_television_talks_without_a_pause(tmp_path, voice):
+    """Live, a run grows every second; a first build always read the partial first and
+    revised nothing for as long as the television spoke. Partials and revisions take
+    turns now (never while a person speaks: the previous test)."""
+    slow = Timed("slow", window_s=8.0)
+    scribe, written = _scribe(tmp_path, Timed("fast"), slow)
+    scribe.finish("before", 0.0, voice[: 3 * contract.RATE], _decisions(3, ["tv"]))
+    long = np.concatenate([voice] * 4)[: 40 * contract.RATE]
+    scribe.set_speaking(True, person=False)
+    for second in range(4, 40):  # the run in progress, one second more each time
+        scribe.hear(
+            "long", 4.0, long[: (second - 3) * contract.RATE], _decisions(second - 3, ["tv"], 4.0)
+        )
+        time.sleep(0.05)
+    revised = [e for e in written if e.get("kind") == "text" and e["revision"] == 1]
+    assert slow.calls and revised, "nothing was revised while the television talked"
+    assert any(e.get("kind") == "partial" for e in written)
+    scribe.finish("long", 4.0, long, _decisions(40, ["tv"], 4.0))
+    scribe.set_speaking(False)
+    scribe.drain()

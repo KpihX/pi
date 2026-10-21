@@ -53,6 +53,7 @@ class Sensor:
         vad.sample_rate = contract.RATE
         self.vad = sherpa_onnx.VoiceActivityDetector(vad, buffer_size_in_seconds=120)
         self.block = vad.silero_vad.window_size
+        self.min_speech_s = float(vad.silero_vad.min_speech_duration)  # published default
         self.encoder = sherpa_onnx.SpeakerEmbeddingExtractor(
             sherpa_onnx.SpeakerEmbeddingExtractorConfig(
                 model=str(models / encoder), num_threads=contract.THREADS
@@ -87,12 +88,17 @@ class Sensor:
     def _remember(self, data: np.ndarray) -> None:
         self.history = np.concatenate([self.history, data])
         keep = int(contract.RATE * 60) + self.window  # a resource bound, not a judgement
+        if self.run_start is not None:
+            # the run in progress is kept whole: the scribe reads it from its start (live,
+            # studio runs of 70 s were sliced from a negative index past 60 s)
+            keep = max(keep, self.history_start + len(self.history) - self.run_start)
         drop = max(0, len(self.history) - keep)
         self.history = self.history[drop:]
         self.history_start += drop
 
     def _slice(self, start: int, end: int) -> np.ndarray:
-        return self.history[start - self.history_start : end - self.history_start]
+        start = max(start, self.history_start)
+        return self.history[start - self.history_start : max(end - self.history_start, 0)]
 
     def _collect(self, pieces: list[Piece], runs: list[Run]) -> None:
         while not self.vad.empty():
@@ -236,6 +242,33 @@ def _silero(path: str):
     return onnxruntime.InferenceSession(path, providers=["CPUExecutionProvider"])
 
 
+class Silero:
+    """Silero's own probability, one per frame (512 samples, 32 ms), as a stream: the
+    state is kept between calls, so a run is followed as it grows, at no extra cost."""
+
+    def __init__(self, models: Path):
+        self.session = _silero(str(models / contract.VAD_MODEL))
+        self.block = self.session.get_inputs()[0].shape[1]
+        shape = self.session.get_inputs()[1].shape
+        self.h = np.zeros(shape, dtype=np.float32)
+        self.c = np.zeros(shape, dtype=np.float32)
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.probs: list[float] = []
+
+    def feed(self, samples: np.ndarray) -> np.ndarray:
+        """The probabilities of the frames these samples complete."""
+        audio = np.concatenate([self.pending, np.asarray(samples, dtype=np.float32)])
+        done = len(audio) - len(audio) % self.block
+        out = []
+        for start in range(0, done, self.block):
+            x = audio[start : start + self.block][None, :]
+            prob, self.h, self.c = self.session.run(None, {"x": x, "h": self.h, "c": self.c})
+            out.append(float(prob[0][0]))
+        self.pending = audio[done:]
+        self.probs += out
+        return np.asarray(out)
+
+
 def speech_probability(models: Path, samples: np.ndarray) -> np.ndarray:
     """Silero's own probability, one per 32 ms frame: what the VAD decision hides.
 
@@ -243,14 +276,4 @@ def speech_probability(models: Path, samples: np.ndarray) -> np.ndarray:
     probe needs the number underneath, to tell "not speech" from "speech the
     detector missed" (RETURNS.md, the 81-second hole).
     """
-    session = _silero(str(models / contract.VAD_MODEL))
-    shape = session.get_inputs()[1].shape
-    h = np.zeros(shape, dtype=np.float32)
-    c = np.zeros(shape, dtype=np.float32)
-    block = session.get_inputs()[0].shape[1]
-    out = []
-    for start in range(0, len(samples) - block + 1, block):
-        x = samples[start : start + block].astype(np.float32)[None, :]
-        prob, h, c = session.run(None, {"x": x, "h": h, "c": c})
-        out.append(float(prob[0][0]))
-    return np.asarray(out)
+    return Silero(models).feed(samples)

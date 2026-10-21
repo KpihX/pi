@@ -38,7 +38,7 @@ CHUNK_S := 1
 RUN_FLAGS ?=
 EAR := $(UV) run π-ear
 
-.PHONY: help sync fetch base check test test-fast rec run watch events state status \
+.PHONY: help sync fetch base check test test-live test-fast rec run watch events state status \
 	pause resume reset snapshot diff correct undo questions answer why probe corpus replay-corpus clean
 
 help:  ## Show the setup order and every target
@@ -63,6 +63,9 @@ check:  ## ruff: imports, format, lint
 
 test:  ## Every test: the law, the maths, the model, the server, the simulated rooms
 	@$(UV) run pytest -q
+
+test-live:  ## Replay the real sessions kept under $$PI_EAR_LIVE (never committed), minutes each
+	@$(UV) run pytest -q -m live tests/test_live.py
 
 test-fast:  ## Only what needs no model and no download (< 1 s)
 	@$(UV) run pytest -q tests/test_law.py tests/test_sphere.py tests/test_model.py tests/test_io.py \

@@ -403,3 +403,32 @@ def test_english_and_french_are_read_clean_and_through_music(tmp_path):
     # measured: 3 errors in 49 words (6 %), two of them one homophone ("plus tôt"
     # heard "plutôt"), the kind of error one `text` correction is for
     assert wrong / said <= 0.1, (wrong, said, {k: e["text"] for k, e in final.items()})
+
+
+FR_MORE = [
+    "Nous irons au marché demain matin si la pluie s'arrête enfin.",
+    "Le train de huit heures est encore parti sans nous ce matin.",
+    "Ma grand-mère prépare une soupe de légumes tous les dimanches.",
+]
+
+
+def test_a_guest_speaking_english_in_a_french_room_is_written_in_english(tmp_path):
+    """A language is learned per voice, its prior the room: four French sentences make
+    the room French, and an English guest after them must still be written in English
+    (a room's language that silenced every other was the risk of learning one)."""
+    from π_ear.lexicon import errors, tokens
+
+    if not asr_models():
+        pytest.skip("the default recognisers are not downloaded (make fetch)")
+    fr = next(iter(synth(contract.MODELS, [0], FR_TEST + FR_MORE, language="fr").values()))
+    en = next(iter(synth(contract.MODELS, [TWINS[1]], SECOND[:3]).values()))
+    turns = [(f"fr{i}", x) for i, x in enumerate(fr)] + [(f"en{i}", x) for i, x in enumerate(en)]
+    final = _read(tmp_path, "guest", turns)
+    truths = {f"en{i}": t for i, t in enumerate(SECOND[:3])}
+    wrong = said = 0
+    for label, truth in truths.items():
+        assert label in final, list(final)
+        wrong += errors(tokens(truth), tokens(final[label]["text"]))
+        said += len(tokens(truth))
+    assert wrong / said <= 0.15, {k: final[k]["text"] for k in truths}
+    assert all(final[k]["language"] == "en" for k in truths)
